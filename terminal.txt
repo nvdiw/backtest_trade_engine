@@ -1,0 +1,715 @@
+my code:
+    ✅ BACKTEST FINISHED
+    Closed Trades: 304 ( Longs: 149 | Shorts: 155 )
+    Total Wins: 107
+    Total Losses: 197
+    Final Balance: 1424.22
+    Final Balance (No Fee): 2649.93
+    Total Fees Paid: 749.14
+    Fee Compounding Impact: 476.56 $
+    Maximum Drawdown: -44.29 %
+    Total Duration : 350 days, 23 hours, 45 minutes
+    Win Rate: 35.2 %
+    Total Profit: 424.22 $
+    Total Profit Percent: 42.42 %
+
+new code:
+    ✅ BACKTEST FINISHED
+    Closed Trades: 304 ( Longs: 149 | Shorts: 155 )
+    Total Wins: 107
+    Total Losses: 197
+    Final Balance: 1424.22
+    Final Balance (No Fee): 2649.93
+    Total Fees Paid: 749.14
+    Fee Compounding Impact: 476.56 $
+    Maximum Drawdown: -44.29 %
+    Total Duration : 350 days, 23 hours, 45 minutes
+    Win Rate: 35.2 %
+    Total Profit: 424.22 $
+    Total Profit Percent: 42.42 %
+
+
+✅ BACKTEST FINISHED
+Closed Trades: 289 ( Longs: 144 | Shorts: 145 )
+Total Wins: 100 | Total Wins Long: 53 | Total Wins Short: 47
+Total Losses: 189
+Final Balance: 133.14 $
+Final Balance (No Fee): 234.74 $
+Total Fees Paid: 71.16 $
+Fee Compounding Impact: 30.44 $
+Maximum Drawdown: -44.29 %
+Total Duration : 333 days, 23 hours, 45 minutes
+Win Rate: 34.6 %
+Total Profit: 33.14 $
+Total Profit Percent: 33.14 % or 43.56 %
+saved Money: 0 $
+profit_percent_per_month: []
+
+
+✅ BACKTEST FINISHED
+Closed Trades: 351 ( Longs: 176 | Shorts: 175 )
+Total Wins: 140 | Total Wins Long: 78 | Total Wins Short: 62
+Total Losses: 211
+Final Balance: 2896.32 $
+Final Balance (No Fee): 7435.64 $
+Total Fees Paid: 949.15 $
+Fee Compounding Impact: 3590.17 $
+Maximum Drawdown: -31.74 %
+Total Duration : 715 days, 23 hours, 45 minutes
+Win Rate: 39.89 %
+Total Profit: 1896.32 $
+Total Profit Percent: 189.63 % or 169.74 %
+saved Money: 1368.93 $
+profit_percent_per_month: 14
+
+
+
+✅ BACKTEST FINISHED
+Closed Trades: 152 ( Longs: 73 | Shorts: 79 )
+Total Wins: 67 | Total Wins Long: 38 | Total Wins Short: 29
+Total Losses: 85
+Final Balance: 2041.51 $
+Final Balance (No Fee): 3216.98 $
+Total Fees Paid: 375.41 $
+Fee Compounding Impact: 800.06 $
+Maximum Drawdown: -27.15 %
+Total Duration : 350 days, 23 hours, 45 minutes
+Win Rate: 44.08 %
+Total Profit: 1041.51 $
+Total Profit Percent: 104.15 % or 98.18 %
+saved Money: 774.74 $
+profit_percent_per_month: 7
+
+# without exit score
+# just 2025
+✅ BACKTEST FINISHED
+Closed Trades: 129 ( Longs: 67 | Shorts: 62 )
+Total Wins: 58 | Total Wins Long: 32 | Total Wins Short: 26
+Total Losses: 71
+Final Balance: 2036.43 $
+Final Balance (No Fee): 3070.54 $
+Total Fees Paid: 323.35 $
+Fee Compounding Impact: 710.76 $
+Maximum Drawdown: -26.05 %
+Total Duration : 350 days, 23 hours, 45 minutes
+Win Rate: 44.96 %
+Total Profit: 1036.43 $
+Total Profit Percent: 103.64 % or 97.96 %
+saved Money: 742.59 $
+profit_percent_per_month: 8
+
+# without exit score
+# 2023 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 342 ( Longs: 180 | Shorts: 162 )
+Total Wins: 138 | Total Wins Long: 81 | Total Wins Short: 57
+Total Losses: 204
+Final Balance: 5453.07 $
+Final Balance (No Fee): 37082.57 $
+Total Fees Paid: 1221.32 $
+Fee Compounding Impact: 30408.18 $
+Maximum Drawdown: -31.3 %
+Total Duration : 1080 days, 23 hours, 45 minutes
+Win Rate: 40.35 %
+Total Profit: 4453.07 $
+Total Profit Percent: 445.31 % or 331.87 %
+saved Money: 3314.55 $
+profit_percent_per_month: 25
+
+# without exit score
+# 2019 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 922 ( Longs: 471 | Shorts: 451 )
+Total Wins: 355 | Total Wins Long: 192 | Total Wins Short: 163
+Total Losses: 567
+Final Balance: 15382.67 $
+Final Balance (No Fee): 714843.63 $
+Total Fees Paid: 4771.83 $
+Fee Compounding Impact: 694689.13 $
+Maximum Drawdown: -48.14 %
+Total Duration : 2540 days, 23 hours, 45 minutes
+Win Rate: 38.5 %
+Total Profit: 14382.67 $
+Total Profit Percent: 1438.27 % or 641.16 %
+saved Money: 10489.89 $
+profit_percent_per_month: 53
+
+#--------------------------------------------------------------------------
+# with exit score
+# just 2025
+✅ BACKTEST FINISHED
+Closed Trades: 116 ( Longs: 60 | Shorts: 56 )
+Total Wins: 49 | Total Wins Long: 28 | Total Wins Short: 21
+Total Losses: 67
+Final Balance: 1946.4 $
+Final Balance (No Fee): 2853.47 $
+Total Fees Paid: 317.88 $
+Fee Compounding Impact: 589.19 $
+Maximum Drawdown: -25.19 %
+Total Duration : 350 days, 23 hours, 45 minutes
+Win Rate: 42.24 %
+Total Profit: 946.4 $
+Total Profit Percent: 94.64 % or 88.6 %
+saved Money: 806.03 $
+count_profit_more_than_8%_monthly: 8
+
+# with exit score
+# 2023 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 294 ( Longs: 161 | Shorts: 133 )
+Total Wins: 123 | Total Wins Long: 73 | Total Wins Short: 50
+Total Losses: 171
+Final Balance: 6711.9 $
+Final Balance (No Fee): 71871.78 $
+Total Fees Paid: 1164.09 $
+Fee Compounding Impact: 63995.79 $
+Maximum Drawdown: -27.12 %
+Total Duration : 1080 days, 23 hours, 45 minutes
+Win Rate: 41.84 %
+Total Profit: 5711.9 $
+Total Profit Percent: 571.19 % or 400.74 %
+saved Money: 4652.25 $
+count_profit_more_than_8%_monthly: 28
+
+# with exit score
+# 2019 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 876 ( Longs: 448 | Shorts: 428 )
+Total Wins: 325 | Total Wins Long: 177 | Total Wins Short: 148
+Total Losses: 551
+Final Balance: 17879.53 $
+Final Balance (No Fee): 3082478.39 $
+Total Fees Paid: 4347.37 $
+Fee Compounding Impact: 3060251.49 $
+Maximum Drawdown: -44.21 %
+Total Duration : 2540 days, 23 hours, 45 minutes
+Win Rate: 37.1 %
+Total Profit: 16879.53 $
+Total Profit Percent: 1687.95 % or 757.77 %
+saved Money: 13567.09 $
+count_profit_more_than_8%_monthly: 53
+
+
+--------------- leverage changes -----------------
+# leverage 10, safe_leverage 3 2019-2025
+✅ BACKTEST FINISHED
+Closed Trades: 765 ( Longs: 391 | Shorts: 374 )
+Total Wins: 284 | Total Wins Long: 156 | Total Wins Short: 128
+Total Losses: 481
+Final Balance: 29492.42 $
+Final Balance (No Fee): 40967549.87 $
+Total Fees Paid: 6988.53 $
+Fee Compounding Impact: 40931068.93 $
+Maximum Drawdown: -49.67 %
+Total Duration : 2540 days, 23 hours, 45 minutes
+Win Rate: 37.12 %
+Total Profit: 28492.42 $
+Total Profit Percent: 2849.24 % or 1131.75 %
+saved Money: 24838.68 $
+count_profit_more_than_8%_monthly: 59
+
+# leverage 10, safe_leverage 3 2023-2025
+✅ BACKTEST FINISHED
+Closed Trades: 288 ( Longs: 151 | Shorts: 137 )
+Total Wins: 119 | Total Wins Long: 68 | Total Wins Short: 51
+Total Losses: 169
+Final Balance: 8370.24 $
+Final Balance (No Fee): 224027.35 $
+Total Fees Paid: 1759.18 $
+Fee Compounding Impact: 213897.93 $
+Maximum Drawdown: -46.11 %
+Total Duration : 1080 days, 23 hours, 45 minutes
+Win Rate: 41.32 %
+Total Profit: 7370.24 $
+Total Profit Percent: 737.02 % or 539.45 %
+saved Money: 6563.02 $
+count_profit_more_than_8%_monthly: 27
+
+# leverage 10, safe_leverage 3 2025-2025
+✅ BACKTEST FINISHED
+Closed Trades: 90 ( Longs: 46 | Shorts: 44 )
+Total Wins: 36 | Total Wins Long: 21 | Total Wins Short: 15
+Total Losses: 54
+Final Balance: 2742.9 $
+Final Balance (No Fee): 5468.61 $
+Total Fees Paid: 457.13 $
+Fee Compounding Impact: 2268.58 $
+Maximum Drawdown: -34.83 %
+Total Duration : 350 days, 23 hours, 45 minutes
+Win Rate: 40.0 %
+Total Profit: 1742.9 $
+Total Profit Percent: 174.29 % or 159.2 %
+saved Money: 1649.51 $
+count_profit_more_than_8%_monthly: 10
+
+======================================================
+# 2025- 2025
+✅ BACKTEST FINISHED
+Closed Trades: 104 ( Longs: 55 | Shorts: 49 )
+Total Wins: 41 | Total Wins Long: 24 | Total Wins Short: 17
+Total Losses: 63
+Final Balance: 2407.25 $
+Final Balance (No Fee): 4222.33 $
+Total Fees Paid: 405.21 $
+Fee Compounding Impact: 1409.87 $
+Maximum Drawdown: -12.68 %
+Total Duration : 350 days, 23 hours, 45 minutes
+Win Rate: 39.42 %
+Total Profit: 1407.25 $
+Total Profit Percent: 140.73 % or 136.52 %
+saved Money: 1328.34 $
+count_profit_more_than_8%_monthly: 7
+
+# 2023 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 234 ( Longs: 128 | Shorts: 106 )
+Total Wins: 105 | Total Wins Long: 60 | Total Wins Short: 45
+Total Losses: 129
+Final Balance: 9682.1 $
+Final Balance (No Fee): 368753.65 $
+Total Fees Paid: 1568.41 $
+Fee Compounding Impact: 357503.14 $
+Maximum Drawdown: -8.18 %
+Total Duration : 1080 days, 23 hours, 45 minutes
+Win Rate: 44.87 %
+Total Profit: 8682.1 $
+Total Profit Percent: 868.21 % or 607.99 %
+saved Money: 7733.45 $
+count_profit_more_than_8%_monthly: 27
+
+# 2019 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 672 ( Longs: 346 | Shorts: 326 )
+Total Wins: 266 | Total Wins Long: 148 | Total Wins Short: 118
+Total Losses: 406
+Final Balance: 34468.52 $
+Final Balance (No Fee): 123719575.62 $
+Total Fees Paid: 6304.86 $
+Fee Compounding Impact: 123678802.23 $
+Maximum Drawdown: -26.15 %
+Total Duration : 2540 days, 23 hours, 45 minutes
+Win Rate: 39.58 %
+Total Profit: 33468.52 $
+Total Profit Percent: 3346.85 % or 1297.82 %
+saved Money: 29450.6 $
+count_profit_more_than_8%_monthly: 59
+
+
+✅ BACKTEST FINISHED
+Closed Trades: 231 ( Longs: 117 | Shorts: 114 )
+Total Wins: 121 | Total Wins Long: 66 | Total Wins Short: 55
+Total Losses: 110
+Final Balance: 8592.96 $
+Final Balance (No Fee): 99450.58 $
+Total Fees Paid: 1208.45 $
+Fee Compounding Impact: 89649.18 $
+Maximum Drawdown: -12.78 %
+Total Duration : 1081 days, 0 hours, 0 minutes
+Win Rate: 52.38 %
+Total Profit: 7592.96 $
+Total Profit Percent: 759.3 % or 543.74 %
+saved Money: 6859.4 $
+Count Liquids: 0
+count_profit_more_than_8%_monthly: 26
+
+
+
+✅ BACKTEST FINISHED
+Closed Trades: 223 ( Longs: 111 | Shorts: 112 )
+Total Wins: 119 | Total Wins Long: 60 | Total Wins Short: 59
+Total Losses: 104
+Final Balance: 9270.56 $
+Final Balance (No Fee): 154487.06 $
+Total Fees Paid: 1373.91 $
+Fee Compounding Impact: 143842.58 $
+Maximum Drawdown: -19.44 %
+Total Duration : 1081 days, 0 hours, 0 minutes
+Win Rate: 53.36 %
+Total Profit: 8270.56 $
+Total Profit Percent: 827.06 % or 565.13 %
+saved Money: 7366.54 $
+Count Liquids: 0
+count_profit_more_than_8%_monthly: 29
+
+
+# after big update 2023 - 2025
+✅ BACKTEST FINISHED
+Closed Trades: 176 ( Longs: 97 | Shorts: 79 )
+Total Wins: 99 | Total Wins Long: 57 | Total Wins Short: 42
+Total Losses: 77
+Final Balance: 11861.54 $
+Final Balance (No Fee): 577865.94 $
+Total Fees Paid: 1236.52 $
+Fee Compounding Impact: 564767.88 $
+Maximum Drawdown: -14.93 %
+Total Duration : 1081 days, 0 hours, 0 minutes
+Win Rate: 56.25 %
+Total Profit: 10861.54 $
+Total Profit Percent: 1086.15 % or 705.06 %
+saved Money: 9886.32 $
+Count Liquids: 0
+count_profit_more_than_8%_monthly: 32
+
+
+✅ BACKTEST FINISHED
+Closed Trades: 175 ( Longs: 96 | Shorts: 79 )
+Total Wins: 99 | Total Wins Long: 57 | Total Wins Short: 42
+Total Losses: 76
+Final Balance: 11882.77 $
+Final Balance (No Fee): 582860.47 $
+Total Fees Paid: 1231.51 $
+Fee Compounding Impact: 569746.19 $
+Maximum Drawdown: -14.9 %
+Total Duration : 1081 days, 0 hours, 0 minutes
+Win Rate: 56.57 %
+Total Profit: 10882.77 $
+Total Profit Percent: 1088.28 % or 706.35 %
+saved Money: 9907.55 $
+Count Liquids: 0
+count_profit_more_than_8%_monthly: 32
+
+
+
+
+
+
+
+LAST one after chart reason:
+2025-2026
+✅ BACKTEST FINISHED
+Closed Trades: 95 ( Longs: 46 | Shorts: 49 )
+Total Wins: 50 | Total Wins Long: 21 | Total Wins Short: 29
+Total Losses: 45
+Final Balance: 4500.48 $
+Final Balance (No Fee): 4957.07 $
+Total Fees Paid: 456.59 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -21.36 %
+Total Duration : 418 days, 0 hours, 0 minutes
+Win Rate: 52.63 %
+Total Profit: 3500.48 $
+Total Profit Percent: 350.05 % or 399.69 %
+saved Money: 3031.95 $
+Count Liquids: 0
+count_profit_months: 12
+count_loss_months: 0
+
+2023-2026
+✅ BACKTEST FINISHED
+Closed Trades: 228 ( Longs: 123 | Shorts: 105 )
+Total Wins: 122 | Total Wins Long: 64 | Total Wins Short: 58
+Total Losses: 106
+Final Balance: 18611.83 $
+Final Balance (No Fee): 20175.79 $
+Total Fees Paid: 1563.95 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -15.38 %
+Total Duration : 1148 days, 0 hours, 0 minutes
+Win Rate: 53.51 %
+Total Profit: 17611.83 $
+Total Profit Percent: 1761.18 % or 1481.24 %
+saved Money: 15713.56 $
+Count Liquids: 0
+count_profit_months: 35
+count_loss_months: 0
+
+2019-2026
+✅ BACKTEST FINISHED
+Closed Trades: 567 ( Longs: 281 | Shorts: 286 )
+Total Wins: 274 | Total Wins Long: 142 | Total Wins Short: 132
+Total Losses: 293
+Final Balance: 56585.86 $
+Final Balance (No Fee): 62752.41 $
+Total Fees Paid: 6166.56 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -36.74 %
+Total Duration : 2608 days, 0 hours, 0 minutes
+Win Rate: 48.32 %
+Total Profit: 55585.86 $
+Total Profit Percent: 5558.59 % or 2436.34 %
+saved Money: 48668.03 $
+Count Liquids: 0
+count_profit_months: 69
+count_loss_months: 0
+
+
+# after optimize 2nd entry profits/Losses
+# 2023-2025
+✅ BACKTEST FINISHED
+Closed Trades: 230 ( Longs: 124 | Shorts: 106 )
+Total Wins: 122 | Total Wins Long: 64 | Total Wins Short: 58
+Total Losses: 108
+Final Balance: 18696.43 $
+Final Balance (No Fee): 20256.75 $
+Total Fees Paid: 1560.32 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -15.37 %
+Total Duration : 1148 days, 0 hours, 0 minutes
+Win Rate: 53.04 %
+Total Profit: 17696.43 $
+Total Profit Percent: 1769.64 % or 1490.96 %
+saved Money: 15798.15 $
+Count Liquids: 0
+count_profit_months: 35
+count_loss_months: 0
+
+# 2025-2026
+✅ BACKTEST FINISHED
+Closed Trades: 96 ( Longs: 47 | Shorts: 49 )
+Total Wins: 50 | Total Wins Long: 21 | Total Wins Short: 29
+Total Losses: 46
+Final Balance: 4539.62 $
+Final Balance (No Fee): 4993.18 $
+Total Fees Paid: 453.56 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -18.25 %
+Total Duration : 418 days, 0 hours, 0 minutes
+Win Rate: 52.08 %
+Total Profit: 3539.62 $
+Total Profit Percent: 353.96 % or 406.12 %
+saved Money: 3071.09 $
+Count Liquids: 0
+count_profit_months: 12
+count_loss_months: 0
+
+
+# rsi_strategy:
+# 2023 - 2026 rsi_strategy
+✅ BACKTEST FINISHED
+Closed Trades: 498 ( Longs: 498 | Shorts: 0 )
+Count open Trades: 11
+Total Wins: 498 | Total Wins Long: 498 | Total Wins Short: 0
+Total Losses: 0
+Final Balance: 7088.81 $
+Final Balance (No Fee): 7364.7 $
+Final balance with close, open orders in last candle: 3935.24 $
+Total Fees Paid: 136.85 $
+Fee Compounding Impact: 139.05 $
+Maximum Drawdown: -47.99 %
+Total Duration : 1148 days, 0 hours, 0 minutes
+Win Rate: 100.0 %
+Total Profit: 6088.81 $
+Total Profit Percent: 608.88 % or 1304.3 %
+saved Money: 0 $
+Count Liquids: 0
+count_profit_months: 0
+count_loss_months: 0
+
+
+# 2025 - 2026 rsi_strategy:
+✅ BACKTEST FINISHED
+Closed Trades: 84 ( Longs: 84 | Shorts: 0 )
+Count open Trades: 11
+Total Wins: 84 | Total Wins Long: 84 | Total Wins Short: 0
+Total Losses: 0
+Final Balance: 1390.67 $
+Final Balance (No Fee): 1400.69 $
+Final balance with close, open orders in last candle: 772.01 $
+Total Fees Paid: 8.7 $
+Fee Compounding Impact: 1.32 $
+Maximum Drawdown: -36.4 %
+Total Duration : 418 days, 0 hours, 0 minutes
+Win Rate: 100.0 %
+Total Profit: 390.67 $
+Total Profit Percent: 39.07 % or 227.49 %
+saved Money: 0 $
+Count Liquids: 0
+count_profit_months: 0
+count_loss_months: 0
+
+
+ma_strategy rsi when monthly filter is on: 2026-02-23
+2019 - 2026:
+✅ BACKTEST FINISHED
+Closed Trades: 586 ( Longs: 299 | Shorts: 287 )
+Count open Trades: 0
+Total Wins: 280 | Total Wins Long: 155 | Total Wins Short: 125
+Total Losses: 306
+Final Balance: 56534.83 $
+Final Balance (No Fee): 62499.05 $
+Final balance if close, open orders: 56534.83 $
+Total Fees Paid: 5964.22 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -48.36 %
+Total Duration : 2608 days, 0 hours, 0 minutes
+Win Rate: 47.78 %
+Total Profit: 55534.83 $
+Total Profit Percent: 5553.48 % or 2427.65 %
+saved Money: 48617.01 $
+Count Liquids: 0
+count_profit_months: 69
+count_loss_months: 0
+
+2023 - 2026:
+✅ BACKTEST FINISHED
+Closed Trades: 227 ( Longs: 119 | Shorts: 108 )
+Count open Trades: 0
+Total Wins: 119 | Total Wins Long: 63 | Total Wins Short: 56
+Total Losses: 108
+Final Balance: 18763.31 $
+Final Balance (No Fee): 20227.4 $
+Final balance if close, open orders: 18763.31 $
+Total Fees Paid: 1464.09 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -17.13 %
+Total Duration : 1148 days, 0 hours, 0 minutes
+Win Rate: 52.42 %
+Total Profit: 17763.31 $
+Total Profit Percent: 1776.33 % or 1515.79 %
+saved Money: 15865.03 $
+Count Liquids: 0
+count_profit_months: 35
+count_loss_months: 0
+
+
+2025 - 2026:
+✅ BACKTEST FINISHED
+Closed Trades: 90 ( Longs: 46 | Shorts: 44 )
+Count open Trades: 0
+Total Wins: 47 | Total Wins Long: 21 | Total Wins Short: 26
+Total Losses: 43
+Final Balance: 4562.41 $
+Final Balance (No Fee): 4974.93 $
+Final balance if close, open orders: 4562.41 $
+Total Fees Paid: 412.52 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -28.54 %
+Total Duration : 418 days, 0 hours, 0 minutes
+Win Rate: 52.22 %
+Total Profit: 3562.41 $
+Total Profit Percent: 356.24 % or 409.01 %
+saved Money: 3093.87 $
+Count Liquids: 0
+count_profit_months: 12
+count_loss_months: 0
+
+
+
+# RSI COMPLETE DEBUGGING:
+2019 - 2026:
+✅ BACKTEST FINISHED
+Closed Trades: 620 ( Longs: 304 | Shorts: 316 )
+Count open Trades: 0
+Total Wins: 299 | Total Wins Long: 153 | Total Wins Short: 146
+Total Losses: 321
+Final Balance: 64237.36 $
+Final Balance (No Fee): 70604.48 $
+Final balance if close, open orders: 64237.36 $
+Total Fees Paid: 6367.12 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -43.05 %
+Total Duration : 2608 days, 0 hours, 0 minutes
+Win Rate: 48.23 %
+Total Profit: 63237.36 $
+Total Profit Percent: 6323.74 % or 1906.67 %
+saved Money: 55764.6 $
+Count Liquids: 0
+count_profit_months: 69
+count_loss_months: 0
+
+2023 - 2026:
+✅ BACKTEST FINISHED
+Closed Trades: 246 ( Longs: 126 | Shorts: 120 )
+Count open Trades: 0
+Total Wins: 134 | Total Wins Long: 66 | Total Wins Short: 68
+Total Losses: 112
+Final Balance: 20101.63 $
+Final Balance (No Fee): 21674.7 $
+Final balance if close, open orders: 20101.63 $
+Total Fees Paid: 1573.06 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -16.87 %
+Total Duration : 1148 days, 0 hours, 0 minutes
+Win Rate: 54.47 %
+Total Profit: 19101.63 $
+Total Profit Percent: 1910.16 % or 1145.09 %
+saved Money: 17000.22 $
+Count Liquids: 0
+count_profit_months: 35
+count_loss_months: 0
+
+2025 - 2026:
+✅ BACKTEST FINISHED
+Closed Trades: 99 ( Longs: 48 | Shorts: 51 )
+Count open Trades: 0
+Total Wins: 54 | Total Wins Long: 22 | Total Wins Short: 32
+Total Losses: 45
+Final Balance: 5073.97 $
+Final Balance (No Fee): 5514.56 $
+Final balance if close, open orders: 5073.97 $
+Total Fees Paid: 440.59 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -25.77 %
+Total Duration : 418 days, 0 hours, 0 minutes
+Win Rate: 54.55 %
+Total Profit: 4073.97 $
+Total Profit Percent: 407.4 % or 340.85 %
+saved Money: 3502.51 $
+Count Liquids: 0
+count_profit_months: 12
+count_loss_months: 0
+
+
+SCALE IMPROVE:
+2019 - 2026
+✅ BACKTEST FINISHED
+Closed Trades: 625 ( Longs: 310 | Shorts: 315 )
+Count open Trades: 0
+Total Wins: 302 | Total Wins Long: 157 | Total Wins Short: 145
+Total Losses: 323
+Final Balance: 66734.29 $
+Final Balance (No Fee): 73243.2 $
+Final balance if close, open orders: 66734.29 $
+Total Fees Paid: 6508.91 $
+Fee Compounding Impact: -0.0 $
+Maximum Drawdown: -41.83 %
+Total Duration : 2608 days, 0 hours, 0 minutes
+Win Rate: 48.32 %
+Total Profit: 65734.29 $
+Total Profit Percent: 6573.43 % or 1951.32 %
+saved Money: 58007.34 $
+Count Liquids: 0
+count_profit_months: 70
+count_loss_months: 0
+
+2023 - 2026
+✅ BACKTEST FINISHED
+Closed Trades: 246 ( Longs: 127 | Shorts: 119 )
+Count open Trades: 0
+Total Wins: 135 | Total Wins Long: 67 | Total Wins Short: 68
+Total Losses: 111
+Final Balance: 20173.76 $
+Final Balance (No Fee): 21749.95 $
+Final balance if close, open orders: 20173.76 $
+Total Fees Paid: 1576.18 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -16.87 %
+Total Duration : 1148 days, 0 hours, 0 minutes
+Win Rate: 54.88 %
+Total Profit: 19173.76 $
+Total Profit Percent: 1917.38 % or 1148.85 %
+saved Money: 17072.35 $
+Count Liquids: 0
+count_profit_months: 35
+count_loss_months: 0
+
+2025 - 2026
+✅ BACKTEST FINISHED
+Closed Trades: 98 ( Longs: 48 | Shorts: 50 )
+Count open Trades: 0
+Total Wins: 54 | Total Wins Long: 22 | Total Wins Short: 32
+Total Losses: 44
+Final Balance: 5094.64 $
+Final Balance (No Fee): 5532.97 $
+Final balance if close, open orders: 5094.64 $
+Total Fees Paid: 438.33 $
+Fee Compounding Impact: 0.0 $
+Maximum Drawdown: -25.65 %
+Total Duration : 418 days, 0 hours, 0 minutes
+Win Rate: 55.1 %
+Total Profit: 4094.64 $
+Total Profit Percent: 409.46 % or 342.72 %
+saved Money: 3523.18 $
+Count Liquids: 0
+count_profit_months: 12
+count_loss_months: 0
