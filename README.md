@@ -12,10 +12,10 @@ It reads historical candle CSV data, simulates trades candle-by-candle, and outp
 - Interactive chart rendering for backtest review
 
 ## Project Structure
-- `ma_strategy.py`: main strategy/backtest engine
+- `ma_strategy.py`: MA strategy rules and signal flow
+- `trade_engine.py`: execution, accounting, position lifecycle, logging, CSV reports, and chart lifecycle
 - `optimize.py`: grid-search optimizer
-- `trade_csv_logger.py`: trade log writer
-- `trademanager.py`: position open/close/liquidation management
+- `trade_csv_logger.py`: low-level CSV writer used by `trade_engine.py`
 - `check_monthly_data.py`: monthly summary generator
 - `chart_renderer.py`: chart UI
 - `data_candle/`: historical input candles
@@ -45,17 +45,78 @@ pip install pandas numpy mplfinance
 - `Volume`
 - `Close time`
 
-Default data path is configured in `ma_strategy.py`:
-`./data_candle/btc_15m_data_2018_to_2025.csv`
+Default data path is configured in `fetch_calculate_data.py`:
+`./data_candle/btc_15m_data_2018_to_2026.csv`
 
 ## Run Backtest
-1. Set date range in `ma_strategy.py`:
-   - `start, end = get_candle_index(("YYYY-MM-DD", "YYYY-MM-DD"))`
-2. Run:
+
+Run with the default range:
+
 ```bash
 python ma_strategy.py
 ```
-3. Check outputs in `outputs/`.
+
+Or provide an inclusive start and exclusive end:
+
+```bash
+python ma_strategy.py --start 2025-01-01 --end 2025-06-01
+```
+
+Programmatic use supports dates or candle indices:
+
+```python
+from ma_strategy import ma_strategy
+
+result = ma_strategy(start="2025-01-01", end="2025-06-01")
+```
+
+Check generated files in `outputs/`.
+
+## Trade Engine Defaults
+
+`AccountState` owns portfolio balances and aggregate trade metrics. `Position`
+owns the complete state of one open order. Direct `open_long` and `open_short`
+calls use 100% of available capital and 1x leverage unless overridden. Closing
+methods accept these objects, close the full supplied position, and update the
+account atomically.
+
+```python
+from trade_engine import AccountState, Position, TradeEngine
+
+engine = TradeEngine(optimize=True, verbose=False)
+account = AccountState(balance=1000.0)
+
+opened = engine.open_long(0, [100.0], ["2026-01-01 00:00:00"], account)
+position = Position.from_open_result(
+    opened,
+    trade_id="manual_0001",
+    side="long",
+    entry_index=0,
+    high_price=100.0,
+    low_price=100.0,
+    reason="manual",
+)
+
+closed = engine.close_long(
+    0,
+    [110.0],
+    ["2026-01-01 00:15:00"],
+    position,
+    account,
+    fee_rate=0.0005,
+    cooldown_after_big_pnl=12,
+)
+
+custom_account = AccountState(balance=1000.0)
+custom = engine.open_short(
+    0,
+    [100.0],
+    ["2026-01-01 00:00:00"],
+    custom_account,
+    trade_amount_percent=0.25,
+    leverage=3,
+)
+```
 
 ## Run Optimization
 1. Edit `param_grid` in `optimize.py`
@@ -82,4 +143,3 @@ python optimize.py -w 8
 - Optimization mode disables per-trade CSV logging for speed.
 - If CSV is open in another app (like Excel), writing may wait/fail until file is closed.
 - This repository is for research/education, not financial advice.
-

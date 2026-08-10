@@ -1,73 +1,46 @@
 ﻿# NOTE: Strategy executes With candle Open prices, High prices, Low prices, Close prices
 
-import pandas as pd
+import argparse
 import numpy as np
-import os
 
-# My Codes :
-from trade_csv_logger import TradeCSVLogger
 from indicators import Indicator
-from get_candle_index import get_candle_index, get_month_start_indices
-from trademanager import TradeManager
-from check_monthly_data import write_monthly_summary
-from chart_renderer import render_backtest_chart
-from fetch_calculate_data import fetch_all_data, trade_duration
+from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
 from strategy_config import build_ma_strategy_config
 
-
-# start = get_candle_index("2018-01-01")   ----> 1 on CSV
-# end = get_candle_index("2026-05-31")     ----> 294381 on CSV
-
-# get (index or ID) of start, end of csv
-start, end = get_candle_index(("2025-01-01","2026-02-23"))
-lst_month_starts = get_month_start_indices(start, end, just_index= True)
-
-all_data = fetch_all_data(start, end)
-open_prices = all_data["Open"]
-close_prices = all_data["Close"]
-open_times = all_data["Open time"]
-close_times = all_data["Close time"]
-low_prices = all_data["Low"]
-high_prices = all_data["High"]
-volume_prices = all_data["Volume"]
-
-# normalize close_times by adding 0.001 seconds (1 ms) to make rounding consistent
-close_times = (
-    pd.to_datetime(close_times, utc=True) + pd.Timedelta(milliseconds=1)
-).strftime("%Y-%m-%d %H:%M:%S.%f").tolist()
-
-# --- performance: ensure numeric arrays and precompute rolling means (O(n)) ---
-open_prices = np.asarray(open_prices, dtype=float)
-close_prices = np.asarray(close_prices, dtype=float)
-low_prices = np.asarray(low_prices, dtype=float)
-high_prices = np.asarray(high_prices, dtype=float)
-volume_prices = np.asarray(volume_prices, dtype=float)
-
-_INDICATOR_CACHE = {
-    "ema": {},
-    "ma": {},
-    "adx": {},
-    "atr": {},
-    "atr_ma": {},
-    "vol_avg": {},
-    "rsi": {},
-}
-
-
-def _cached_indicator(kind, key, builder):
-    cache = _INDICATOR_CACHE[kind]
-    if key not in cache:
-        cache[key] = builder()
-    return cache[key]
-
 # Main Trading Logic
-def ma_strategy(tune: dict = None):
+def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
+    """Run the MA strategy over ``start`` (inclusive) to ``end`` (exclusive).
+
+    ``start`` and ``end`` may be date strings (``YYYY-MM-DD``) or candle indices.
+    """
 
     # detect optimization mode early so we can disable I/O and heavy bookkeeping
     optimize = bool(tune.get('optimize')) if tune else False
     verbose = not optimize
-    csv_logger = TradeCSVLogger(optimize=optimize)
+
+    market = TradeEngine.load_market_data(start=start, end=end)
+    start = market["start"]
+    end = market["end"]
+    lst_month_starts = market["month_starts"]
+    open_prices = market["open_prices"]
+    close_prices = market["close_prices"]
+    open_times = market["open_times"]
+    close_times = market["close_times"]
+    low_prices = market["low_prices"]
+    high_prices = market["high_prices"]
+    volume_prices = market["volume_prices"]
+
+    indicator_cache = {
+        "ema": {}, "ma": {}, "adx": {}, "atr": {},
+        "atr_ma": {}, "vol_avg": {}, "rsi": {},
+    }
+
+    def _cached_indicator(kind, key, builder):
+        cache = indicator_cache[kind]
+        if key not in cache:
+            cache[key] = builder()
+        return cache[key]
 
     # ---- settings ----
     cfg = build_ma_strategy_config(tune)
@@ -233,8 +206,10 @@ def ma_strategy(tune: dict = None):
 
     # ---- setting end ----
     multi_position_enabled = max_open_trades > 1
-    if multi_position_enabled and verbose:
-        print(f"ℹ️ Multi-position mode enabled (max_open_trades={max_open_trades}).")
+    TradeEngine.display(
+        multi_position_enabled and verbose,
+        f"ℹ️ Multi-position mode enabled (max_open_trades={max_open_trades}).",
+    )
 
 
     total_wins = 0
@@ -329,20 +304,23 @@ def ma_strategy(tune: dict = None):
 
     equity_curve = []
     profits_lst = []
-    chart_data = [] if not optimize else None
-    # price chart trade markers
-    long_open_points = [] if not optimize else None
-    long_close_points = [] if not optimize else None
-    short_open_points = [] if not optimize else None
-    short_close_points = [] if not optimize else None
-    long_open_reasons = {} if not optimize else None
-    long_close_reasons = {} if not optimize else None
-    short_open_reasons = {} if not optimize else None
-    short_close_reasons = {} if not optimize else None
-    penalty_long_points = [] if (not optimize and plot_post_cross_penalty_markers) else None
-    penalty_short_points = [] if (not optimize and plot_post_cross_penalty_markers) else None
-    penalty_long_reasons = {} if (not optimize and plot_post_cross_penalty_markers) else None
-    penalty_short_reasons = {} if (not optimize and plot_post_cross_penalty_markers) else None
+    chart_state = TradeEngine.create_chart_state(
+        optimize=optimize,
+        plot_penalties=plot_post_cross_penalty_markers,
+    )
+    chart_data = chart_state["chart_data"]
+    long_open_points = chart_state["long_open_points"]
+    long_close_points = chart_state["long_close_points"]
+    short_open_points = chart_state["short_open_points"]
+    short_close_points = chart_state["short_close_points"]
+    long_open_reasons = chart_state["long_open_reasons"]
+    long_close_reasons = chart_state["long_close_reasons"]
+    short_open_reasons = chart_state["short_open_reasons"]
+    short_close_reasons = chart_state["short_close_reasons"]
+    penalty_long_points = chart_state["penalty_long_points"]
+    penalty_short_points = chart_state["penalty_short_points"]
+    penalty_long_reasons = chart_state["penalty_long_reasons"]
+    penalty_short_reasons = chart_state["penalty_short_reasons"]
 
     open_positions = []
     next_trade_id = 1
@@ -385,12 +363,77 @@ def ma_strategy(tune: dict = None):
 
 
     # ---- MANAGE TRADES ----
-    trade_manager = TradeManager(csv_logger, first_balance, monthly_profit_percent_stop_trade,
-                                 monthly_loss_percent_stop_trade, tactical_balance, monthly_profit_close_filter,
-                                 monthly_loss_close_filter, monthly_compound, leverage, safe_leverage_low,
-                                 safe_leverage_med, safe_leverage_high, safe_leverage_balance_pct_low,
-                                 safe_leverage_balance_pct_med, safe_leverage_balance_pct_high,
-                                 save_money_recover_trigger_pct, verbose=verbose)
+    trade_engine = TradeEngine(
+        first_balance=first_balance,
+        monthly_profit_percent_stop_trade=monthly_profit_percent_stop_trade,
+        monthly_loss_percent_stop_trade=monthly_loss_percent_stop_trade,
+        tactical_balance=tactical_balance,
+        monthly_profit_close_filter=monthly_profit_close_filter,
+        monthly_loss_close_filter=monthly_loss_close_filter,
+        monthly_compound=monthly_compound,
+        leverage=leverage,
+        safe_leverage_low=safe_leverage_low,
+        safe_leverage_med=safe_leverage_med,
+        safe_leverage_high=safe_leverage_high,
+        safe_leverage_balance_pct_low=safe_leverage_balance_pct_low,
+        safe_leverage_balance_pct_med=safe_leverage_balance_pct_med,
+        safe_leverage_balance_pct_high=safe_leverage_balance_pct_high,
+        save_money_recover_trigger_pct=save_money_recover_trigger_pct,
+        verbose=verbose,
+        optimize=optimize,
+    )
+
+    def capture_account_state():
+        return AccountState(
+            balance=balance,
+            balance_without_fee=balance_without_fee,
+            tactical_balance=tactical_balance,
+            deducting_fee_total=deducting_fee_total,
+            profits_lst=profits_lst,
+            total_profit_percent=total_profit_percent,
+            count_closed_orders=count_closed_orders,
+            equity_curve=equity_curve,
+            max_drawdown=max_drawdown,
+            total_wins=total_wins,
+            total_wins_long=total_wins_long,
+            total_wins_short=total_wins_short,
+            total_losses=total_losses,
+            total_long=total_long,
+            total_short=total_short,
+            cooldown_until_index=cooldown_until_index,
+            profit_percent_per_month=profit_percent_per_month,
+            save_money=save_money,
+            trade_power=trade_power,
+            total_liquids=total_liquids,
+        )
+
+    def apply_account_state(account):
+        nonlocal balance, balance_without_fee, tactical_balance
+        nonlocal deducting_fee_total, profits_lst, total_profit_percent
+        nonlocal count_closed_orders, equity_curve, max_drawdown
+        nonlocal total_wins, total_wins_long, total_wins_short, total_losses
+        nonlocal total_long, total_short, cooldown_until_index
+        nonlocal profit_percent_per_month, save_money, trade_power, total_liquids
+        balance = account.balance
+        balance_without_fee = account.balance_without_fee
+        tactical_balance = account.tactical_balance
+        deducting_fee_total = account.deducting_fee_total
+        profits_lst = account.profits_lst
+        total_profit_percent = account.total_profit_percent
+        count_closed_orders = account.count_closed_orders
+        equity_curve = account.equity_curve
+        max_drawdown = account.max_drawdown
+        total_wins = account.total_wins
+        total_wins_long = account.total_wins_long
+        total_wins_short = account.total_wins_short
+        total_losses = account.total_losses
+        total_long = account.total_long
+        total_short = account.total_short
+        cooldown_until_index = account.cooldown_until_index
+        profit_percent_per_month = account.profit_percent_per_month
+        save_money = account.save_money
+        trade_power = account.trade_power
+        total_liquids = account.total_liquids
 
     # ---- get_ADX ----
     # reuse existing `indicator` instance (created above) to avoid re-initialization
@@ -440,16 +483,6 @@ def ma_strategy(tune: dict = None):
     def _count_open(side):
         return sum(1 for p in open_positions if p['side'] == side)
 
-    def _position_equity(position, price):
-        if position['side'] == "long":
-            pnl_pct = ((price - position['entry_price']) / position['entry_price']) * 100
-        else:
-            pnl_pct = ((position['entry_price'] - price) / position['entry_price']) * 100
-        return position['margin'] + position['margin'] * pnl_pct * position['leverage'] / 100
-
-    def _open_positions_equity(price, exclude_position=None):
-        return sum(_position_equity(p, price) for p in open_positions if p is not exclude_position)
-
     # ---- MAIN ----
     for i in range(len(close_prices)):
         # print(start+i)
@@ -458,11 +491,11 @@ def ma_strategy(tune: dict = None):
         total_open_margin_static = sum(p['margin'] for p in open_positions)
 
         # margin dynamic
-        total_open_margin_dynamic = _open_positions_equity(close_prices[i])
+        total_open_margin_dynamic = trade_engine.open_positions_equity(open_positions, close_prices[i])
 
         total_money_static = balance + total_open_margin_static + save_money
         total_money_dynamic = balance + total_open_margin_dynamic + save_money
-        equity_curve, max_drawdown = trade_manager._update_drawdown(
+        equity_curve, max_drawdown = trade_engine._update_drawdown(
             equity_curve,
             max_drawdown,
             total_money_dynamic
@@ -522,48 +555,20 @@ def ma_strategy(tune: dict = None):
                 remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
                 remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                 # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                liq_updates = trade_manager.check_liquidation_long(
-                    i,
-                    low_prices,
-                    close_times,
-                    p['entry_price'],
-                    p['leverage'],
-                    p['margin'],
-                    balance,
-                    balance_without_fee,
-                    deducting_fee_total,
-                    count_closed_orders,
-                    total_losses,
-                    total_long,
-                    equity_curve,
-                    save_money,
-                    max_drawdown,
-                    p['open_time_value'],
-                    csv_logger,
-                    p['trade_amount_percent'],
-                    total_liquids,
-                    p['trade_id'],
-                    remaining_open_margin,
-                    remaining_open_margin_no_fee,
-                    tactical_balance,
-                    p['reason'],
-                    balance_before_close_batch,
-                    balance_before_close_batch_no_fee,
-                    p['balance_before_trade'],
-                    p['balance_before_trade_no_fee'],
-                    remaining_open_equity=remaining_open_margin
+                account = capture_account_state()
+                liq_updates = trade_engine.check_liquidation_long(
+                    i, low_prices, close_times, p, account,
+                    remaining_open_margin=remaining_open_margin,
+                    remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                    balance_before_close_snapshot=balance_before_close_batch,
+                    balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                    balance_before_log_override=p['balance_before_trade'],
+                    balance_before_log_override_no_fee=p['balance_before_trade_no_fee'],
+                    remaining_open_equity=remaining_open_margin,
                 )
+                apply_account_state(account)
                 if liq_updates['liquidated']:
                     liq_reason_text = "LONG EXIT (Liquidation)\nForced close by liquidation rule."
-                    balance = liq_updates['balance']
-                    balance_without_fee = liq_updates['balance_without_fee']
-                    deducting_fee_total = liq_updates['deducting_fee_total']
-                    count_closed_orders = liq_updates['count_closed_orders']
-                    total_losses = liq_updates['total_losses']
-                    total_long = liq_updates['total_long']
-                    equity_curve = liq_updates['equity_curve']
-                    max_drawdown = liq_updates['max_drawdown']
-                    total_liquids = liq_updates['total_liquids']
                     open_positions.remove(p)
                     liquidated_any = True
                     if consecutive_losses_month_stop_filter:
@@ -582,48 +587,20 @@ def ma_strategy(tune: dict = None):
                 remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
                 remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                 # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                liq_updates = trade_manager.check_liquidation_short(
-                    i,
-                    high_prices,
-                    close_times,
-                    p['entry_price'],
-                    p['leverage'],
-                    p['margin'],
-                    balance,
-                    balance_without_fee,
-                    deducting_fee_total,
-                    count_closed_orders,
-                    total_losses,
-                    total_short,
-                    equity_curve,
-                    save_money,
-                    max_drawdown,
-                    p['open_time_value'],
-                    csv_logger,
-                    p['trade_amount_percent'],
-                    total_liquids,
-                    p['trade_id'],
-                    remaining_open_margin,
-                    remaining_open_margin_no_fee,
-                    tactical_balance,
-                    p['reason'],
-                    balance_before_close_batch,
-                    balance_before_close_batch_no_fee,
-                    p['balance_before_trade'],
-                    p['balance_before_trade_no_fee'],
-                    remaining_open_equity=remaining_open_margin
+                account = capture_account_state()
+                liq_updates = trade_engine.check_liquidation_short(
+                    i, high_prices, close_times, p, account,
+                    remaining_open_margin=remaining_open_margin,
+                    remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                    balance_before_close_snapshot=balance_before_close_batch,
+                    balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                    balance_before_log_override=p['balance_before_trade'],
+                    balance_before_log_override_no_fee=p['balance_before_trade_no_fee'],
+                    remaining_open_equity=remaining_open_margin,
                 )
+                apply_account_state(account)
                 if liq_updates['liquidated']:
                     liq_reason_text = "SHORT EXIT (Liquidation)\nForced close by liquidation rule."
-                    balance = liq_updates['balance']
-                    balance_without_fee = liq_updates['balance_without_fee']
-                    deducting_fee_total = liq_updates['deducting_fee_total']
-                    count_closed_orders = liq_updates['count_closed_orders']
-                    total_losses = liq_updates['total_losses']
-                    total_short = liq_updates['total_short']
-                    equity_curve = liq_updates['equity_curve']
-                    max_drawdown = liq_updates['max_drawdown']
-                    total_liquids = liq_updates['total_liquids']
                     open_positions.remove(p)
                     liquidated_any = True
                     if consecutive_losses_month_stop_filter:
@@ -651,65 +628,22 @@ def ma_strategy(tune: dict = None):
                     # remaining_open_equity = _open_positions_equity(close_prices[i], p)
                     close_price = close_prices[i]
                     # ---- close long ----
-                    updates = trade_manager.close_long(
-                        i,
-                        close_prices,
-                        close_times,
-                        p['entry_price'],
-                        p['position_size'],
-                        p['position_size_no_fee'],
-                        fee_rate,
-                        p['margin'],
-                        p['margin_no_fee'],
-                        balance,
-                        balance_without_fee,
-                        deducting_fee_total,
-                        profits_lst,
-                        total_profit_percent,
-                        count_closed_orders,
-                        equity_curve,
-                        max_drawdown,
-                        total_wins,
-                        total_wins_long,
-                        total_losses,
-                        total_long,
-                        cooldown_after_big_pnl,
-                        p['leverage'],
-                        cooldown_until_index,
-                        p['open_time_value'],
-                        csv_logger,
-                        p['trade_amount_percent'],
-                        profit_percent_per_month,
-                        save_money,
-                        trade_power,
-                        p['trade_id'],
-                        remaining_open_margin,
-                        remaining_open_margin_no_fee,
-                        tactical_balance,
-                        p['reason'],
-                        balance_before_close_batch,
-                        balance_before_close_batch_no_fee,
-                        p['balance_before_trade'],
-                        p['balance_before_trade_no_fee'],
-                        remaining_open_equity=remaining_open_margin)
+                    account = capture_account_state()
+                    updates = trade_engine.close_long(
+                        i, close_prices, close_times, p, account,
+                        fee_rate=fee_rate,
+                        cooldown_after_big_pnl=cooldown_after_big_pnl,
+                        remaining_open_margin=remaining_open_margin,
+                        remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                        balance_before_close_snapshot=balance_before_close_batch,
+                        balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                        balance_before_log_override=p['balance_before_trade'],
+                        balance_before_log_override_no_fee=p['balance_before_trade_no_fee'],
+                        remaining_open_equity=remaining_open_margin,
+                    )
+                    apply_account_state(account)
 
-                    balance = updates['balance']
-                    balance_without_fee = updates['balance_without_fee']
-                    deducting_fee_total = updates['deducting_fee_total']
-                    profits_lst = updates['profits_lst']
                     profit_order = updates['profit']
-                    total_profit_percent = updates['total_profit_percent']
-                    count_closed_orders = updates['count_closed_orders']
-                    equity_curve = updates['equity_curve']
-                    max_drawdown = updates['max_drawdown']
-                    total_wins = updates['total_wins']
-                    total_wins_long = updates['total_wins_long']
-                    total_losses = updates['total_losses']
-                    total_long = updates['total_long']
-                    cooldown_until_index = updates['cooldown_until_index']
-                    profit_percent_per_month = updates['profit_percent_per_month']
-                    save_money = updates['save_money']
-                    trade_power = updates['trade_power']
                     # remove position
                     open_positions.remove(p)
                     
@@ -754,66 +688,22 @@ def ma_strategy(tune: dict = None):
                     # remaining_open_equity = _open_positions_equity(close_prices[i], p)
                     close_price = close_prices[i]
                     # ---- close short ----
-                    updates = trade_manager.close_short(
-                        i,
-                        close_prices,
-                        close_times,
-                        p['entry_price'],
-                        p['position_size'],
-                        p['position_size_no_fee'],
-                        fee_rate,
-                        p['margin'],
-                        p['margin_no_fee'],
-                        balance,
-                        balance_without_fee,
-                        deducting_fee_total,
-                        profits_lst,
-                        total_profit_percent,
-                        count_closed_orders,
-                        equity_curve,
-                        max_drawdown,
-                        total_wins,
-                        total_wins_short,
-                        total_losses,
-                        total_short,
-                        cooldown_after_big_pnl,
-                        p['leverage'],
-                        cooldown_until_index,
-                        p['open_time_value'],
-                        csv_logger,
-                        p['trade_amount_percent'],
-                        profit_percent_per_month,
-                        save_money,
-                        trade_power,
-                        p['trade_id'],
-                        remaining_open_margin,
-                        remaining_open_margin_no_fee,
-                        tactical_balance,
-                        p['reason'],
-                        balance_before_close_batch,
-                        balance_before_close_batch_no_fee,
-                        p['balance_before_trade'],
-                        p['balance_before_trade_no_fee'],
-                        remaining_open_equity=remaining_open_margin
-                        )
+                    account = capture_account_state()
+                    updates = trade_engine.close_short(
+                        i, close_prices, close_times, p, account,
+                        fee_rate=fee_rate,
+                        cooldown_after_big_pnl=cooldown_after_big_pnl,
+                        remaining_open_margin=remaining_open_margin,
+                        remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                        balance_before_close_snapshot=balance_before_close_batch,
+                        balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                        balance_before_log_override=p['balance_before_trade'],
+                        balance_before_log_override_no_fee=p['balance_before_trade_no_fee'],
+                        remaining_open_equity=remaining_open_margin,
+                    )
+                    apply_account_state(account)
 
-                    balance = updates['balance']
-                    balance_without_fee = updates['balance_without_fee']
-                    deducting_fee_total = updates['deducting_fee_total']
-                    profits_lst = updates['profits_lst']
                     profit_order = updates['profit']
-                    total_profit_percent = updates['total_profit_percent']
-                    count_closed_orders = updates['count_closed_orders']
-                    equity_curve = updates['equity_curve']
-                    max_drawdown = updates['max_drawdown']
-                    total_wins = updates['total_wins']
-                    total_wins_short = updates['total_wins_short']
-                    total_losses = updates['total_losses']
-                    total_short = updates['total_short']
-                    cooldown_until_index = updates['cooldown_until_index']
-                    profit_percent_per_month = updates['profit_percent_per_month']
-                    save_money = updates['save_money']
-                    trade_power = updates['trade_power']
                     # remove position
                     open_positions.remove(p)
 
@@ -903,41 +793,26 @@ def ma_strategy(tune: dict = None):
                         and not rsi_in_cooldown
                     ):
                         # ---- open long ----
-                        updates = trade_manager.open_long(
-                            i,
-                            close_prices,
-                            close_times,
-                            balance,
-                            balance_without_fee,
-                            rsi_trade_amount_percent,
-                            balance + sum(p['margin'] for p in open_positions),
-                            balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
-                            tactical_balance,
-                            leverage = rsi_leverage,)
+                        account = capture_account_state()
+                        updates = trade_engine.open_long(
+                            i, close_prices, close_times, account,
+                            trade_amount_percent=rsi_trade_amount_percent,
+                            margin_balance=balance + sum(p['margin'] for p in open_positions),
+                            margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
+                            leverage=rsi_leverage,
+                        )
+                        apply_account_state(account)
                         if updates is not None:
-
-                            balance = updates['balance']
-                            balance_without_fee = updates['balance_without_fee']
                             trade_reason = 'rsi_ma_strategy'
-                            position = {
-                                'trade_id': f"{trade_reason}_{next_trade_id:04d}",
-                                'side': "long",
-                                'entry_price': updates['entry_price'],
-                                'entry_index': i,
-                                'highest_since_entry': max(updates['entry_price'], high_prices[i]),
-                                'lowest_since_entry': min(updates['entry_price'], low_prices[i]),
-                                'position_size': updates['position_size'],
-                                'position_size_no_fee': updates['position_size_no_fee'],
-                                'balance_before_trade': updates['balance_before_trade'],
-                                'balance_before_trade_no_fee': updates['balance_before_trade_no_fee'],
-                                'margin': updates['margin'],
-                                'margin_no_fee': updates['margin_no_fee'],
-                                'trade_amount_percent': updates['trade_amount_percent'],
-                                'leverage': updates['leverage'],
-                                'open_time_value': updates['open_time_value'],
-                                'target_close_price_loss': updates['entry_price'],
-                                'reason': trade_reason
-                            }
+                            position = Position.from_open_result(
+                                updates,
+                                trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                                side="long",
+                                entry_index=i,
+                                high_price=high_prices[i],
+                                low_price=low_prices[i],
+                                reason=trade_reason,
+                            )
                             open_positions.append(position)
                             
                             # open point on chart
@@ -986,41 +861,26 @@ def ma_strategy(tune: dict = None):
                         and not rsi_in_cooldown
                     ):
                         # ---- open short ----
-                        updates = trade_manager.open_short(
-                            i,
-                            close_prices,
-                            close_times,
-                            balance,
-                            balance_without_fee,
-                            rsi_trade_amount_percent,
-                            balance + sum(p['margin'] for p in open_positions),
-                            balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
-                            tactical_balance,
-                            leverage = rsi_leverage,)
+                        account = capture_account_state()
+                        updates = trade_engine.open_short(
+                            i, close_prices, close_times, account,
+                            trade_amount_percent=rsi_trade_amount_percent,
+                            margin_balance=balance + sum(p['margin'] for p in open_positions),
+                            margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
+                            leverage=rsi_leverage,
+                        )
+                        apply_account_state(account)
                         if updates is not None:
-                            
-                            balance = updates['balance']
-                            balance_without_fee = updates['balance_without_fee']
                             trade_reason = 'rsi_ma_strategy'
-                            position = {
-                                'trade_id': f"{trade_reason}_{next_trade_id:04d}",
-                                'side': "short",
-                                'entry_price': updates['entry_price'],
-                                'entry_index': i,
-                                'highest_since_entry': max(updates['entry_price'], high_prices[i]),
-                                'lowest_since_entry': min(updates['entry_price'], low_prices[i]),
-                                'position_size': updates['position_size'],
-                                'position_size_no_fee': updates['position_size_no_fee'],
-                                'balance_before_trade': updates['balance_before_trade'],
-                                'balance_before_trade_no_fee': updates['balance_before_trade_no_fee'],
-                                'margin': updates['margin'],
-                                'margin_no_fee': updates['margin_no_fee'],
-                                'trade_amount_percent': updates['trade_amount_percent'],
-                                'leverage': updates['leverage'],
-                                'open_time_value': updates['open_time_value'],
-                                'target_close_price_loss': updates['entry_price'],
-                                'reason': trade_reason
-                            }
+                            position = Position.from_open_result(
+                                updates,
+                                trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                                side="short",
+                                entry_index=i,
+                                high_price=high_prices[i],
+                                low_price=low_prices[i],
+                                reason=trade_reason,
+                            )
                             open_positions.append(position)
                             
                             # open point on chart
@@ -1140,8 +1000,7 @@ def ma_strategy(tune: dict = None):
                     if skip_logic and skip_trades_left > 0:
                         skip_trades_left -= 1
                         last_trade_cross_index = last_cross_index
-                        if verbose:
-                            print(f"⏭️ SKIP LONG | skips left: {skip_trades_left}")
+                        TradeEngine.display(verbose, f"⏭️ SKIP LONG | skips left: {skip_trades_left}")
                         continue
                     entry_reason_text = build_score_reason_text(
                         "LONG ENTRY SCORE REASONS",
@@ -1151,40 +1010,26 @@ def ma_strategy(tune: dict = None):
                     )
 
                     # ---- open long ----
-                    updates = trade_manager.open_long(
-                        i,
-                        close_prices,
-                        close_times,
-                        balance,
-                        balance_without_fee,
-                        trade_amount_percent,
-                        balance + sum(p['margin'] for p in open_positions),
-                        balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
-                        tactical_balance)
+                    account = capture_account_state()
+                    updates = trade_engine.open_long(
+                        i, close_prices, close_times, account,
+                        trade_amount_percent=trade_amount_percent,
+                        margin_balance=balance + sum(p['margin'] for p in open_positions),
+                        margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
+                        leverage=None,
+                    )
+                    apply_account_state(account)
                     if updates is not None:
-
-                        balance = updates['balance']
-                        balance_without_fee = updates['balance_without_fee']
                         trade_reason = 'ma_strategy'
-                        position = {
-                            'trade_id': f"{trade_reason}_{next_trade_id:04d}",
-                            'side': "long",
-                            'entry_price': updates['entry_price'],
-                            'entry_index': i,
-                            'highest_since_entry': max(updates['entry_price'], high_prices[i]),
-                            'lowest_since_entry': min(updates['entry_price'], low_prices[i]),
-                            'position_size': updates['position_size'],
-                            'position_size_no_fee': updates['position_size_no_fee'],
-                            'balance_before_trade': updates['balance_before_trade'],
-                            'balance_before_trade_no_fee': updates['balance_before_trade_no_fee'],
-                            'margin': updates['margin'],
-                            'margin_no_fee': updates['margin_no_fee'],
-                            'trade_amount_percent': updates['trade_amount_percent'],
-                            'leverage': updates['leverage'],
-                            'open_time_value': updates['open_time_value'],
-                            'target_close_price_loss': updates['entry_price'],
-                            'reason': trade_reason
-                        }
+                        position = Position.from_open_result(
+                            updates,
+                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                            side="long",
+                            entry_index=i,
+                            high_price=high_prices[i],
+                            low_price=low_prices[i],
+                            reason=trade_reason,
+                        )
                         open_positions.append(position)
                         
                         # open point on chart
@@ -1247,16 +1092,15 @@ def ma_strategy(tune: dict = None):
                         long_scale_entry_reason = None
 
                 if long_scale_entry_reason is not None:
-                    updates = trade_manager.open_long(
-                        i,
-                        close_prices,
-                        close_times,
-                        balance,
-                        balance_without_fee,
-                        scale_entry_amount_percent,
-                        balance + sum(p['margin'] for p in open_positions),
-                        balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
-                        tactical_balance)
+                    account = capture_account_state()
+                    updates = trade_engine.open_long(
+                        i, close_prices, close_times, account,
+                        trade_amount_percent=scale_entry_amount_percent,
+                        margin_balance=balance + sum(p['margin'] for p in open_positions),
+                        margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
+                        leverage=None,
+                    )
+                    apply_account_state(account)
                     if updates is not None:
 
                         # count profits, losses Scales
@@ -1265,29 +1109,16 @@ def ma_strategy(tune: dict = None):
                         elif long_scale_entry_reason == "loss":
                             long_loss_scale_entries += 1
                         
-                        # ==== UPDATE ====
-                        balance = updates['balance']
-                        balance_without_fee = updates['balance_without_fee']
                         trade_reason = 'scale_ma_strategy'
-                        position = {
-                            'trade_id': f"{trade_reason}_{next_trade_id:04d}",
-                            'side': "long",
-                            'entry_price': updates['entry_price'],
-                            'entry_index': i,
-                            'highest_since_entry': max(updates['entry_price'], high_prices[i]),
-                            'lowest_since_entry': min(updates['entry_price'], low_prices[i]),
-                            'position_size': updates['position_size'],
-                            'position_size_no_fee': updates['position_size_no_fee'],
-                            'balance_before_trade': updates['balance_before_trade'],
-                            'balance_before_trade_no_fee': updates['balance_before_trade_no_fee'],
-                            'margin': updates['margin'],
-                            'margin_no_fee': updates['margin_no_fee'],
-                            'trade_amount_percent': updates['trade_amount_percent'],
-                            'leverage': updates['leverage'],
-                            'open_time_value': updates['open_time_value'],
-                            'target_close_price_loss': updates['entry_price'],
-                            'reason': trade_reason
-                        }
+                        position = Position.from_open_result(
+                            updates,
+                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                            side="long",
+                            entry_index=i,
+                            high_price=high_prices[i],
+                            low_price=low_prices[i],
+                            reason=trade_reason,
+                        )
                         open_positions.append(position)
                         next_trade_id += 1
                         if long_open_points is not None:
@@ -1424,47 +1255,20 @@ def ma_strategy(tune: dict = None):
                 remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                 # remaining_open_equity = _open_positions_equity(close_prices[i], p)
                 close_price = close_prices[i]
-                updates = trade_manager.close_long(
-                    i,
-                    close_prices,
-                    close_times,
-                    p['entry_price'],
-                    p['position_size'],
-                    p['position_size_no_fee'],
-                    fee_rate,
-                    p['margin'],
-                    p['margin_no_fee'],
-                    balance,
-                    balance_without_fee,
-                    deducting_fee_total,
-                    profits_lst,
-                    total_profit_percent,
-                    count_closed_orders,
-                    equity_curve,
-                    max_drawdown,
-                    total_wins,
-                    total_wins_long,
-                    total_losses,
-                    total_long,
-                    cooldown_after_big_pnl,
-                    p['leverage'],
-                    cooldown_until_index,
-                    p['open_time_value'],
-                    csv_logger,
-                    p['trade_amount_percent'],
-                    profit_percent_per_month,
-                    save_money,
-                    trade_power,
-                    p['trade_id'],
-                    remaining_open_margin,
-                    remaining_open_margin_no_fee,
-                    tactical_balance,
-                    p['reason'],
-                    balance_before_close_batch,
-                    balance_before_close_batch_no_fee,
-                    p['balance_before_trade'],
-                    p['balance_before_trade_no_fee'],
-                    remaining_open_equity=remaining_open_margin)
+                account = capture_account_state()
+                updates = trade_engine.close_long(
+                    i, close_prices, close_times, p, account,
+                    fee_rate=fee_rate,
+                    cooldown_after_big_pnl=cooldown_after_big_pnl,
+                    remaining_open_margin=remaining_open_margin,
+                    remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                    balance_before_close_snapshot=balance_before_close_batch,
+                    balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                    balance_before_log_override=p['balance_before_trade'],
+                    balance_before_log_override_no_fee=p['balance_before_trade_no_fee'],
+                    remaining_open_equity=remaining_open_margin,
+                )
+                apply_account_state(account)
                 
                 # count profit,loss scales positions
                 if p.get('reason') == 'scale_ma_strategy':
@@ -1475,23 +1279,6 @@ def ma_strategy(tune: dict = None):
                         scale_ma_long_wins += 1
                     else:
                         scale_ma_long_losses += 1
-
-                balance = updates['balance']
-                balance_without_fee = updates['balance_without_fee']
-                deducting_fee_total = updates['deducting_fee_total']
-                profits_lst = updates['profits_lst']
-                total_profit_percent = updates['total_profit_percent']
-                count_closed_orders = updates['count_closed_orders']
-                equity_curve = updates['equity_curve']
-                max_drawdown = updates['max_drawdown']
-                total_wins = updates['total_wins']
-                total_wins_long = updates['total_wins_long']
-                total_losses = updates['total_losses']
-                total_long = updates['total_long']
-                cooldown_until_index = updates['cooldown_until_index']
-                profit_percent_per_month = updates['profit_percent_per_month']
-                save_money = updates['save_money']
-                trade_power = updates['trade_power']
                 # remove position
                 open_positions.remove(p)
                 
@@ -1661,8 +1448,7 @@ def ma_strategy(tune: dict = None):
                     if skip_logic and skip_trades_left > 0:
                         skip_trades_left -= 1
                         last_trade_cross_index = last_cross_index
-                        if verbose:
-                            print(f"⏭️ SKIP SHORT | skips left: {skip_trades_left}")
+                        TradeEngine.display(verbose, f"⏭️ SKIP SHORT | skips left: {skip_trades_left}")
                         continue
                     entry_reason_text = build_score_reason_text(
                         "SHORT ENTRY SCORE REASONS",
@@ -1672,40 +1458,26 @@ def ma_strategy(tune: dict = None):
                     )
 
                     # ---- open short ----
-                    updates = trade_manager.open_short(
-                        i,
-                        close_prices,
-                        close_times,
-                        balance,
-                        balance_without_fee,
-                        trade_amount_percent,
-                        balance + sum(p['margin'] for p in open_positions),
-                        balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
-                        tactical_balance)
+                    account = capture_account_state()
+                    updates = trade_engine.open_short(
+                        i, close_prices, close_times, account,
+                        trade_amount_percent=trade_amount_percent,
+                        margin_balance=balance + sum(p['margin'] for p in open_positions),
+                        margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
+                        leverage=None,
+                    )
+                    apply_account_state(account)
                     if updates is not None:
-                        
-                        balance = updates['balance']
-                        balance_without_fee = updates['balance_without_fee']
                         trade_reason = 'ma_strategy'
-                        position = {
-                            'trade_id': f"{trade_reason}_{next_trade_id:04d}",
-                            'side': "short",
-                            'entry_price': updates['entry_price'],
-                            'entry_index': i,
-                            'highest_since_entry': max(updates['entry_price'], high_prices[i]),
-                            'lowest_since_entry': min(updates['entry_price'], low_prices[i]),
-                            'position_size': updates['position_size'],
-                            'position_size_no_fee': updates['position_size_no_fee'],
-                            'balance_before_trade': updates['balance_before_trade'],
-                            'balance_before_trade_no_fee': updates['balance_before_trade_no_fee'],
-                            'margin': updates['margin'],
-                            'margin_no_fee': updates['margin_no_fee'],
-                            'trade_amount_percent': updates['trade_amount_percent'],
-                            'leverage': updates['leverage'],
-                            'open_time_value': updates['open_time_value'],
-                            'target_close_price_loss': updates['entry_price'],
-                            'reason': trade_reason
-                        }
+                        position = Position.from_open_result(
+                            updates,
+                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                            side="short",
+                            entry_index=i,
+                            high_price=high_prices[i],
+                            low_price=low_prices[i],
+                            reason=trade_reason,
+                        )
                         open_positions.append(position)
                         
                         # open point on chart
@@ -1768,16 +1540,15 @@ def ma_strategy(tune: dict = None):
                         short_scale_entry_reason = None
 
                 if short_scale_entry_reason is not None:
-                    updates = trade_manager.open_short(
-                        i,
-                        close_prices,
-                        close_times,
-                        balance,
-                        balance_without_fee,
-                        scale_entry_amount_percent,
-                        balance + sum(p['margin'] for p in open_positions),
-                        balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
-                        tactical_balance)
+                    account = capture_account_state()
+                    updates = trade_engine.open_short(
+                        i, close_prices, close_times, account,
+                        trade_amount_percent=scale_entry_amount_percent,
+                        margin_balance=balance + sum(p['margin'] for p in open_positions),
+                        margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
+                        leverage=None,
+                    )
+                    apply_account_state(account)
                     if updates is not None:
                         
                         # count profits, losses Scales
@@ -1786,29 +1557,16 @@ def ma_strategy(tune: dict = None):
                         elif short_scale_entry_reason == "loss":
                             short_loss_scale_entries += 1
 
-                        # === UPDATE ===
-                        balance = updates['balance']
-                        balance_without_fee = updates['balance_without_fee']
                         trade_reason = 'scale_ma_strategy'
-                        position = {
-                            'trade_id': f"{trade_reason}_{next_trade_id:04d}",
-                            'side': "short",
-                            'entry_price': updates['entry_price'],
-                            'entry_index': i,
-                            'highest_since_entry': max(updates['entry_price'], high_prices[i]),
-                            'lowest_since_entry': min(updates['entry_price'], low_prices[i]),
-                            'position_size': updates['position_size'],
-                            'position_size_no_fee': updates['position_size_no_fee'],
-                            'balance_before_trade': updates['balance_before_trade'],
-                            'balance_before_trade_no_fee': updates['balance_before_trade_no_fee'],
-                            'margin': updates['margin'],
-                            'margin_no_fee': updates['margin_no_fee'],
-                            'trade_amount_percent': updates['trade_amount_percent'],
-                            'leverage': updates['leverage'],
-                            'open_time_value': updates['open_time_value'],
-                            'target_close_price_loss': updates['entry_price'],
-                            'reason': trade_reason
-                        }
+                        position = Position.from_open_result(
+                            updates,
+                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                            side="short",
+                            entry_index=i,
+                            high_price=high_prices[i],
+                            low_price=low_prices[i],
+                            reason=trade_reason,
+                        )
                         open_positions.append(position)
                         next_trade_id += 1
                         if short_open_points is not None:
@@ -1944,48 +1702,20 @@ def ma_strategy(tune: dict = None):
                 remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                 # remaining_open_equity = _open_positions_equity(close_prices[i], p)
                 close_price = close_prices[i]
-                updates = trade_manager.close_short(
-                    i,
-                    close_prices,
-                    close_times,
-                    p['entry_price'],
-                    p['position_size'],
-                    p['position_size_no_fee'],
-                    fee_rate,
-                    p['margin'],
-                    p['margin_no_fee'],
-                    balance,
-                    balance_without_fee,
-                    deducting_fee_total,
-                    profits_lst,
-                    total_profit_percent,
-                    count_closed_orders,
-                    equity_curve,
-                    max_drawdown,
-                    total_wins,
-                    total_wins_short,
-                    total_losses,
-                    total_short,
-                    cooldown_after_big_pnl,
-                    p['leverage'],
-                    cooldown_until_index,
-                    p['open_time_value'],
-                    csv_logger,
-                    p['trade_amount_percent'],
-                    profit_percent_per_month,
-                    save_money,
-                    trade_power,
-                    p['trade_id'],
-                    remaining_open_margin,
-                    remaining_open_margin_no_fee,
-                    tactical_balance,
-                    p['reason'],
-                    balance_before_close_batch,
-                    balance_before_close_batch_no_fee,
-                    p['balance_before_trade'],
-                    p['balance_before_trade_no_fee'],
-                    remaining_open_equity=remaining_open_margin
-                    )
+                account = capture_account_state()
+                updates = trade_engine.close_short(
+                    i, close_prices, close_times, p, account,
+                    fee_rate=fee_rate,
+                    cooldown_after_big_pnl=cooldown_after_big_pnl,
+                    remaining_open_margin=remaining_open_margin,
+                    remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                    balance_before_close_snapshot=balance_before_close_batch,
+                    balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                    balance_before_log_override=p['balance_before_trade'],
+                    balance_before_log_override_no_fee=p['balance_before_trade_no_fee'],
+                    remaining_open_equity=remaining_open_margin,
+                )
+                apply_account_state(account)
 
                 # count profit,loss scales positions
                 if p.get('reason') == 'scale_ma_strategy':
@@ -1996,23 +1726,6 @@ def ma_strategy(tune: dict = None):
                         scale_ma_short_wins += 1
                     else:
                         scale_ma_short_losses += 1
-
-                balance = updates['balance']
-                balance_without_fee = updates['balance_without_fee']
-                deducting_fee_total = updates['deducting_fee_total']
-                profits_lst = updates['profits_lst']
-                total_profit_percent = updates['total_profit_percent']
-                count_closed_orders = updates['count_closed_orders']
-                equity_curve = updates['equity_curve']
-                max_drawdown = updates['max_drawdown']
-                total_wins = updates['total_wins']
-                total_wins_short = updates['total_wins_short']
-                total_losses = updates['total_losses']
-                total_short = updates['total_short']
-                cooldown_until_index = updates['cooldown_until_index']
-                profit_percent_per_month = updates['profit_percent_per_month']
-                save_money = updates['save_money']
-                trade_power = updates['trade_power']
                 # remove position
                 open_positions.remove(p)
 
@@ -2105,363 +1818,98 @@ def ma_strategy(tune: dict = None):
                 pending_monthly_stop_reason = monthly_stop_reason
                 pending_monthly_stop_value = monthly_stop_value
                 
-    # ===================== BACKTEST SUMMARY =====================
-
-    if open_positions:
-        balance += sum(p['margin'] for p in open_positions)
-        balance_without_fee += sum(p['margin_no_fee'] for p in open_positions)
-
-    balance += save_money
-
-    # summary calculation
-    t_profit_percent = balance * 100 / first_balance - 100
-    days, hours, minutes = trade_duration(first_open_time, last_close_time)
-    win_rate = (total_wins / (total_wins + total_losses)) * 100 if (total_wins + total_losses) > 0 else 0
-
-
-    # ====== scale calculation ======
-    # ---- LONG ----
-    scale_long_total = scale_ma_long_wins + scale_ma_long_losses
-
-    scale_long_winrate = (
-        round(scale_ma_long_wins / scale_long_total * 100, 2)
-        if scale_long_total > 0 else 0
+    return trade_engine.finalize_backtest(
+        optimize=optimize,
+        balance=balance,
+        balance_without_fee=balance_without_fee,
+        save_money=save_money,
+        open_positions=open_positions,
+        first_balance=first_balance,
+        first_open_time=first_open_time,
+        last_close_time=last_close_time,
+        total_money_static=total_money_static,
+        total_money_dynamic=total_money_dynamic,
+        total_profit_percent=total_profit_percent,
+        deducting_fee_total=deducting_fee_total,
+        profits_lst=profits_lst,
+        count_closed_orders=count_closed_orders,
+        total_wins=total_wins,
+        total_wins_long=total_wins_long,
+        total_wins_short=total_wins_short,
+        total_losses=total_losses,
+        total_long=total_long,
+        total_short=total_short,
+        max_drawdown=max_drawdown,
+        total_liquids=total_liquids,
+        lst_profit_percent_per_month=lst_profit_percent_per_month,
+        monthly_stop_reasons=monthly_stop_reasons,
+        long_profit_scale_entry_attempts=long_profit_scale_entry_attempts,
+        long_loss_scale_entry_attempts=long_loss_scale_entry_attempts,
+        long_filtered_profit_scale_entries=long_filtered_profit_scale_entries,
+        long_profit_scale_entries=long_profit_scale_entries,
+        long_loss_scale_entries=long_loss_scale_entries,
+        short_profit_scale_entry_attempts=short_profit_scale_entry_attempts,
+        short_loss_scale_entry_attempts=short_loss_scale_entry_attempts,
+        short_filtered_profit_scale_entries=short_filtered_profit_scale_entries,
+        short_profit_scale_entries=short_profit_scale_entries,
+        short_loss_scale_entries=short_loss_scale_entries,
+        scale_ma_long_wins=scale_ma_long_wins,
+        scale_ma_long_losses=scale_ma_long_losses,
+        scale_ma_long_total_profit=scale_ma_long_total_profit,
+        scale_ma_short_wins=scale_ma_short_wins,
+        scale_ma_short_losses=scale_ma_short_losses,
+        scale_ma_short_total_profit=scale_ma_short_total_profit,
+        rsi_long_total=rsi_long_total,
+        rsi_long_wins=rsi_long_wins,
+        rsi_long_losses=rsi_long_losses,
+        rsi_long_total_profit=rsi_long_total_profit,
+        rsi_short_total=rsi_short_total,
+        rsi_short_wins=rsi_short_wins,
+        rsi_short_losses=rsi_short_losses,
+        rsi_short_total_profit=rsi_short_total_profit,
+        chart_payload={
+            "chart_data": chart_data,
+            "close_prices": close_prices,
+            "close_times": close_times,
+            "open_prices": open_prices,
+            "high_prices": high_prices,
+            "low_prices": low_prices,
+            "ema_16": ema_16,
+            "ma_50": ma_50,
+            "ma_100": ma_100,
+            "ma_200": ma_200,
+            "rsi_values": rsi_list,
+            "long_open_points": long_open_points,
+            "long_close_points": long_close_points,
+            "short_open_points": short_open_points,
+            "short_close_points": short_close_points,
+            "penalty_long_points": penalty_long_points,
+            "penalty_short_points": penalty_short_points,
+            "long_open_reasons": long_open_reasons,
+            "long_close_reasons": long_close_reasons,
+            "short_open_reasons": short_open_reasons,
+            "short_close_reasons": short_close_reasons,
+            "penalty_long_reasons": penalty_long_reasons,
+            "penalty_short_reasons": penalty_short_reasons,
+            "plot_end_offset": plot_end_offset,
+            "plot_max_candles": plot_max_candles,
+            "plot_step_candles": plot_step_candles,
+            "plot_min_zoom_candles": plot_min_zoom_candles,
+            "plot_max_render_candles": plot_max_render_candles,
+            "plot_zoom_in_factor": plot_zoom_in_factor,
+            "plot_zoom_out_factor": plot_zoom_out_factor,
+            "plot_window_width_scale": plot_window_width_scale,
+            "plot_window_height_scale": plot_window_height_scale,
+            "plot_drag_preview_factor": plot_drag_preview_factor,
+            "plot_drag_update_interval_ms": plot_drag_update_interval_ms,
+            "plot_yscale_drag_sensitivity": plot_yscale_drag_sensitivity,
+        },
     )
-
-    # ---- SHORT ----
-    scale_short_total = scale_ma_short_wins + scale_ma_short_losses
-
-    short_winrate = (
-        round(scale_ma_short_wins / scale_short_total * 100, 2)
-        if scale_short_total > 0 else 0
-    )
-
-    # ---- OVERALL ----
-    scale_total_profit_closed = scale_ma_long_wins + scale_ma_short_wins
-    scale_total_loss_closed = scale_ma_long_losses + scale_ma_short_losses
-
-    scale_total_closed = scale_total_profit_closed + scale_total_loss_closed
-
-    scale_total_winrate = (
-        round(scale_total_profit_closed / scale_total_closed * 100, 2)
-        if scale_total_closed > 0 else 0
-    )
-
-    scale_total_profit_amount = (
-        scale_ma_long_total_profit +
-        scale_ma_short_total_profit
-    )
-
-    # ====== RSI calculation OVERALL ======
-    rsi_total_trades = rsi_long_total + rsi_short_total
-    rsi_total_wins = rsi_long_wins + rsi_short_wins
-    rsi_total_losses = rsi_long_losses + rsi_short_losses
-    rsi_total_profit = rsi_long_total_profit + rsi_short_total_profit
-    rsi_winrate = round(rsi_total_wins / rsi_total_trades * 100, 2) if rsi_total_trades > 0 else 0
-
-    if monthly_stop_reasons:
-        profit_months_count = sum(1 for r in monthly_stop_reasons if r == "profit")
-        loss_months_count = sum(1 for r in monthly_stop_reasons if r == "loss")
-    else:
-        # fallback: keep previous behavior when no explicit monthly stop reason exists
-        profit_months_count = sum(1 for p in lst_profit_percent_per_month if p > 0)
-        loss_months_count = sum(1 for p in lst_profit_percent_per_month if p < 0)
-
-
-    # =========================
-    # NORMALIZED STRATEGY SCORE
-    # =========================
-
-    final_balance = total_money_static
-
-    # --- Growth ---
-    growth = final_balance / first_balance
-
-    # --- Risk (Drawdown) ---
-    risk = abs(max_drawdown) / 100
-
-    # --- Consistency ---
-    consistency = profit_months_count / max(1, (profit_months_count + loss_months_count))
-
-    # --- Quality (Winrate) ---
-    quality = win_rate / 100
-
-    # =========================
-    # FINAL SCORE
-    # =========================
-    score = (
-        (growth ** 1.15)
-        * (0.6 + quality)
-        * (0.5 + consistency)
-        / (1 + (risk * 2))
-    )
-
-    if verbose:
-        print("✅ BACKTEST FINISHED")
-        print("Closed Trades:", count_closed_orders, "( Longs:", total_long, "| Shorts:", total_short, ")")
-        print("Count open Trades:", len(open_positions))
-        print("Total Wins:", total_wins, "| Total Wins Long:", total_wins_long, "| Total Wins Short:", total_wins_short)
-        print("Total Losses:", total_losses)
-        print("Final Balance:", round(balance, 2), "$")
-        print("Final Balance (No Fee):", round(balance_without_fee, 2), "$")
-        print("Final balance if close, open orders:", round(total_money_dynamic, 2), "$")
-        print("Total Fees Paid:", round(deducting_fee_total, 2), "$")
-        print("Fee Compounding Impact:",
-              round(balance_without_fee - balance - deducting_fee_total, 2), "$")
-        print("Maximum Drawdown:", round(max_drawdown, 2), "%")
-        print(f"Total Duration : {days} days, {hours} hours, {minutes} minutes")
-        print("Win Rate:", round(win_rate, 2), "%")
-        print("Total Profit:", round(sum(profits_lst), 2), "$")
-        print("Total Profit Percent:", round(t_profit_percent, 2), "%", "or", round(total_profit_percent, 2), "%")
-        print("saved Money:", round(save_money,2), "$")
-        print("Count Liquids:", total_liquids)
-        print("count_profit_months:", profit_months_count)
-        print("count_loss_months:", loss_months_count)
-        print("Total score:", score)
-
-
-        # SCALE ENTRY REPORT
-        print("\n================ SCALE ENTRY REPORT ================\n")
-
-        # ---- LONG ENTRY ----
-        print("===== LONG SCALE ENTRY =====")
-        print(f"Profit Triggered : {long_profit_scale_entry_attempts}")
-        print(f"Profit Executed  : {long_profit_scale_entries}")
-        print(f"Profit Filtered  : {long_filtered_profit_scale_entries}")
-        print()
-        print(f"Loss Triggered   : {long_loss_scale_entry_attempts}")
-        print(f"Loss Executed    : {long_loss_scale_entries}")
-
-        print("\n-----------------------------------------------------\n")
-
-        # ---- SHORT ENTRY ----
-        print("===== SHORT SCALE ENTRY =====")
-        print(f"Profit Triggered : {short_profit_scale_entry_attempts}")
-        print(f"Profit Executed  : {short_profit_scale_entries}")
-        print(f"Profit Filtered  : {short_filtered_profit_scale_entries}")
-        print()
-        print(f"Loss Triggered   : {short_loss_scale_entry_attempts}")
-        print(f"Loss Executed    : {short_loss_scale_entries}")
-
-        print("\n=====================================================\n")
-
-
-        print("================ SCALE PERFORMANCE =================\n")
-
-        # ---- LONG PERFORMANCE ----
-        print("===== LONG SCALE STATS =====")
-        print(f"Total Closed : {scale_long_total}")
-        print(f"Wins         : {scale_ma_long_wins}")
-        print(f"Losses       : {scale_ma_long_losses}")
-        print(f"Winrate      : {scale_long_winrate}%")
-        print(f"Total Profit : {round(scale_ma_long_total_profit, 2)}")
-
-        print("\n-----------------------------------------------------\n")
-
-        # ---- SHORT PERFORMANCE ----
-        print("===== SHORT SCALE STATS =====")
-        print(f"Total Closed : {scale_short_total}")
-        print(f"Wins         : {scale_ma_short_wins}")
-        print(f"Losses       : {scale_ma_short_losses}")
-        print(f"Winrate      : {short_winrate}%")
-        print(f"Total Profit : {round(scale_ma_short_total_profit, 2)}")
-
-        print("\n-----------------------------------------------------\n")
-
-        # ---- OVERALL PERFORMANCE ----
-        print("===== OVERALL SCALE PERFORMANCE =====")
-        print(f"Total Trades : {scale_total_closed}")
-        print(f"Wins         : {scale_total_profit_closed}")
-        print(f"Losses       : {scale_total_loss_closed}")
-        print(f"Winrate      : {scale_total_winrate}%")
-        print(f"Total Profit : {round(scale_total_profit_amount, 2)}")
-
-        print("\n=====================================================\n")
-
-
-        # ======== RSI STRATEGY REPORT ========
-        print("\n================ RSI STRATEGY REPORT ================\n")
-
-        # ---- LONG ----
-        print("===== RSI LONG STATS =====")
-        print("Total:", rsi_long_total)
-        print("Wins:", rsi_long_wins)
-        print("Losses:", rsi_long_losses)
-
-        if rsi_long_total > 0:
-            print("Winrate:", round(rsi_long_wins / rsi_long_total * 100, 2), "%")
-
-        print("Total Profit:", round(rsi_long_total_profit, 2))
-        print("\n")
-
-        # ---- SHORT ----
-        print("===== RSI SHORT STATS =====")
-        print("Total:", rsi_short_total)
-        print("Wins:", rsi_short_wins)
-        print("Losses:", rsi_short_losses)
-
-        if rsi_short_total > 0:
-            print("Winrate:", round(rsi_short_wins / rsi_short_total * 100, 2), "%")
-
-        print("Total Profit:", round(rsi_short_total_profit, 2))
-        print("\n-----------------------------------------------------\n")
-
-
-        print("===== OVERALL RSI PERFORMANCE =====")
-        print("Total Trades:", rsi_total_trades)
-        print("Wins:", rsi_total_wins)
-        print("Losses:", rsi_total_losses)
-
-        if rsi_total_trades > 0:
-            print("Winrate:", rsi_winrate, "%")
-
-        print("Total Profit:", round(rsi_total_profit, 2))
-        print("\n=====================================================\n")
-
-
-    csv_logger.save_csv(
-    first_balance=first_balance,
-    final_balance=balance,
-    total_profit=sum(profits_lst),
-    total_profit_percent=t_profit_percent,
-    total_fee=deducting_fee_total,
-    start_time=first_open_time,
-    end_time=last_close_time,
-    days=days,
-    hours=hours,
-    minutes=minutes,
-    file_name=os.path.join("outputs", "trades", "data_orders.csv"),
-    )
-
-    # optimize already determined earlier; skip plotting when optimizing
-    # Draw diagram with OHLC candles (Open/High/Low/Close)
-    if optimize is False:
-        empty_result = render_backtest_chart(
-            chart_data=chart_data,
-            close_prices=close_prices,
-            close_times=close_times,
-            open_prices=open_prices,
-            high_prices=high_prices,
-            low_prices=low_prices,
-            ema_16=ema_16,
-            ma_50=ma_50,
-            ma_100=ma_100,
-            ma_200=ma_200,
-            rsi_values=rsi_list,
-            long_open_points=long_open_points,
-            long_close_points=long_close_points,
-            short_open_points=short_open_points,
-            short_close_points=short_close_points,
-            penalty_long_points=penalty_long_points,
-            penalty_short_points=penalty_short_points,
-            long_open_reasons=long_open_reasons,
-            long_close_reasons=long_close_reasons,
-            short_open_reasons=short_open_reasons,
-            short_close_reasons=short_close_reasons,
-            penalty_long_reasons=penalty_long_reasons,
-            penalty_short_reasons=penalty_short_reasons,
-            plot_end_offset=plot_end_offset,
-            plot_max_candles=plot_max_candles,
-            plot_step_candles=plot_step_candles,
-            plot_min_zoom_candles=plot_min_zoom_candles,
-            plot_max_render_candles=plot_max_render_candles,
-            plot_zoom_in_factor=plot_zoom_in_factor,
-            plot_zoom_out_factor=plot_zoom_out_factor,
-            plot_window_width_scale=plot_window_width_scale,
-            plot_window_height_scale=plot_window_height_scale,
-            plot_drag_preview_factor=plot_drag_preview_factor,
-            plot_drag_update_interval_ms=plot_drag_update_interval_ms,
-            plot_yscale_drag_sensitivity=plot_yscale_drag_sensitivity,
-            balance=balance,
-            profits_lst=profits_lst,
-            t_profit_percent=t_profit_percent,
-            count_closed_orders=count_closed_orders,
-            total_wins=total_wins,
-            total_losses=total_losses,
-            max_drawdown=max_drawdown,
-            lst_profit_percent_per_month=lst_profit_percent_per_month,
-        )
-        if empty_result is not None:
-            return empty_result
-    # generate monthly summary CSV silently (no terminal output)
-    if not optimize:
-        try:
-            write_monthly_summary(
-                in_file=os.path.join("outputs", "trades", "data_orders.csv"),
-                out_file=os.path.join("outputs", "monthly", "monthly_data_orders.csv"),
-                quiet=True,
-            )
-        except Exception:
-            # avoid crashing the backtest if monthly summary fails
-            pass
-
-    # return summary metrics for programmatic use
-    return {
-        # ==== all results ====
-        'final_balance_static': total_money_static,
-        "final_balance_dynamic": total_money_dynamic,
-        'total_profit': round(sum(profits_lst), 6),
-        'total_profit_percent': round(t_profit_percent, 6),
-        'closed_trades': count_closed_orders,
-        'wins': total_wins,
-        'losses': total_losses,
-        'maximum_drawdown': round(max_drawdown, 2),
-        'win_rate': round(win_rate, 2),
-        "profit_more_than_8%": profit_months_count,
-        "profit_months": profit_months_count,
-        "loss_months": loss_months_count,
-
-        # score
-        'score': score,
-
-        # ==== RSI RESULTS TOTAL ====
-        "rsi_total_trades": rsi_total_trades,
-        "rsi_wins": rsi_total_wins,
-        "rsi_losses": rsi_total_losses,
-        "rsi_winrate": rsi_winrate,
-        "rsi_total_profit": rsi_total_profit,
-        # RSI LONG
-        "rsi_long_trades": rsi_long_total,
-        "rsi_long_wins": rsi_long_wins,
-        "rsi_long_losses": rsi_long_losses,
-        "rsi_long_winrate": round(rsi_long_wins / rsi_long_total * 100, 2) if rsi_long_total > 0 else 0,
-        "rsi_long_profit": rsi_long_total_profit,
-        # RSI SHORT
-        "rsi_short_trades": rsi_short_total,
-        "rsi_short_wins": rsi_short_wins,
-        "rsi_short_losses": rsi_short_losses,
-        "rsi_short_winrate": round(rsi_short_wins / rsi_short_total * 100, 2) if rsi_short_total > 0 else 0,
-        "rsi_short_profit": rsi_short_total_profit,
-
-        # ==== SCALE RESULTS TOTAL ====
-        "scale_total_trades": scale_total_closed,
-        "scale_wins": scale_total_profit_closed,
-        "scale_losses": scale_total_loss_closed,
-        "scale_winrate": scale_total_winrate,
-        "scale_total_profit": scale_total_profit_amount,
-        # SCALE LONG
-        "scale_long_trades": scale_long_total,
-        "scale_long_wins": scale_ma_long_wins,
-        "scale_long_losses": scale_ma_long_losses,
-        "scale_long_winrate": scale_long_winrate,
-        "scale_long_profit": scale_ma_long_total_profit,
-        # SCALE SHORT
-        "scale_short_trades": scale_short_total,
-        "scale_short_wins": scale_ma_short_wins,
-        "scale_short_losses": scale_ma_short_losses,
-        "scale_short_winrate": short_winrate,
-        "scale_short_profit": scale_ma_short_total_profit,
-    }
-
-
-    # Run the trading logic when executed as a script
 if __name__ == "__main__":
-    ma_strategy()
-
-# print(open_prices[0])
-# print(open_times[0])
-# print(open_times[1])
-# print(start, end)
-# print(lst_month_starts)
-# print(get_candle_index("2025-03-01"))
-# print(get_candle_index("2025-02-27"))
+    parser = argparse.ArgumentParser(description="Run the MA backtest strategy.")
+    parser.add_argument("--start", default="2025-01-01", help="Inclusive date or candle index")
+    parser.add_argument("--end", default="2026-02-23", help="Exclusive date or candle index")
+    args = parser.parse_args()
+    parsed_start = int(args.start) if args.start.isdigit() else args.start
+    parsed_end = int(args.end) if args.end.isdigit() else args.end
+    ma_strategy(start=parsed_start, end=parsed_end)
