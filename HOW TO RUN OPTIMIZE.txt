@@ -1,0 +1,4 @@
+python optimize.py --mode smart --tests 5000 -w 8
+OR:
+python optimize.py --mode grid -w 8
+OR: python optimize.py --mode smart --tests 10000 -w 8 --start 2023-01-01 --end 2026-01-01 --output-dir outputs/optimize/run_2023_2025

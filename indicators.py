@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 
 class Indicator:
     def __init__(self, close_prices, period=None):
@@ -7,21 +8,11 @@ class Indicator:
 
     # Calculate Moving Average
     def get_MA(self, period):
-        closes_orders_ma_lst = []
-        ma_lst = []
-        for price in self.close_prices:
-            closes_orders_ma_lst.append(price)
-
-            if len(closes_orders_ma_lst) < period:
-                ma = None
-                ma_lst.append(ma)
-
-            if len(closes_orders_ma_lst) >= period:
-                ma = sum(closes_orders_ma_lst) / period
-                ma_lst.append(round(ma , 2))
-                closes_orders_ma_lst.pop(0)
-
-        return ma_lst
+        rolling = pd.Series(self.close_prices, dtype=float).rolling(
+            window=period,
+            min_periods=period,
+        ).mean()
+        return [None if pd.isna(value) else round(float(value), 2) for value in rolling]
 
 
     # Calculate Exponential Moving Average
@@ -54,59 +45,37 @@ class Indicator:
 
     # calculate: ADX --> Average Directional Index
     def get_ADX(self, high, low, close, period=14):
+        high = np.asarray(high, dtype=float)
+        low = np.asarray(low, dtype=float)
+        close = np.asarray(close, dtype=float)
+        length = len(close)
+        if not (len(high) == len(low) == length):
+            raise ValueError("high, low, and close must have the same length")
+        if length == 0:
+            return []
 
-        df = pd.DataFrame({
-            "high": high,
-            "low": low,
-            "close": close
-        })
+        tr = np.full(length, np.nan, dtype=float)
+        plus_dm = np.full(length, np.nan, dtype=float)
+        minus_dm = np.full(length, np.nan, dtype=float)
+        if length > 1:
+            tr[1:] = np.maximum.reduce((
+                high[1:] - low[1:],
+                np.abs(high[1:] - close[:-1]),
+                np.abs(low[1:] - close[:-1]),
+            ))
+            up_move = high[1:] - high[:-1]
+            down_move = low[:-1] - low[1:]
+            plus_dm[1:] = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+            minus_dm[1:] = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
 
-        df["prev_close"] = df["close"].shift(1)
-        df["prev_high"] = df["high"].shift(1)
-        df["prev_low"] = df["low"].shift(1)
-
-        # ===== True Range =====
-        tr_list = [None]
-        for i in range(1, len(df)):
-            tr = max(
-                df["high"].iloc[i] - df["low"].iloc[i],
-                abs(df["high"].iloc[i] - df["prev_close"].iloc[i]),
-                abs(df["low"].iloc[i] - df["prev_close"].iloc[i])
-            )
-            tr_list.append(tr)
-
-        df["tr"] = tr_list
-
-        # ===== Directional Movement =====
-        plus_dm = [None]
-        minus_dm = [None]
-
-        for i in range(1, len(df)):
-            up_move = df["high"].iloc[i] - df["prev_high"].iloc[i]
-            down_move = df["prev_low"].iloc[i] - df["low"].iloc[i]
-
-            plus_dm.append(up_move if up_move > down_move and up_move > 0 else 0)
-            minus_dm.append(down_move if down_move > up_move and down_move > 0 else 0)
-
-        df["+dm"] = plus_dm
-        df["-dm"] = minus_dm
-
-        # ===== Wilder smoothing =====
-        df["tr_smooth"] = df["tr"].ewm(alpha=1/period, adjust=False).mean()
-        df["+dm_smooth"] = df["+dm"].ewm(alpha=1/period, adjust=False).mean()
-        df["-dm_smooth"] = df["-dm"].ewm(alpha=1/period, adjust=False).mean()
-
-        # ===== DI =====
-        df["+di"] = 100 * df["+dm_smooth"] / df["tr_smooth"]
-        df["-di"] = 100 * df["-dm_smooth"] / df["tr_smooth"]
-
-        # ===== DX =====
-        df["dx"] = 100 * abs(df["+di"] - df["-di"]) / (df["+di"] + df["-di"])
-
-        # ===== ADX =====
-        df["adx"] = df["dx"].ewm(alpha=1/period, adjust=False).mean()
-
-        return df["adx"].tolist()
+        alpha = 1 / period
+        tr_smooth = pd.Series(tr).ewm(alpha=alpha, adjust=False).mean()
+        plus_smooth = pd.Series(plus_dm).ewm(alpha=alpha, adjust=False).mean()
+        minus_smooth = pd.Series(minus_dm).ewm(alpha=alpha, adjust=False).mean()
+        plus_di = 100 * plus_smooth / tr_smooth
+        minus_di = 100 * minus_smooth / tr_smooth
+        dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
+        return dx.ewm(alpha=alpha, adjust=False).mean().tolist()
 
 
     # Calculate ATR (Average True Range) using True Range and Wilder smoothing

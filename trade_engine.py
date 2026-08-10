@@ -1,6 +1,8 @@
 """Execution, accounting, logging, reporting, and chart lifecycle for backtests."""
 
 import os
+import math
+from functools import lru_cache
 from dataclasses import dataclass, field, fields
 from typing import Optional
 
@@ -202,12 +204,19 @@ class TradeEngine:
         self.safe_leverage_balance_pct_high = safe_leverage_balance_pct_high
         self.save_money_recover_trigger_pct = save_money_recover_trigger_pct
         self.verbose = bool(verbose)
+        self.track_equity_curve = not bool(optimize)
         self.equity_peak = None
         # self.just_one_time = True
 
     @staticmethod
+    @lru_cache(maxsize=4)
     def load_market_data(start="2025-01-01", end="2026-02-23"):
-        """Resolve an inclusive start/exclusive end range and load its candles."""
+        """Resolve and cache an inclusive start/exclusive end candle range.
+
+        Optimization workers call the strategy many times for the same range.  The
+        cached immutable market arrays avoid re-reading and parsing the CSV for
+        every candidate in a worker process.
+        """
         start_index = get_candle_index(start) if isinstance(start, str) else int(start)
         end_index = get_candle_index(end) if isinstance(end, str) else int(end)
         if end_index <= start_index:
@@ -287,9 +296,10 @@ class TradeEngine:
         return balance + open_position_value + save_money
 
     def _update_drawdown(self, equity_curve, max_drawdown, total_assets):
-        equity_curve.append(total_assets)
+        if self.track_equity_curve:
+            equity_curve.append(total_assets)
         if self.equity_peak is None:
-            self.equity_peak = max(equity_curve) if equity_curve else total_assets
+            self.equity_peak = total_assets
         elif total_assets > self.equity_peak:
             self.equity_peak = total_assets
 
@@ -472,7 +482,7 @@ class TradeEngine:
             i, low_prices, close_times,
             position["entry_price"], position["leverage"], position["margin"],
             account.balance, account.balance_without_fee,
-            account.deducting_fee_total, account.count_closed_orders,
+            account.deducting_fee_total, account.profits_lst, account.count_closed_orders,
             account.total_losses, account.total_long, account.equity_curve,
             account.save_money, account.max_drawdown, position["open_time_value"],
             position["trade_amount_percent"], account.total_liquids, position["trade_id"],
@@ -506,7 +516,7 @@ class TradeEngine:
             i, high_prices, close_times,
             position["entry_price"], position["leverage"], position["margin"],
             account.balance, account.balance_without_fee,
-            account.deducting_fee_total, account.count_closed_orders,
+            account.deducting_fee_total, account.profits_lst, account.count_closed_orders,
             account.total_losses, account.total_short, account.equity_curve,
             account.save_money, account.max_drawdown, position["open_time_value"],
             position["trade_amount_percent"], account.total_liquids, position["trade_id"],
@@ -1060,7 +1070,7 @@ class TradeEngine:
         self, i, low_prices, close_times,
         entry_price, leverage, margin,
         balance, balance_without_fee,
-        deducting_fee_total, count_closed_orders,
+        deducting_fee_total, profits_lst, count_closed_orders,
         total_losses, total_long, equity_curve,
         save_money, max_drawdown, open_time_value,
         trade_amount_percent,
@@ -1084,6 +1094,7 @@ class TradeEngine:
                 'balance': balance,
                 'balance_without_fee': balance_without_fee,
                 'deducting_fee_total': deducting_fee_total,
+                'profits_lst': profits_lst,
                 'count_closed_orders': count_closed_orders,
                 'total_losses': total_losses,
                 'total_long': total_long,
@@ -1126,6 +1137,7 @@ class TradeEngine:
         balance_without_fee += margin + pnl_no_fee
 
         profit = pnl - total_fee
+        profits_lst.append(profit)
 
         # --------------------------
         # CSV BALANCE (same as close_long)
@@ -1224,6 +1236,7 @@ class TradeEngine:
             'balance': balance,
             'balance_without_fee': balance_without_fee,
             'deducting_fee_total': deducting_fee_total,
+            'profits_lst': profits_lst,
             'count_closed_orders': count_closed_orders,
             'total_losses': total_losses,
             'total_long': total_long,
@@ -1232,6 +1245,59 @@ class TradeEngine:
             'close_price': close_price,
             'close_time_value': close_time_value,
             'total_liquids': total_liquids
+        }
+
+    @staticmethod
+    def calculate_performance_score(
+        *, return_percent, max_drawdown, win_rate, profits, first_balance,
+        profit_months, loss_months, liquidations=0, closed_trades=None,
+    ):
+        """Return a robust optimizer score and its supporting quality metrics."""
+        if closed_trades is None:
+            closed_trades = len(profits)
+        gross_profit = sum(value for value in profits if value > 0)
+        gross_loss = abs(sum(value for value in profits if value < 0))
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = 5.0
+        else:
+            profit_factor = 0.0
+
+        drawdown_pct = abs(max_drawdown)
+        expectancy_pct = (
+            (sum(profits) / closed_trades) * 100 / first_balance
+            if closed_trades and first_balance
+            else 0.0
+        )
+        calmar_ratio = return_percent / max(drawdown_pct, 1.0)
+        consistency = profit_months / max(1, profit_months + loss_months)
+
+        if closed_trades == 0:
+            score = -1_000_000.0
+        else:
+            sample_confidence = min(1.0, math.sqrt(closed_trades / 30.0))
+            bounded_profit_factor = min(5.0, max(0.05, profit_factor))
+            risk_adjusted = max(-10.0, min(10.0, calmar_ratio)) * 10.0
+            quality = math.log(bounded_profit_factor) * 10.0
+            win_quality = max(-10.0, min(10.0, (win_rate - 50.0) * 0.2))
+            consistency_score = (consistency - 0.5) * 20.0
+            expectancy_score = max(-10.0, min(10.0, expectancy_pct)) * 2.0
+            liquidation_rate = liquidations / closed_trades
+            score = sample_confidence * (
+                return_percent
+                + risk_adjusted
+                + quality
+                + win_quality
+                + consistency_score
+                + expectancy_score
+            ) - drawdown_pct * 0.75 - liquidation_rate * 50.0
+
+        return {
+            "score": score,
+            "profit_factor": profit_factor,
+            "expectancy_percent": expectancy_pct,
+            "calmar_ratio": calmar_ratio,
         }
 
     def finalize_backtest(self, **state):
@@ -1280,11 +1346,21 @@ class TradeEngine:
             profit_months_count = sum(value > 0 for value in monthly_profits)
             loss_months_count = sum(value < 0 for value in monthly_profits)
 
-        growth = state["total_money_static"] / first_balance
-        risk = abs(max_drawdown) / 100
-        consistency = profit_months_count / max(1, profit_months_count + loss_months_count)
-        quality = win_rate / 100
-        score = (growth ** 1.15) * (0.6 + quality) * (0.5 + consistency) / (1 + risk * 2)
+        score_metrics = self.calculate_performance_score(
+            return_percent=t_profit_percent,
+            max_drawdown=max_drawdown,
+            win_rate=win_rate,
+            profits=profits,
+            first_balance=first_balance,
+            profit_months=profit_months_count,
+            loss_months=loss_months_count,
+            liquidations=state["total_liquids"],
+            closed_trades=state["count_closed_orders"],
+        )
+        score = score_metrics["score"]
+        profit_factor = score_metrics["profit_factor"]
+        expectancy_pct = score_metrics["expectancy_percent"]
+        calmar_ratio = score_metrics["calmar_ratio"]
 
         if self.verbose:
             self._print_backtest_report(
@@ -1368,6 +1444,9 @@ class TradeEngine:
             "profit_months": profit_months_count,
             "loss_months": loss_months_count,
             "score": score,
+            "profit_factor": round(profit_factor, 4),
+            "expectancy_percent": round(expectancy_pct, 6),
+            "calmar_ratio": round(calmar_ratio, 4),
             "rsi_total_trades": rsi_total,
             "rsi_wins": rsi_wins,
             "rsi_losses": rsi_losses,
@@ -1453,7 +1532,7 @@ class TradeEngine:
         self, i, high_prices, close_times,
         entry_price, leverage, margin,
         balance, balance_without_fee,
-        deducting_fee_total, count_closed_orders,
+        deducting_fee_total, profits_lst, count_closed_orders,
         total_losses, total_short, equity_curve,
         save_money, max_drawdown, open_time_value,
         trade_amount_percent,
@@ -1477,6 +1556,7 @@ class TradeEngine:
                 'balance': balance,
                 'balance_without_fee': balance_without_fee,
                 'deducting_fee_total': deducting_fee_total,
+                'profits_lst': profits_lst,
                 'count_closed_orders': count_closed_orders,
                 'total_losses': total_losses,
                 'total_short': total_short,
@@ -1517,6 +1597,7 @@ class TradeEngine:
         balance_without_fee += margin + pnl_no_fee
 
         profit = pnl - total_fee
+        profits_lst.append(profit)
 
         # --------------------------
         # CSV BALANCE (aligned with close_long)
@@ -1615,6 +1696,7 @@ class TradeEngine:
             'balance': balance,
             'balance_without_fee': balance_without_fee,
             'deducting_fee_total': deducting_fee_total,
+            'profits_lst': profits_lst,
             'count_closed_orders': count_closed_orders,
             'total_losses': total_losses,
             'total_short': total_short,

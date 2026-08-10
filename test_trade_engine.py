@@ -117,6 +117,7 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertTrue(liquidation["liquidated"])
         self.assertEqual(liquid_account.total_liquids, 1)
         self.assertEqual(liquid_account.total_losses, 1)
+        self.assertEqual(liquid_account.profits_lst, [-100.0])
 
 
 if __name__ == "__main__":

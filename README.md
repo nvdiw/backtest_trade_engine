@@ -119,14 +119,42 @@ custom = engine.open_short(
 ```
 
 ## Run Optimization
-1. Edit `param_grid` in `optimize.py`
-2. Run:
+
+The default smart mode performs an adaptive, reproducible search. It starts with
+exploration and then mutates the best candidates found so far:
+
 ```bash
-python optimize.py -w 8
+python optimize.py --mode smart --tests 5000 -w 8
 ```
-3. Review:
-- `outputs/optimize/optimization_results.csv`
-- `outputs/optimize/best_params.txt`
+
+To test every Cartesian combination in `param_grid`, use full-grid mode. The
+grid is intentionally large, so reduce its values first if a complete run is
+not practical:
+
+```bash
+python optimize.py --mode grid -w 8
+```
+
+Useful options include `--start`, `--end`, `--seed`, `--batch-size`, and
+`--output-dir`. Market data and previously calculated indicators are cached in
+each worker process, which substantially reduces repeated-test overhead.
+
+Optimization writes:
+
+- `outputs/optimize/optimization_results.csv`: every completed candidate.
+- `outputs/optimize/best_params.json`: only the winning parameter values.
+- `outputs/optimize/optimization_summary.json`: run metadata and best metrics.
+- `outputs/optimize/top_results.json`: the top 20 candidates by robust score.
+
+Run a normal backtest with the winning JSON without changing strategy defaults:
+
+```bash
+python ma_strategy.py --config outputs/optimize/best_params.json
+```
+
+The optimizer score combines return, drawdown, Calmar ratio, profit factor,
+expectancy, win rate, monthly consistency, trade-count confidence, and a
+liquidation penalty. No-trade candidates receive a losing score.
 
 ## Recent Strategy/Project Updates
 - Added negative exit score component:

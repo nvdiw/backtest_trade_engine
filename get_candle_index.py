@@ -51,20 +51,14 @@ def get_month_start_indices(start_idx: int, end_idx: int, just_index : bool):
     inside [start_idx, end_idx)
     """
 
-    month_starts = []
-    seen_months = set()
-
-    for i in range(start_idx, end_idx):
-        ts = df["Open time"].iloc[i]
-
-        if ts.day != 1:
-            continue
-
-        month_key = ts.strftime("%Y-%m")
-
-        if month_key not in seen_months:
-            seen_months.add(month_key)
-            month_starts.append((month_key, i))
+    window = df["Open time"].iloc[start_idx:end_idx]
+    first_day_rows = window[window.dt.day.eq(1)]
+    month_keys = first_day_rows.dt.strftime("%Y-%m")
+    keep = ~month_keys.duplicated()
+    month_starts = list(zip(
+        month_keys[keep].tolist(),
+        first_day_rows.index[keep].tolist(),
+    ))
 
     if just_index:
         lst_month_starts = []

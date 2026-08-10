@@ -1,12 +1,41 @@
 ﻿# NOTE: Strategy executes With candle Open prices, High prices, Low prices, Close prices
 
 import argparse
+import json
+from collections import OrderedDict
 import numpy as np
 
 from indicators import Indicator
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
 from strategy_config import build_ma_strategy_config
+
+
+_INDICATOR_CACHE_LIMIT = 64
+_INDICATOR_CACHE = {
+    "ema": OrderedDict(),
+    "ma": OrderedDict(),
+    "adx": OrderedDict(),
+    "atr": OrderedDict(),
+    "atr_ma": OrderedDict(),
+    "vol_avg": OrderedDict(),
+    "rsi": OrderedDict(),
+}
+
+
+def _get_cached_indicator(kind, range_key, indicator_key, builder):
+    """Keep reusable indicator arrays in each optimizer worker process."""
+    cache = _INDICATOR_CACHE[kind]
+    key = (range_key, indicator_key)
+    if key in cache:
+        cache.move_to_end(key)
+        return cache[key]
+    value = builder()
+    cache[key] = value
+    cache.move_to_end(key)
+    if len(cache) > _INDICATOR_CACHE_LIMIT:
+        cache.popitem(last=False)
+    return value
 
 # Main Trading Logic
 def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
@@ -31,16 +60,10 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
     high_prices = market["high_prices"]
     volume_prices = market["volume_prices"]
 
-    indicator_cache = {
-        "ema": {}, "ma": {}, "adx": {}, "atr": {},
-        "atr_ma": {}, "vol_avg": {}, "rsi": {},
-    }
+    range_key = (market["start"], market["end"])
 
     def _cached_indicator(kind, key, builder):
-        cache = indicator_cache[kind]
-        if key not in cache:
-            cache[key] = builder()
-        return cache[key]
+        return _get_cached_indicator(kind, range_key, key, builder)
 
     # ---- settings ----
     cfg = build_ma_strategy_config(tune)
@@ -173,35 +196,19 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         return "\n".join(lines)
 
     def strongest_directional_moves_pct(prices, start_idx, end_idx):
-        """Measure strongest ordered up/down moves in one pass."""
+        """Measure strongest ordered up/down moves with vectorized accumulators."""
         if end_idx <= start_idx:
             return 0.0, 0.0
 
-        first_price = float(prices[start_idx])
-        if not np.isfinite(first_price) or first_price <= 0:
+        window = np.asarray(prices[start_idx:end_idx + 1], dtype=float)
+        window = window[np.isfinite(window) & (window > 0)]
+        if window.size < 2:
             return 0.0, 0.0
 
-        max_up_move_pct = 0.0
-        max_down_move_pct = 0.0
-        trough = first_price
-        peak = first_price
-        for j in range(start_idx + 1, end_idx + 1):
-            price = float(prices[j])
-            if not np.isfinite(price) or price <= 0:
-                continue
-
-            up_move_pct = (price / trough - 1.0) * 100.0
-            if up_move_pct > max_up_move_pct:
-                max_up_move_pct = up_move_pct
-            if price < trough:
-                trough = price
-
-            down_move_pct = (peak / price - 1.0) * 100.0
-            if down_move_pct > max_down_move_pct:
-                max_down_move_pct = down_move_pct
-            if price > peak:
-                peak = price
-
+        running_min = np.minimum.accumulate(window)
+        running_max = np.maximum.accumulate(window)
+        max_up_move_pct = float(np.max(window / running_min - 1.0) * 100.0)
+        max_down_move_pct = float(np.max(running_max / window - 1.0) * 100.0)
         return max_up_move_pct, max_down_move_pct
 
     # ---- setting end ----
@@ -1909,7 +1916,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the MA backtest strategy.")
     parser.add_argument("--start", default="2025-01-01", help="Inclusive date or candle index")
     parser.add_argument("--end", default="2026-02-23", help="Exclusive date or candle index")
+    parser.add_argument("--config", help="JSON file containing optimized parameter values")
     args = parser.parse_args()
     parsed_start = int(args.start) if args.start.isdigit() else args.start
     parsed_end = int(args.end) if args.end.isdigit() else args.end
-    ma_strategy(start=parsed_start, end=parsed_end)
+    tune = None
+    if args.config:
+        with open(args.config, encoding="utf-8") as config_file:
+            tune = json.load(config_file)
+        if not isinstance(tune, dict):
+            raise ValueError("--config must contain a JSON object")
+    ma_strategy(tune=tune, start=parsed_start, end=parsed_end)
