@@ -1,4 +1,6 @@
+import json
 from dataclasses import dataclass, fields
+from pathlib import Path
 
 
 def _coerce_like(current_value, new_value):
@@ -65,7 +67,7 @@ class CapitalConfig:
     # Reserved capital kept outside active balance.
     save_money: float = 0
     # fee rate.
-    fee_rate = 0.0005
+    fee_rate: float = 0.0005
 
 
 @dataclass
@@ -389,3 +391,33 @@ def build_ma_strategy_config(tune=None):
 
 def build_rsi_strategy_config(tune=None):
     return _apply_common_tune(RSIStrategyConfig(), tune)
+
+
+_TUNE_ALIASES = {
+    "trade_amount_percent_neworder", "scale_entry_trigger_pct",
+    "scale_in_trigger_move_pct", "loss_scale_entry_long_atr_ratio_min",
+    "loss_scale_entry_short_atr_ratio_min", "ema_16", "ma_50",
+    "ma_100", "ma_200",
+}
+
+
+def load_ma_strategy_tune(path):
+    """Load and validate a JSON parameter override for ``ma_strategy``."""
+    path = Path(path)
+    with path.open(encoding="utf-8") as config_file:
+        tune = json.load(config_file)
+    if not isinstance(tune, dict):
+        raise ValueError(f"{path} must contain a JSON object")
+
+    valid_keys = {field.name for field in fields(MAStrategyConfig)} | _TUNE_ALIASES
+    unknown = sorted(set(tune) - valid_keys)
+    if unknown:
+        raise ValueError(
+            f"{path} contains unknown strategy parameter(s): {', '.join(unknown)}"
+        )
+    # Build once to validate/coerce every supplied value before a long run starts.
+    config = build_ma_strategy_config(tune)
+    return {
+        key: getattr(config, key) if hasattr(config, key) else value
+        for key, value in tune.items()
+    }

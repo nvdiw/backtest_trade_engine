@@ -1,14 +1,38 @@
 ﻿# NOTE: Strategy executes With candle Open prices, High prices, Low prices, Close prices
 
 import argparse
-import json
 from collections import OrderedDict
+from pathlib import Path
 import numpy as np
 
 from indicators import Indicator
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
-from strategy_config import build_ma_strategy_config
+from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
+
+
+DEFAULT_BEST_PARAMS_PATH = Path("outputs") / "optimize" / "best_params.json"
+
+
+def resolve_parameter_source(source="config", *, params_file=None,
+                             best_params=DEFAULT_BEST_PARAMS_PATH):
+    """Return parameter overrides and a human-readable source description."""
+    if source == "config":
+        return None, "strategy_config.py"
+    if source == "best":
+        path = Path(best_params)
+    elif source == "file":
+        if not params_file:
+            raise ValueError("--params-file is required when --params-source=file")
+        path = Path(params_file)
+    else:
+        raise ValueError(f"unknown parameter source: {source}")
+
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"parameter file not found: {path}. Run optimize.py first or provide another path."
+        )
+    return load_ma_strategy_tune(path), str(path)
 
 
 _INDICATOR_CACHE_LIMIT = 64
@@ -1916,14 +1940,34 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Run the MA backtest strategy.")
     parser.add_argument("--start", default="2025-01-01", help="Inclusive date or candle index")
     parser.add_argument("--end", default="2026-02-23", help="Exclusive date or candle index")
-    parser.add_argument("--config", help="JSON file containing optimized parameter values")
+    parser.add_argument(
+        "--params-source", choices=("config", "best", "file"), default="config",
+        help="config=strategy_config.py, best=optimizer winner, file=custom JSON",
+    )
+    parser.add_argument(
+        "--best-params", default=str(DEFAULT_BEST_PARAMS_PATH),
+        help="best_params.json used by --params-source=best",
+    )
+    parser.add_argument("--params-file", help="JSON used by --params-source=file")
+    parser.add_argument(
+        "--config", dest="legacy_config",
+        help="legacy alias for --params-source=file --params-file=FILE",
+    )
     args = parser.parse_args()
     parsed_start = int(args.start) if args.start.isdigit() else args.start
     parsed_end = int(args.end) if args.end.isdigit() else args.end
-    tune = None
-    if args.config:
-        with open(args.config, encoding="utf-8") as config_file:
-            tune = json.load(config_file)
-        if not isinstance(tune, dict):
-            raise ValueError("--config must contain a JSON object")
+    if args.legacy_config:
+        if args.params_source != "config" or args.params_file:
+            parser.error("--config cannot be combined with --params-source/--params-file")
+        args.params_source = "file"
+        args.params_file = args.legacy_config
+    try:
+        tune, source_description = resolve_parameter_source(
+            args.params_source,
+            params_file=args.params_file,
+            best_params=args.best_params,
+        )
+    except (ValueError, FileNotFoundError) as exc:
+        parser.error(str(exc))
+    print(f"Parameter source: {source_description}")
     ma_strategy(tune=tune, start=parsed_start, end=parsed_end)

@@ -17,13 +17,13 @@ import time
 from pathlib import Path
 
 from ma_strategy import ma_strategy
-from strategy_config import build_ma_strategy_config
+from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
 
 
 # Every key is an existing MAStrategyConfig setting.  Defaults in
 # strategy_config.py remain unchanged; the optimizer only passes candidates via
 # ``tune`` and writes the winning values to JSON.
-param_grid = {
+FULL_PARAM_GRID = {
     # Capital baseline (singletons prevent meaningless score scaling)
     "balance": [1000],
     "save_money": [0],
@@ -152,12 +152,55 @@ param_grid = {
     "plot_post_cross_penalty_markers": [True],
 }
 
-# param_grid = {
-#     "ema_16_period": [10, 12, 14, 16, 18, 20, 24],
-#     "ma_50_period": [35, 40, 45, 50, 55, 60, 70],
-#     "ma_100_period": [80, 90, 100, 102, 110, 125, 140],
-#     "ma_200_period": [160, 180, 198, 200, 220, 240, 260],
-# }
+FOCUSED_PARAM_GRID = {
+    "ema_16_period": [10, 12, 14, 16, 18, 20, 24],
+    "ma_50_period": [35, 40, 45, 50, 55, 60, 70],
+    "ma_100_period": [80, 90, 100, 102, 110, 125, 140],
+    "ma_200_period": [160, 180, 198, 200, 220, 240, 260],
+    "leverage": [1, 2, 3, 4, 5, 7, 10, 12, 15],
+    "safe_leverage_low": [1, 2, 3, 4, 5],
+    "safe_leverage_med": [2, 3, 4, 5, 6, 8],
+    "safe_leverage_high": [3, 4, 5, 6, 8, 10],
+    "safe_leverage_balance_pct_low": [70, 75, 80],
+    "safe_leverage_balance_pct_med": [75, 80, 85],
+    "safe_leverage_balance_pct_high": [80, 85, 90, 95],
+    "save_money_recover_trigger_pct": [65, 70, 75, 80],
+}
+
+
+def _grid_subset(*prefixes, extra=()):
+    keys = set(extra)
+    for key in FULL_PARAM_GRID:
+        if key.startswith(prefixes):
+            keys.add(key)
+    return {key: values for key, values in FULL_PARAM_GRID.items() if key in keys}
+
+
+PARAMETER_PROFILES = {
+    # The focused profile preserves the user's current MA/leverage search.
+    "focused": FOCUSED_PARAM_GRID,
+    "signal": _grid_subset(
+        "entry_", "ma_distance", "candle_move", "impulse_", "late_entry_",
+        "period_", "volume_spike", "adx_filter", "atr_filter", "volume_filter",
+        extra=("ema_16_period", "ma_50_period", "ma_100_period", "ma_200_period"),
+    ),
+    "exit": _grid_subset(
+        "exit_", "trail_", "loss_exit", "profit_exit", "loss_lock",
+        "adx_exit", "opposite_", "sharp_move", "post_cross_", "slope_window",
+    ),
+    "risk": _grid_subset(
+        "safe_leverage", "monthly_", "scale_", "profit_scale_", "consecutive_",
+        extra=(
+            "trade_amount_percent", "leverage", "save_money_recover_trigger_pct",
+            "max_open_trades", "cooldown_after_big_pnl", "skip_logic",
+        ),
+    ),
+    "rsi": _grid_subset("rsi_", "lowest_rsi_", "highest_rsi_"),
+    "full": FULL_PARAM_GRID,
+}
+
+# Backward-compatible public name used by tests and imports.
+param_grid = FULL_PARAM_GRID
 
 RESULT_COLUMNS = [
     "final_balance_static", "final_balance_dynamic", "total_profit",
@@ -219,9 +262,9 @@ def is_valid_candidate(candidate):
 
 
 class SmartCandidateGenerator:
-    """Reproducible elite-guided search over the discrete parameter space."""
+    """Reproducible adaptive search over a discrete parameter space."""
 
-    def __init__(self, grid, seed=42):
+    def __init__(self, grid, seed=42, baseline_params=None):
         if not grid or any(not values for values in grid.values()):
             raise ValueError("param_grid must contain at least one value per parameter")
         self.grid = {key: tuple(values) for key, values in grid.items()}
@@ -230,7 +273,7 @@ class SmartCandidateGenerator:
         self.random = random.Random(seed)
         self.seen = set()
         self.baseline_attempted = False
-        defaults = build_ma_strategy_config()
+        defaults = build_ma_strategy_config(baseline_params)
         self.baseline = {
             key: _nearest_value(values, getattr(defaults, key, values[0]))
             for key, values in self.grid.items()
@@ -239,21 +282,54 @@ class SmartCandidateGenerator:
     def _signature(self, candidate):
         return tuple(candidate[key] for key in self.keys)
 
+    def _canonicalize(self, candidate):
+        """Collapse inactive conditional parameters to avoid duplicate backtests."""
+        candidate = dict(candidate)
+        if candidate.get("scale_in_enabled") is False:
+            for key in self.keys:
+                if key.startswith(("scale_entry_", "profit_scale_entry_")):
+                    candidate[key] = self.baseline[key]
+        else:
+            if candidate.get("scale_entry_on_profit_enabled") is False:
+                for key in ("scale_entry_profit_trigger_pct",):
+                    if key in candidate:
+                        candidate[key] = self.baseline[key]
+            if candidate.get("scale_entry_on_loss_enabled") is False:
+                for key in ("scale_entry_loss_trigger_pct",):
+                    if key in candidate:
+                        candidate[key] = self.baseline[key]
+        if candidate.get("rsi_trade_monthly_filter_on") is False:
+            for key in self.keys:
+                if key.startswith("rsi_") and key != "rsi_trade_monthly_filter_on":
+                    candidate[key] = self.baseline[key]
+        return candidate
+
     def _random_candidate(self):
         return {key: self.random.choice(values) for key, values in self.grid.items()}
 
-    def _guided_candidate(self, elites):
-        # Start from one proven combination and mutate only a focused subset.
-        # This preserves useful parameter interactions in a high-dimensional grid.
-        candidate = dict(self.random.choice(elites)["params"])
-        mutation_count = min(
-            len(self.mutable_keys),
-            max(2, round(math.sqrt(max(1, len(self.mutable_keys))))),
-        )
+    def _elite_choice(self, elites):
+        # Rank weighting prevents one early lucky candidate from monopolizing search.
+        weights = list(range(len(elites), 0, -1))
+        return self.random.choices(elites, weights=weights, k=1)[0]
+
+    def _guided_candidate(self, elites, progress=0.0):
+        # Occasionally cross two good candidates, then mutate. Mutation becomes
+        # narrower as the budget is consumed (exploration -> exploitation).
+        parent = self._elite_choice(elites)
+        candidate = dict(parent["params"])
+        if len(elites) > 1 and self.random.random() < 0.20:
+            other = self._elite_choice(elites)["params"]
+            for key in self.mutable_keys:
+                if self.random.random() < 0.5:
+                    candidate[key] = other[key]
+
+        max_mutations = max(2, round(math.sqrt(max(1, len(self.mutable_keys)))))
+        mutation_count = max(1, round(max_mutations * (1.0 - 0.70 * progress)))
+        mutation_count = min(len(self.mutable_keys), mutation_count)
         for key in self.random.sample(self.mutable_keys, mutation_count):
             values = self.grid[key]
             elite_value = candidate[key]
-            if self.random.random() < 0.65 and len(values) > 1:
+            if self.random.random() < 0.80 and len(values) > 1:
                 index = values.index(elite_value)
                 offset = self.random.choice((-1, 1))
                 candidate[key] = values[max(0, min(len(values) - 1, index + offset))]
@@ -261,7 +337,7 @@ class SmartCandidateGenerator:
                 candidate[key] = self.random.choice(values)
         return candidate
 
-    def generate(self, count, elites=None):
+    def generate(self, count, elites=None, progress=0.0):
         candidates = []
         attempts = 0
         max_attempts = max(1000, count * 100)
@@ -270,10 +346,11 @@ class SmartCandidateGenerator:
             if not self.baseline_attempted:
                 candidate = dict(self.baseline)
                 self.baseline_attempted = True
-            elif elites and self.random.random() >= 0.25:
-                candidate = self._guided_candidate(elites)
+            elif elites and self.random.random() >= max(0.08, 0.35 * (1.0 - progress)):
+                candidate = self._guided_candidate(elites, progress=progress)
             else:
                 candidate = self._random_candidate()
+            candidate = self._canonicalize(candidate)
             signature = self._signature(candidate)
             if signature in self.seen or not is_valid_candidate(candidate):
                 continue
@@ -322,6 +399,30 @@ def _score(result):
     return value if math.isfinite(value) else -math.inf
 
 
+def _objective_score(result, min_trades=0, max_drawdown=None):
+    """Apply research-quality constraints before a result can become elite."""
+    value = _score(result)
+    if not result or value == -math.inf:
+        return -math.inf
+    if int(result.get("closed_trades", 0) or 0) < min_trades:
+        return -math.inf
+    if max_drawdown is not None:
+        raw_drawdown = result.get("maximum_drawdown")
+        if raw_drawdown is None or abs(float(raw_drawdown)) > max_drawdown:
+            return -math.inf
+    return value
+
+
+def _robust_validation_score(train_result, validation_result, overfit_penalty=0.25):
+    """Prefer strong validation performance and penalize train-only excess."""
+    train_score = _score(train_result)
+    validation_score = _score(validation_result)
+    if not math.isfinite(validation_score):
+        return -math.inf
+    optimistic_gap = max(0.0, train_score - validation_score)
+    return validation_score - overfit_penalty * optimistic_gap
+
+
 def _json_safe(value):
     if isinstance(value, dict):
         return {key: _json_safe(item) for key, item in value.items()}
@@ -343,11 +444,12 @@ def _write_json(path, payload):
     os.replace(temporary, path)
 
 
-def _write_best_files(output_dir, best, mode, requested_tests, completed, elapsed, seed):
+def _write_best_files(output_dir, best, mode, requested_tests, completed, elapsed, seed,
+                      metadata=None):
     if best is None:
         return
     _write_json(Path(output_dir) / "best_params.json", best["params"])
-    _write_json(Path(output_dir) / "optimization_summary.json", {
+    summary = {
         "mode": mode,
         "requested_tests": requested_tests,
         "completed_tests": completed,
@@ -357,7 +459,10 @@ def _write_best_files(output_dir, best, mode, requested_tests, completed, elapse
         "best_duration_seconds": round(best["duration"], 4),
         "best_params": best["params"],
         "best_metrics": best["result"],
-    })
+    }
+    if metadata:
+        summary.update(metadata)
+    _write_json(Path(output_dir) / "optimization_summary.json", summary)
 
 
 def _result_row(keys, index, params, result, duration):
@@ -367,9 +472,119 @@ def _result_row(keys, index, params, result, duration):
     return row
 
 
+def _parse_grid_csv_value(raw, values):
+    for value in values:
+        if str(value) == raw:
+            return value
+    raise ValueError(f"saved value {raw!r} is not present in the current grid")
+
+
+def _parse_metric(raw):
+    if raw in (None, ""):
+        return None
+    try:
+        number = float(raw)
+    except (TypeError, ValueError):
+        return raw
+    return int(number) if number.is_integer() else number
+
+
+def _read_resume_records(path, grid, base_tune):
+    records = []
+    with Path(path).open(newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        required = {"test_index", "duration_s", *grid, *RESULT_COLUMNS}
+        missing = required - set(reader.fieldnames or ())
+        if missing:
+            raise ValueError(
+                "cannot resume because CSV columns do not match this profile: "
+                + ", ".join(sorted(missing))
+            )
+        for row in reader:
+            selected = {
+                key: _parse_grid_csv_value(row[key], grid[key]) for key in grid
+            }
+            result = {key: _parse_metric(row.get(key)) for key in RESULT_COLUMNS}
+            records.append({
+                "index": int(row["test_index"]),
+                "params": {**base_tune, **selected},
+                "result": result,
+                "duration": float(row["duration_s"]),
+            })
+    return records
+
+
+def _load_base_tune(args):
+    source = getattr(args, "base_source", "config")
+    if source == "config":
+        return {}, "strategy_config.py"
+    path = Path(getattr(args, "base_params", "outputs/optimize/best_params.json"))
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"base parameter file not found: {path}. Run an optimization first or "
+            "use --base-source=config."
+        )
+    return load_ma_strategy_tune(path), str(path)
+
+
+def _validate_top_candidates(records, args, workers, chunksize):
+    validation_start = getattr(args, "validation_start", None)
+    validation_end = getattr(args, "validation_end", None)
+    if not validation_start and not validation_end:
+        return None, []
+    if not validation_start or not validation_end:
+        raise ValueError("--validation-start and --validation-end must be used together")
+
+    top_count = min(getattr(args, "validation_top", 20), len(records))
+    candidates = records[:top_count]
+    start = _parse_bound(validation_start)
+    end = _parse_bound(validation_end)
+    tasks = [(record["index"], record["params"]) for record in candidates]
+    if workers > 1:
+        pool = multiprocessing.Pool(workers, initializer=_init_worker, initargs=(start, end))
+        try:
+            evaluated = list(pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize))
+        finally:
+            pool.close()
+            pool.join()
+    else:
+        _init_worker(start, end)
+        evaluated = list(map(_evaluate_task, tasks))
+
+    train_by_index = {record["index"]: record for record in candidates}
+    validated = []
+    for index, params, result, duration, error in evaluated:
+        train = train_by_index[index]
+        validation_qualified = (
+            not error and math.isfinite(_objective_score(
+                result,
+                min_trades=getattr(args, "min_trades", 0),
+                max_drawdown=getattr(args, "max_drawdown", None),
+            ))
+        )
+        robust_score = (
+            -math.inf if not validation_qualified else _robust_validation_score(
+                train["result"], result, getattr(args, "overfit_penalty", 0.25)
+            )
+        )
+        validated.append({
+            "index": index,
+            "params": params,
+            "result": result,
+            "duration": duration,
+            "error": error,
+            "training_result": train["result"],
+            "robust_score": robust_score,
+        })
+    validated.sort(key=lambda item: item["robust_score"], reverse=True)
+    return (validated[0] if validated else None), validated
+
+
 def run_optimization(args, grid=None):
-    grid = param_grid if grid is None else grid
+    profile = getattr(args, "profile", "focused")
+    grid = PARAMETER_PROFILES[profile] if grid is None else grid
     keys = tuple(grid)
+    base_tune, base_description = _load_base_tune(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "optimization_results.csv"
@@ -377,7 +592,7 @@ def run_optimization(args, grid=None):
 
     if args.mode == "grid":
         requested_tests = grid_size(grid)
-        candidate_source = iter_grid_candidates(grid)
+        candidate_source = None
     else:
         requested_tests = min(args.tests, grid_size(grid))
         candidate_source = None
@@ -393,13 +608,56 @@ def run_optimization(args, grid=None):
     next_index = 1
     best = None
     ranked = []
+    min_trades = getattr(args, "min_trades", 0)
+    max_drawdown = getattr(args, "max_drawdown", None)
+
+    def objective(result):
+        return _objective_score(result, min_trades=min_trades, max_drawdown=max_drawdown)
+
+    resume = bool(getattr(args, "resume", False))
+    resume_signatures = set()
+    if resume and results_path.is_file():
+        ranked = _read_resume_records(results_path, grid, base_tune)
+        completed = len(ranked)
+        resume_signatures = {
+            tuple(record["params"][key] for key in keys) for record in ranked
+        }
+        if ranked:
+            next_index = max(record["index"] for record in ranked) + 1
+        ranked.sort(key=lambda item: objective(item["result"]), reverse=True)
+        best = next(
+            (record for record in ranked if math.isfinite(objective(record["result"]))),
+            None,
+        )
+        del ranked[max(20, args.elite_size, getattr(args, "validation_top", 20)):]
+        print(f"Resuming from {completed:,} completed candidates in {results_path}")
+
+    seen_signatures = resume_signatures
+    if args.mode == "grid":
+        candidate_source = (
+            candidate for candidate in iter_grid_candidates(grid)
+            if tuple(candidate[key] for key in keys) not in seen_signatures
+            and is_valid_candidate({**base_tune, **candidate})
+        )
+
+    run_metadata = {
+        "profile": profile,
+        "optimized_parameters": list(keys),
+        "base_source": base_description,
+        "minimum_trades": min_trades,
+        "maximum_allowed_drawdown": max_drawdown,
+        "resumed": resume,
+    }
 
     print(f"Mode: {args.mode} | tests: {requested_tests:,} | workers: {workers}")
+    print(f"Profile: {profile} ({len(keys)} parameters) | base: {base_description}")
     print(f"Range: {start} -> {end}")
 
-    with results_path.open("w", newline="", encoding="utf-8") as csv_file:
+    append_results = resume and results_path.is_file() and completed > 0
+    with results_path.open("a" if append_results else "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
+        if not append_results:
+            writer.writeheader()
 
         pool = None
         if workers > 1:
@@ -424,9 +682,11 @@ def run_optimization(args, grid=None):
                 writer.writerow(_result_row(keys, index, params, result, duration))
                 record = {"index": index, "params": params, "result": result, "duration": duration}
                 ranked.append(record)
-                ranked.sort(key=lambda item: _score(item["result"]), reverse=True)
-                del ranked[max(20, args.elite_size):]
-                if best is None or _score(result) > _score(best["result"]):
+                ranked.sort(key=lambda item: objective(item["result"]), reverse=True)
+                del ranked[max(20, args.elite_size, getattr(args, "validation_top", 20)):]
+                if math.isfinite(objective(result)) and (
+                    best is None or objective(result) > objective(best["result"])
+                ):
                     best = record
                 if args.log_every and (completed % args.log_every == 0 or completed == requested_tests):
                     best_score = _score(best["result"]) if best else -math.inf
@@ -435,7 +695,7 @@ def run_optimization(args, grid=None):
             csv_file.flush()
             _write_best_files(
                 output_dir, best, args.mode, requested_tests, completed,
-                time.perf_counter() - started, args.seed,
+                time.perf_counter() - started, args.seed, run_metadata,
             )
 
         try:
@@ -444,18 +704,27 @@ def run_optimization(args, grid=None):
                     candidates = list(itertools.islice(candidate_source, batch_size))
                     if not candidates:
                         break
-                    batch = list(enumerate(candidates, start=next_index))
+                    effective = [{**base_tune, **candidate} for candidate in candidates]
+                    batch = list(enumerate(effective, start=next_index))
                     next_index += len(batch)
                     consume(batch)
             else:
-                generator = SmartCandidateGenerator(grid, seed=args.seed)
+                generator = SmartCandidateGenerator(
+                    grid, seed=args.seed, baseline_params=base_tune,
+                )
+                generator.seen.update(seen_signatures)
                 while completed < requested_tests:
                     count = min(batch_size, requested_tests - completed)
-                    elites = ranked[:args.elite_size]
-                    candidates = generator.generate(count, elites=elites)
+                    elites = [
+                        record for record in ranked[:args.elite_size]
+                        if math.isfinite(objective(record["result"]))
+                    ]
+                    progress = completed / max(1, requested_tests)
+                    candidates = generator.generate(count, elites=elites, progress=progress)
                     if not candidates:
                         break
-                    batch = list(enumerate(candidates, start=next_index))
+                    effective = [{**base_tune, **candidate} for candidate in candidates]
+                    batch = list(enumerate(effective, start=next_index))
                     next_index += len(batch)
                     consume(batch)
         finally:
@@ -464,7 +733,42 @@ def run_optimization(args, grid=None):
                 pool.join()
 
     elapsed = time.perf_counter() - started
-    _write_best_files(output_dir, best, args.mode, requested_tests, completed, elapsed, args.seed)
+    training_best = best
+    validated_best, validation_records = _validate_top_candidates(
+        ranked, args, workers, chunksize,
+    )
+    if validation_records:
+        _write_json(output_dir / "validation_results.json", validation_records)
+        run_metadata.update({
+            "validation_range": [args.validation_start, args.validation_end],
+            "validation_candidates": len(validation_records),
+            "overfit_penalty": args.overfit_penalty,
+        })
+        if training_best:
+            _write_json(output_dir / "best_training_params.json", training_best["params"])
+        if validated_best and math.isfinite(validated_best["robust_score"]):
+            best = {
+                "index": validated_best["index"],
+                "params": validated_best["params"],
+                "result": validated_best["result"],
+                "duration": validated_best["duration"],
+            }
+            run_metadata.update({
+                "best_robust_score": validated_best["robust_score"],
+                "best_training_metrics": validated_best["training_result"],
+            })
+            print(
+                f"Validated {len(validation_records)} finalists | "
+                f"best robust score={validated_best['robust_score']:.4f}"
+            )
+        else:
+            run_metadata["validation_warning"] = "no finalist passed validation constraints"
+            print("Validation warning: no finalist passed the requested constraints")
+    elapsed = time.perf_counter() - started
+    _write_best_files(
+        output_dir, best, args.mode, requested_tests, completed, elapsed,
+        args.seed, run_metadata,
+    )
     _write_json(output_dir / "top_results.json", [
         {"rank": rank, **record}
         for rank, record in enumerate(ranked[:20], start=1)
@@ -483,6 +787,18 @@ def build_parser():
                         help="smart uses a test budget; grid evaluates the full Cartesian product")
     parser.add_argument("--tests", type=int, default=5000,
                         help="number of candidates in smart mode (default: 5000)")
+    parser.add_argument(
+        "--profile", choices=tuple(PARAMETER_PROFILES), default="focused",
+        help="parameter group to optimize (focused is the fast default)",
+    )
+    parser.add_argument(
+        "--base-source", choices=("config", "best", "file"), default="config",
+        help="start from strategy_config.py or an existing parameter JSON",
+    )
+    parser.add_argument(
+        "--base-params", default=os.path.join("outputs", "optimize", "best_params.json"),
+        help="JSON used when --base-source is best/file",
+    )
     parser.add_argument("-w", "--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--batch-size", type=int, default=0,
                         help="adaptive batch size (0=auto)")
@@ -494,7 +810,19 @@ def build_parser():
                         help="random seed for reproducible smart searches")
     parser.add_argument("--start", default="2025-01-01", help="inclusive date or candle index")
     parser.add_argument("--end", default="2026-02-23", help="exclusive date or candle index")
+    parser.add_argument("--validation-start", help="optional out-of-sample start")
+    parser.add_argument("--validation-end", help="optional out-of-sample end")
+    parser.add_argument("--validation-top", type=int, default=20,
+                        help="number of training finalists tested out-of-sample")
+    parser.add_argument("--overfit-penalty", type=float, default=0.25,
+                        help="penalty applied when training score exceeds validation score")
+    parser.add_argument("--min-trades", type=int, default=0,
+                        help="disqualify candidates with fewer closed trades")
+    parser.add_argument("--max-drawdown", type=float,
+                        help="disqualify candidates whose absolute drawdown exceeds this percent")
     parser.add_argument("--output-dir", default=os.path.join("outputs", "optimize"))
+    parser.add_argument("--resume", action="store_true",
+                        help="continue a compatible CSV checkpoint in output-dir")
     parser.add_argument("--log-every", type=int, default=10,
                         help="print progress every N completed tests (0=silent)")
     return parser
@@ -506,6 +834,16 @@ def main():
         raise SystemExit("--tests must be greater than zero")
     if args.elite_size <= 0:
         raise SystemExit("--elite-size must be greater than zero")
+    if args.validation_top <= 0:
+        raise SystemExit("--validation-top must be greater than zero")
+    if args.min_trades < 0:
+        raise SystemExit("--min-trades cannot be negative")
+    if args.max_drawdown is not None and args.max_drawdown <= 0:
+        raise SystemExit("--max-drawdown must be greater than zero")
+    if args.overfit_penalty < 0:
+        raise SystemExit("--overfit-penalty cannot be negative")
+    if bool(args.validation_start) != bool(args.validation_end):
+        raise SystemExit("--validation-start and --validation-end must be used together")
     multiprocessing.freeze_support()
     run_optimization(args)
 

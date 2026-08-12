@@ -1,3 +1,4 @@
+import csv
 import json
 import re
 import tempfile
@@ -7,10 +8,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from optimize import (
-    SmartCandidateGenerator, grid_size, iter_grid_candidates, param_grid,
-    run_optimization,
+    SmartCandidateGenerator, _robust_validation_score, grid_size,
+    iter_grid_candidates, param_grid, run_optimization,
 )
-from strategy_config import build_ma_strategy_config
+from ma_strategy import resolve_parameter_source
+from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
 from trade_engine import TradeEngine
 
 
@@ -106,6 +108,85 @@ class PerformanceScoreTests(unittest.TestCase):
         self.assertEqual(metrics["profit_factor"], 2.0)
         self.assertIn("expectancy_percent", metrics)
         self.assertIn("calmar_ratio", metrics)
+
+
+class ParameterSourceTests(unittest.TestCase):
+    def test_config_and_best_sources_are_explicit(self):
+        tune, description = resolve_parameter_source("config")
+        self.assertIsNone(tune)
+        self.assertEqual(description, "strategy_config.py")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            best_path = Path(temp_dir) / "best.json"
+            best_path.write_text('{"leverage": 7, "fee_rate": 0.001}', encoding="utf-8")
+            tune, description = resolve_parameter_source("best", best_params=best_path)
+
+        self.assertEqual(tune["leverage"], 7)
+        self.assertEqual(tune["fee_rate"], 0.001)
+        self.assertEqual(description, str(best_path))
+
+    def test_parameter_json_rejects_unknown_names(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "bad.json"
+            path.write_text('{"leverge": 7}', encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "leverge"):
+                load_ma_strategy_tune(path)
+
+    def test_optimizer_preserves_base_parameters_outside_profile(self):
+        args = Namespace(
+            output_dir=None, mode="grid", tests=1, workers=1, batch_size=2,
+            chunksize=1, start="0", end="10", seed=3, log_every=0,
+            elite_size=2, base_source="file", base_params=None,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+            args.base_params = str(Path(temp_dir) / "base.json")
+            Path(args.base_params).write_text('{"leverage": 7}', encoding="utf-8")
+
+            def fake_strategy(tune, start, end):
+                self.assertEqual(tune["leverage"], 7)
+                return {"score": tune["ema_16_period"]}
+
+            with patch("optimize._init_worker"), patch("optimize.ma_strategy", fake_strategy):
+                best = run_optimization(args, grid={"ema_16_period": [10]})
+
+        self.assertEqual(best["params"]["leverage"], 7)
+        self.assertEqual(best["params"]["ema_16_period"], 10)
+
+    def test_resume_does_not_repeat_completed_grid_candidates(self):
+        args = Namespace(
+            output_dir=None, mode="grid", tests=2, workers=1, batch_size=2,
+            chunksize=1, start="0", end="10", seed=3, log_every=0,
+            elite_size=2, resume=False,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+
+            def fake_strategy(tune, start, end):
+                return {"score": tune["ema_16_period"]}
+
+            with patch("optimize._init_worker"), patch("optimize.ma_strategy", fake_strategy):
+                run_optimization(args, grid={"ema_16_period": [10, 12]})
+
+            args.resume = True
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=AssertionError("candidate repeated")
+            ):
+                run_optimization(args, grid={"ema_16_period": [10, 12]})
+
+            with (Path(temp_dir) / "optimization_results.csv").open(
+                encoding="utf-8"
+            ) as results_file:
+                rows = list(csv.DictReader(results_file))
+
+        self.assertEqual(len(rows), 2)
+
+    def test_validation_score_penalizes_train_only_performance(self):
+        stable = _robust_validation_score({"score": 100}, {"score": 90}, 0.5)
+        overfit = _robust_validation_score({"score": 200}, {"score": 90}, 0.5)
+        self.assertGreater(stable, overfit)
 
 
 if __name__ == "__main__":

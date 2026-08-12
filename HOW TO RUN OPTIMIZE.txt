@@ -1,4 +1,20 @@
-python optimize.py --mode smart --tests 5000 -w 8
-OR:
-python optimize.py --mode grid -w 8
-OR: python optimize.py --mode smart --tests 10000 -w 8 --start 2023-01-01 --end 2026-01-01 --output-dir outputs/optimize/run_2023_2025
+NEW SEARCH FROM strategy_config.py:
+python optimize.py --mode smart --profile focused --base-source config --tests 5000 -w 8
+
+REFINE THE CURRENT BEST PARAMETERS:
+python optimize.py --mode smart --profile exit --base-source best --base-params outputs/optimize/best_params.json --tests 5000 -w 8 --output-dir outputs/optimize/refine_exit
+
+ROBUST TRAIN + VALIDATION SEARCH:
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 --start 2023-01-01 --end 2025-01-01 --validation-start 2025-01-01 --validation-end 2026-01-01 --min-trades 50 --max-drawdown 35 --output-dir outputs/optimize/validated
+
+CONTINUE AN INTERRUPTED RUN:
+python optimize.py --mode smart --profile focused --tests 10000 -w 8 --resume
+
+VIEW CHART WITH strategy_config.py:
+python ma_strategy.py --params-source config
+
+VIEW CHART WITH OPTIMIZER WINNER:
+python ma_strategy.py --params-source best
+
+VIEW CHART WITH A WINNER FROM ANOTHER DIRECTORY:
+python ma_strategy.py --params-source best --best-params outputs/optimize/validated/best_params.json

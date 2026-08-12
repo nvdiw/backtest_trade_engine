@@ -149,8 +149,53 @@ Optimization writes:
 Run a normal backtest with the winning JSON without changing strategy defaults:
 
 ```bash
-python ma_strategy.py --config outputs/optimize/best_params.json
+python ma_strategy.py --params-source best
 ```
+
+Switch back to the values written in `strategy_config.py` at any time:
+
+```bash
+python ma_strategy.py --params-source config
+```
+
+Use a winner from another optimization directory:
+
+```bash
+python ma_strategy.py --params-source best --best-params outputs/optimize/run_2023_2025/best_params.json
+```
+
+The old `--config FILE` option is still supported as an alias for a custom JSON.
+The strategy never rewrites `strategy_config.py`; promotion of tested values remains
+an explicit user decision.
+
+Optimization can start from either the Python defaults or a previously found winner:
+
+```bash
+# Fresh focused search around strategy_config.py
+python optimize.py --mode smart --profile focused --base-source config --tests 5000 -w 8
+
+# Refine an existing winner, preserving its parameters outside the selected profile
+python optimize.py --mode smart --profile exit --base-source best \
+  --base-params outputs/optimize/best_params.json --tests 5000 -w 8 \
+  --output-dir outputs/optimize/refine_exit
+```
+
+Profiles are `focused`, `signal`, `exit`, `risk`, `rsi`, and `full`. Sequential
+profile runs are usually more efficient than optimizing every variable at once.
+Use `--resume` to continue a compatible interrupted run.
+
+For a more reliable winner, reserve a later, non-overlapping validation period:
+
+```bash
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 \
+  --start 2023-01-01 --end 2025-01-01 \
+  --validation-start 2025-01-01 --validation-end 2026-01-01 \
+  --min-trades 50 --max-drawdown 35
+```
+
+With validation enabled, `best_training_params.json` preserves the training winner,
+while `best_params.json` becomes the validation-selected winner. Detailed holdout
+results are written to `validation_results.json`.
 
 The optimizer score combines return, drawdown, Calmar ratio, profit factor,
 expectancy, win rate, monthly consistency, trade-count confidence, and a
