@@ -37,8 +37,9 @@ class TradeCSVLogger:
         "reason",
     ]
 
-    def __init__(self, optimize: bool = False):
+    def __init__(self, optimize: bool = False, write_excel: bool = False):
         self.optimize = bool(optimize)
+        self.write_excel = bool(write_excel)
         if self.optimize:
             # keep only a tiny counter to preserve minimal bookkeeping
             self._count = 0
@@ -154,7 +155,8 @@ class TradeCSVLogger:
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
                 df.to_csv(file_name, index=False, encoding="utf-8")
-                self._save_colored_excel(df, file_name)
+                if self.write_excel:
+                    self._save_colored_excel(df, file_name)
                 break
             except PermissionError:
                 answer = input(f"please close: {file_name} after close write ok: ")

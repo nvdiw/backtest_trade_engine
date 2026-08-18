@@ -1,222 +1,333 @@
-# Backtest Trader Bot
+# Backtest Trade Engine
 
-BTC strategy backtesting bot in Python.  
-It reads historical candle CSV data, simulates trades candle-by-candle, and outputs performance reports.
+[راهنمای فارسی](README_FA.md)
 
-## Features
-- Long/short backtesting with fee and liquidation handling
-- Scoring-based entries/exits (EMA/MA, ADX, ATR, volume, momentum)
-- Post-cross sharp-move negative exit score logic
-- Monthly controls and loss-streak stop logic
-- Parameter optimization with multiprocessing
-- Interactive chart rendering for backtest review
+A candle-by-candle BTC backtesting and parameter-optimization project. It supports long/short positions, leverage, fees, liquidation, scale-ins, monthly controls, MA/EMA/ADX/ATR/volume/RSI scoring, interactive chart review, multiprocessing optimization, checkpoints, and out-of-sample validation.
 
-## Project Structure
-- `ma_strategy.py`: MA strategy rules and signal flow
-- `trade_engine.py`: execution, accounting, position lifecycle, logging, CSV reports, and chart lifecycle
-- `optimize.py`: grid-search optimizer
-- `trade_csv_logger.py`: low-level CSV writer used by `trade_engine.py`
-- `check_monthly_data.py`: monthly summary generator
-- `chart_renderer.py`: chart UI
-- `data_candle/`: historical input candles
-- `outputs/`: generated files
-  - `outputs/trades/data_orders.csv`
-  - `outputs/monthly/monthly_data_orders.csv`
-  - `outputs/optimize/optimization_results.csv`
-  - `outputs/optimize/best_params.txt`
+> Research software only. A backtest is not a promise of future performance.
 
-## Requirements
+## Execution model and correctness
+
+- Candle `i` must close before its indicators and signal are known.
+- Signal-based entries and exits fill at candle `i+1` open, avoiding look-ahead execution.
+- Liquidation is checked from the active candle's high/low.
+- Fees are included in closed-trade net profit.
+- Positions still open at the end are marked to the final close. Results expose realized profit, unrealized profit, and open-position count separately.
+- `--start` is inclusive and `--end` is exclusive.
+
+## Requirements and data
+
 - Python 3.9+
-- `pandas`
-- `numpy`
-- `mplfinance`
+- `pandas`, `numpy`, `matplotlib`, `mplfinance`
+- Optional: `openpyxl` when `--excel` is used
 
-Install:
-```bash
-pip install pandas numpy mplfinance
+```powershell
+python -m pip install pandas numpy matplotlib mplfinance
+python -m pip install openpyxl  # optional Excel output
 ```
 
-## Required Candle CSV Columns
-- `Open time`
-- `Open`
-- `High`
-- `Low`
-- `Close`
-- `Volume`
-- `Close time`
+The default file is configured in `fetch_calculate_data.py` as `data_candle/btc_15m_data_2018_to_2026.csv`. Required columns are `Open time`, `Open`, `High`, `Low`, `Close`, `Volume`, and `Close time`.
 
-Default data path is configured in `fetch_calculate_data.py`:
-`./data_candle/btc_15m_data_2018_to_2026.csv`
+## Quick start
 
-## Run Backtest
-
-Run with the default range:
-
-```bash
+```powershell
+# Normal backtest with interactive chart
 python ma_strategy.py
+
+# Fast, non-interactive research run
+python ma_strategy.py --start 2025-01-01 --end 2026-01-01 `
+  --no-chart --no-trade-log --quiet --print-result
+
+# Reproducible smart optimization
+python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
+  --start 2023-01-01 --end 2025-01-01
 ```
 
-Or provide an inclusive start and exclusive end:
+## `ma_strategy.py` manual
 
-```bash
+### Date and candle-index ranges
+
+Dates select an inclusive start and exclusive end:
+
+```powershell
 python ma_strategy.py --start 2025-01-01 --end 2025-06-01
 ```
 
-Programmatic use supports dates or candle indices:
+Integer candle indices are also accepted:
+
+```powershell
+python ma_strategy.py --start 100000 --end 120000
+```
+
+The end must resolve after the start. Date lookup uses timestamps in the configured candle CSV.
+
+### Every command-line option
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `-h`, `--help` | — | Show built-in help. |
+| `--start VALUE` | `2025-01-01` | Inclusive ISO date or candle index. |
+| `--end VALUE` | `2026-02-23` | Exclusive ISO date or candle index. |
+| `--params-source config\|best\|file` | `config` | Select parameter source. |
+| `--best-params FILE` | `outputs/optimize/best_params.json` | Winner used by `--params-source best`. |
+| `--params-file FILE` | — | Custom JSON used by `--params-source file`. |
+| `--config FILE` | — | Legacy alias for `--params-source file --params-file FILE`. |
+| `--set NAME=VALUE` | — | Override one validated setting; repeat as needed. |
+| `--list-params` | — | Print all default settings as JSON and exit. |
+| `--no-chart` | off | Do not open the interactive chart. |
+| `--save-chart FILE` | — | Save PNG, PDF, or SVG; combine with `--no-chart` for headless export. |
+| `--quiet` | off | Suppress trade and summary console messages. |
+| `--no-trade-log` | off | Skip trade CSV, monthly CSV, and XLSX generation. |
+| `--excel` | off | Also create formatted XLSX. Excel is opt-in because it is slower. |
+| `--output-dir DIR` | `outputs` | Root for trade and monthly reports. |
+| `--result-json FILE` | — | Save the final result dictionary as JSON. |
+| `--print-result` | off | Print the final result dictionary as JSON. |
+
+```powershell
+python ma_strategy.py --help
+python ma_strategy.py --list-params
+```
+
+### Parameter sources and precedence
+
+`config` reads defaults from `strategy_config.py` without rewriting it:
+
+```powershell
+python ma_strategy.py --params-source config
+```
+
+`best` loads an optimizer winner:
+
+```powershell
+python ma_strategy.py --params-source best
+python ma_strategy.py --params-source best `
+  --best-params outputs/optimize/run_01/best_params.json
+```
+
+`file` loads a custom JSON object:
+
+```powershell
+python ma_strategy.py --params-source file --params-file configs/conservative.json
+```
+
+`--set` is applied last and can temporarily override either source:
+
+```powershell
+python ma_strategy.py --params-source best `
+  --set leverage=3 --set trade_amount_percent=0.25 --set adx_filter=false
+```
+
+Values use JSON syntax when possible (`true`, `false`, numbers, strings, `null`). Unknown names are rejected before the run begins.
+
+### Useful run recipes
+
+```powershell
+# Fast benchmark without files or GUI
+python ma_strategy.py --start 2024-01-01 --end 2025-01-01 `
+  --no-chart --no-trade-log --quiet --print-result
+
+# Save a chart without opening a window
+python ma_strategy.py --start 2025-01-01 --end 2025-04-01 `
+  --no-chart --save-chart outputs/charts/q1_2025.png
+
+# Independent experiment outputs and JSON result
+python ma_strategy.py --output-dir outputs/runs/conservative `
+  --result-json outputs/runs/conservative/result.json `
+  --set leverage=3 --set trade_amount_percent=0.25
+
+# CSV, monthly CSV, and XLSX without a chart
+python ma_strategy.py --excel --no-chart
+```
+
+### Backtest outputs
+
+Unless disabled, files are written below `--output-dir`:
+
+```text
+outputs/
+├── trades/data_orders.csv
+├── trades/data_orders.xlsx       # only with --excel
+└── monthly/monthly_data_orders.csv
+```
+
+The result dictionary includes final balance, total/realized/unrealized profit, open positions, return percent, closed trades, wins/losses, win rate, maximum drawdown, score, profit factor, expectancy, Calmar ratio, and MA/RSI sub-strategy statistics.
+
+### Interactive chart controls
+
+- Mouse wheel: cursor-centered zoom.
+- Left drag: move backward or forward through history.
+- Right drag: adjust the selected panel's vertical scale.
+- Double-click price/equity: auto-fit its visible y-range.
+- Left / `A`: older candles; Right / `D`: newer candles.
+- Up / `W` / Page Up: oldest window; Down / `S` / Page Down: newest window.
+- `0` / Home: full history; `1` / End: default recent window.
+- Hover near a trade marker: show its entry/exit reason.
+
+Chart settings can be changed temporarily with `--set`:
+
+```powershell
+python ma_strategy.py `
+  --set plot_max_candles=800 `
+  --set plot_max_render_candles=600 `
+  --set plot_drag_update_interval_ms=100
+```
+
+The renderer parses arrays and timestamps once, indexes markers, aggregates OHLC while zoomed out, uses a low-density drag preview, and throttles hover redraws. Zooming in restores full candle detail.
+
+### Programmatic use
 
 ```python
 from ma_strategy import ma_strategy
 
-result = ma_strategy(start="2025-01-01", end="2025-06-01")
-```
-
-Check generated files in `outputs/`.
-
-## Trade Engine Defaults
-
-`AccountState` owns portfolio balances and aggregate trade metrics. `Position`
-owns the complete state of one open order. Direct `open_long` and `open_short`
-calls use 100% of available capital and 1x leverage unless overridden. Closing
-methods accept these objects, close the full supplied position, and update the
-account atomically.
-
-The MA strategy evaluates signals after candle `i` has closed and fills every
-signal-based entry or exit at candle `i+1` open. The final candle can update
-mark-to-market and liquidation state, but cannot create an unfillable order.
-
-```python
-from trade_engine import AccountState, Position, TradeEngine
-
-engine = TradeEngine(optimize=True, verbose=False)
-account = AccountState(balance=1000.0)
-
-opened = engine.open_long(0, [100.0], ["2026-01-01 00:00:00"], account)
-position = Position.from_open_result(
-    opened,
-    trade_id="manual_0001",
-    side="long",
-    entry_index=0,
-    high_price=100.0,
-    low_price=100.0,
-    reason="manual",
+result = ma_strategy(
+    tune={"leverage": 3, "trade_amount_percent": 0.25},
+    start="2025-01-01",
+    end="2025-06-01",
+    show_chart=False,
+    write_trades=False,
+    verbose=False,
 )
-
-closed = engine.close_long(
-    0,
-    [110.0],
-    ["2026-01-01 00:15:00"],
-    position,
-    account,
-    fee_rate=0.0005,
-    cooldown_after_big_pnl=12,
-)
-
-custom_account = AccountState(balance=1000.0)
-custom = engine.open_short(
-    0,
-    [100.0],
-    ["2026-01-01 00:00:00"],
-    custom_account,
-    trade_amount_percent=0.25,
-    leverage=3,
-)
+print(result["total_profit_percent"])
 ```
 
-## Run Optimization
+## `optimize.py` manual
 
-The default smart mode performs an adaptive, reproducible search. It starts with
-exploration and then mutates the best candidates found so far:
+The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-file I/O disabled. Market data and indicators are cached inside worker processes.
 
-```bash
-python optimize.py --mode smart --tests 5000 -w 8
+### Smart mode versus grid mode
+
+- `smart`: uses `--tests` as a budget, explores first, keeps elites, and gradually mutates promising areas. Recommended.
+- `grid`: evaluates every valid Cartesian combination in the selected profile. Built-in grids are enormous; check with `--dry-run` first.
+
+### Every command-line option
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `-h`, `--help` | — | Show built-in help. |
+| `--mode smart\|grid` | `smart` | Adaptive budget or full Cartesian grid. |
+| `--tests N` | `5000` | Smart-mode candidate budget; not a grid-mode limit. |
+| `--profile NAME` | `focused` | `focused`, `signal`, `exit`, `risk`, `rsi`, or `full`. |
+| `--base-source config\|best\|file` | `config` | Baseline outside the selected profile. |
+| `--base-params FILE` | `outputs/optimize/best_params.json` | JSON for `best` or `file`. |
+| `-w N`, `--workers N` | up to `8` | Worker processes; use `1` for easiest debugging. |
+| `--batch-size N` | `0` | Checkpoint batch size; `0` is automatic. |
+| `--chunksize N` | `0` | Multiprocessing task chunk; `0` is automatic. |
+| `--elite-size N` | `20` | Top candidates guiding smart mutations. |
+| `--seed N` | `42` | Reproducible smart-search seed. |
+| `--start VALUE` | `2025-01-01` | Inclusive training date/index. |
+| `--end VALUE` | `2026-02-23` | Exclusive training date/index. |
+| `--validation-start VALUE` | — | Inclusive out-of-sample start; pair with end. |
+| `--validation-end VALUE` | — | Exclusive out-of-sample end; pair with start. |
+| `--validation-top N` | `20` | Training finalists evaluated out of sample. |
+| `--overfit-penalty X` | `0.25` | Penalty when train score exceeds validation score. |
+| `--min-trades N` | `0` | Disqualify candidates with too few closed trades. |
+| `--max-drawdown X` | — | Disqualify candidates above this absolute drawdown %. |
+| `--output-dir DIR` | `outputs/optimize` | Checkpoints and results. |
+| `--resume` | off | Continue a compatible results CSV. |
+| `--log-every N` | `10` | Progress interval; `0` is silent. |
+| `--top-n N` | `20` | Ranked candidates saved to `top_results.json`. |
+| `--list-profiles` | — | Print profile sizes and exit. |
+| `--dry-run` | — | Print planned search size and exit. |
+
+```powershell
+python optimize.py --help
+python optimize.py --list-profiles
+python optimize.py --profile risk --mode grid --dry-run
 ```
 
-To test every Cartesian combination in `param_grid`, use full-grid mode. The
-grid is intentionally large, so reduce its values first if a complete run is
-not practical:
+### Profiles
 
-```bash
-python optimize.py --mode grid -w 8
+| Profile | Intended use |
+|---|---|
+| `focused` | MA periods and leverage/safety tiers; practical starting point. |
+| `signal` | Entry thresholds, indicators, filters, and entry weights. |
+| `exit` | Exit thresholds, trailing behavior, guards, and exit weights. |
+| `risk` | Sizing, leverage, monthly rules, cooldowns, and scale-ins. |
+| `rsi` | Embedded RSI monthly sub-strategy. |
+| `full` | Every tunable parameter; use only with a smart budget. |
+
+Sequential profile refinement is normally more efficient and easier to validate than optimizing everything at once.
+
+### Recommended workflows
+
+```powershell
+# Focused search from Python defaults
+python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
+  --start 2023-01-01 --end 2025-01-01 `
+  --output-dir outputs/optimize/focused_01
+
+# Refine exits around an existing winner
+python optimize.py --mode smart --profile exit --tests 5000 -w 8 `
+  --base-source file --base-params outputs/optimize/focused_01/best_params.json `
+  --start 2023-01-01 --end 2025-01-01 `
+  --output-dir outputs/optimize/exit_01
+
+# Non-overlapping out-of-sample validation
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+  --start 2023-01-01 --end 2025-01-01 `
+  --validation-start 2025-01-01 --validation-end 2026-01-01 `
+  --validation-top 30 --overfit-penalty 0.35 `
+  --min-trades 50 --max-drawdown 35 `
+  --output-dir outputs/optimize/signal_validated
+
+# Resume the same compatible run
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+  --output-dir outputs/optimize/signal_validated --resume
+
+# Run the selected winner
+python ma_strategy.py --params-source best `
+  --best-params outputs/optimize/signal_validated/best_params.json
 ```
 
-Useful options include `--start`, `--end`, `--seed`, `--batch-size`, and
-`--output-dir`. Market data and previously calculated indicators are cached in
-each worker process, which substantially reduces repeated-test overhead.
+Resume requires the same profile/grid columns and compatible values. Use a new output directory after changing the profile or grid.
 
-Optimization writes:
+### Scoring and validation
 
-- `outputs/optimize/optimization_results.csv`: every completed candidate.
-- `outputs/optimize/best_params.json`: only the winning parameter values.
-- `outputs/optimize/optimization_summary.json`: run metadata and best metrics.
-- `outputs/optimize/top_results.json`: the top 20 candidates by robust score.
+Ranking combines return, maximum drawdown, Calmar ratio, profit factor, expectancy, win rate, monthly consistency, trade-count confidence, and a liquidation penalty. No-trade candidates receive a losing score. `--min-trades` and `--max-drawdown` are hard constraints.
 
-Run a normal backtest with the winning JSON without changing strategy defaults:
+With validation, robust score equals validation score minus `overfit_penalty × max(0, train_score - validation_score)`.
 
-```bash
-python ma_strategy.py --params-source best
+### Optimizer outputs
+
+```text
+optimization_results.csv     every completed candidate/checkpoint
+best_params.json              final selected winner
+optimization_summary.json     metadata and winner metrics
+top_results.json              top --top-n candidates
+best_training_params.json     training winner with validation
+validation_results.json       out-of-sample finalist details
 ```
 
-Switch back to the values written in `strategy_config.py` at any time:
+JSON writes are atomic. CSV is flushed after each batch for reliable resume.
 
-```bash
-python ma_strategy.py --params-source config
+## Testing
+
+```powershell
+python -m unittest discover -v
+python -m py_compile ma_strategy.py optimize.py trade_engine.py chart_renderer.py
 ```
 
-Use a winner from another optimization directory:
+## Troubleshooting
 
-```bash
-python ma_strategy.py --params-source best --best-params outputs/optimize/run_2023_2025/best_params.json
+- Slow chart: lower `plot_max_candles` / `plot_max_render_candles`, or use `--no-chart`.
+- Slow reports: XLSX is opt-in; omit `--excel`.
+- Locked CSV/XLSX: close it in Excel or choose another `--output-dir`.
+- Optimizer RAM pressure: lower `--workers`, then `--batch-size`.
+- Windows multiprocessing problem: use `-w 1` to expose the original error.
+- No trades: inspect thresholds, range, `--min-trades`, and parameter source.
+- Unknown JSON/`--set` key: run `python ma_strategy.py --list-params`.
+
+## Project structure
+
+```text
+ma_strategy.py          strategy, CLI, and signal flow
+trade_engine.py         execution, accounting, liquidation, reports
+trade_csv_logger.py     CSV and optional XLSX writer
+chart_renderer.py       interactive/exportable chart
+indicators.py           vectorized indicators
+strategy_config.py      typed defaults
+optimize.py             smart/grid multiprocessing optimizer
+check_monthly_data.py   monthly report builder
+data_candle/            input candles
+outputs/                generated artifacts
 ```
-
-The old `--config FILE` option is still supported as an alias for a custom JSON.
-The strategy never rewrites `strategy_config.py`; promotion of tested values remains
-an explicit user decision.
-
-Optimization can start from either the Python defaults or a previously found winner:
-
-```bash
-# Fresh focused search around strategy_config.py
-python optimize.py --mode smart --profile focused --base-source config --tests 5000 -w 8
-
-# Refine an existing winner, preserving its parameters outside the selected profile
-python optimize.py --mode smart --profile exit --base-source best \
-  --base-params outputs/optimize/best_params.json --tests 5000 -w 8 \
-  --output-dir outputs/optimize/refine_exit
-```
-
-Profiles are `focused`, `signal`, `exit`, `risk`, `rsi`, and `full`. Sequential
-profile runs are usually more efficient than optimizing every variable at once.
-Use `--resume` to continue a compatible interrupted run.
-
-For a more reliable winner, reserve a later, non-overlapping validation period:
-
-```bash
-python optimize.py --mode smart --profile signal --tests 10000 -w 8 \
-  --start 2023-01-01 --end 2025-01-01 \
-  --validation-start 2025-01-01 --validation-end 2026-01-01 \
-  --min-trades 50 --max-drawdown 35
-```
-
-With validation enabled, `best_training_params.json` preserves the training winner,
-while `best_params.json` becomes the validation-selected winner. Detailed holdout
-results are written to `validation_results.json`.
-
-The optimizer score combines return, drawdown, Calmar ratio, profit factor,
-expectancy, win rate, monthly consistency, trade-count confidence, and a
-liquidation penalty. No-trade candidates receive a losing score.
-
-## Recent Strategy/Project Updates
-- Added negative exit score component:
-  - If a sharp move is detected in the lookback window (default `400` candles),
-    and EMA/MA cross happened, a temporary post-cross penalty is applied for `15` candles.
-- Sharp move detection improved to strongest directional move (ordered move), not simple high/low span.
-- Added monthly loss-streak stop controls:
-  - `consecutive_losses_month_stop_filter`
-  - `consecutive_losses_stop_until_month`
-- Output files reorganized under `outputs/` folders for cleaner repository structure.
-- Optimizer and summary writers now create output directories automatically.
-
-## Notes
-- Optimization mode disables per-trade CSV logging for speed.
-- If CSV is open in another app (like Excel), writing may wait/fail until file is closed.
-- This repository is for research/education, not financial advice.

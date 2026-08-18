@@ -141,13 +141,13 @@ FULL_PARAM_GRID = {
     "plot_end_offset": [0],
     "plot_step_candles": [300],
     "plot_min_zoom_candles": [80],
-    "plot_max_render_candles": [1600],
+    "plot_max_render_candles": [900],
     "plot_zoom_in_factor": [0.8],
     "plot_zoom_out_factor": [1.6],
     "plot_window_width_scale": [0.94],
     "plot_window_height_scale": [0.90],
-    "plot_drag_preview_factor": [0.42],
-    "plot_drag_update_interval_ms": [16],
+    "plot_drag_preview_factor": [0.20],
+    "plot_drag_update_interval_ms": [75],
     "plot_yscale_drag_sensitivity": [0.0030],
     "plot_post_cross_penalty_markers": [True],
 }
@@ -360,7 +360,10 @@ class SmartCandidateGenerator:
 
 
 def _parse_bound(value):
-    return int(value) if str(value).isdigit() else value
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
 
 
 def _init_worker(start, end):
@@ -629,7 +632,10 @@ def run_optimization(args, grid=None):
             (record for record in ranked if math.isfinite(objective(record["result"]))),
             None,
         )
-        del ranked[max(20, args.elite_size, getattr(args, "validation_top", 20)):]
+        del ranked[max(
+            getattr(args, "top_n", 20), args.elite_size,
+            getattr(args, "validation_top", 20),
+        ):]
         print(f"Resuming from {completed:,} completed candidates in {results_path}")
 
     seen_signatures = resume_signatures
@@ -683,7 +689,10 @@ def run_optimization(args, grid=None):
                 record = {"index": index, "params": params, "result": result, "duration": duration}
                 ranked.append(record)
                 ranked.sort(key=lambda item: objective(item["result"]), reverse=True)
-                del ranked[max(20, args.elite_size, getattr(args, "validation_top", 20)):]
+                del ranked[max(
+                    getattr(args, "top_n", 20), args.elite_size,
+                    getattr(args, "validation_top", 20),
+                ):]
                 if math.isfinite(objective(result)) and (
                     best is None or objective(result) > objective(best["result"])
                 ):
@@ -769,9 +778,10 @@ def run_optimization(args, grid=None):
         output_dir, best, args.mode, requested_tests, completed, elapsed,
         args.seed, run_metadata,
     )
+    top_n = max(1, int(getattr(args, "top_n", 20)))
     _write_json(output_dir / "top_results.json", [
         {"rank": rank, **record}
-        for rank, record in enumerate(ranked[:20], start=1)
+        for rank, record in enumerate(ranked[:top_n], start=1)
     ])
     print(f"Finished {completed:,} tests ({failed} failed) in {elapsed:.1f}s")
     print(f"Results: {results_path}")
@@ -825,11 +835,21 @@ def build_parser():
                         help="continue a compatible CSV checkpoint in output-dir")
     parser.add_argument("--log-every", type=int, default=10,
                         help="print progress every N completed tests (0=silent)")
+    parser.add_argument("--top-n", type=int, default=20,
+                        help="number of ranked candidates saved to top_results.json")
+    parser.add_argument("--list-profiles", action="store_true",
+                        help="show optimization profiles and exit")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="print the planned search size without evaluating candidates")
     return parser
 
 
-def main():
-    args = build_parser().parse_args()
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.list_profiles:
+        for name, grid in PARAMETER_PROFILES.items():
+            print(f"{name}: {len(grid)} parameters | {grid_size(grid):,} grid combinations")
+        return
     if args.tests <= 0:
         raise SystemExit("--tests must be greater than zero")
     if args.elite_size <= 0:
@@ -842,8 +862,23 @@ def main():
         raise SystemExit("--max-drawdown must be greater than zero")
     if args.overfit_penalty < 0:
         raise SystemExit("--overfit-penalty cannot be negative")
+    if args.top_n <= 0:
+        raise SystemExit("--top-n must be greater than zero")
     if bool(args.validation_start) != bool(args.validation_end):
         raise SystemExit("--validation-start and --validation-end must be used together")
+    if args.dry_run:
+        selected_grid = PARAMETER_PROFILES[args.profile]
+        planned = (
+            min(args.tests, grid_size(selected_grid))
+            if args.mode == "smart"
+            else grid_size(selected_grid)
+        )
+        print(f"Mode: {args.mode}")
+        print(f"Profile: {args.profile} ({len(selected_grid)} parameters)")
+        print(f"Planned candidates: {planned:,}")
+        print(f"Workers: {args.workers}")
+        print(f"Range: {args.start} -> {args.end}")
+        return
     multiprocessing.freeze_support()
     run_optimization(args)
 

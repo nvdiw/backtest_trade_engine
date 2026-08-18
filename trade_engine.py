@@ -2,6 +2,7 @@
 
 import os
 import math
+from datetime import datetime, timezone
 from functools import lru_cache
 from dataclasses import dataclass, field, fields
 from typing import Optional
@@ -126,34 +127,19 @@ class AccountState:
 
 # Calculate Trade Duration
 def trade_duration(open_time: str, close_time: str):
-    # format: YYYY-MM-DD HH:MM:SS.microseconds
+    """Return elapsed whole days/hours/minutes for ISO-like timestamps."""
 
-    def parse(t):
-        t = t.strip()
-        date, time = t.split(" ")
-        y, m, d = map(int, date.split("-"))
-        h, mi, s = time.split(":")
-        s = int(float(s))  # drop microseconds
-        return y, m, d, int(h), int(mi), s
+    def parse(value):
+        text = str(value).strip().replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
 
-    def to_seconds(y, m, d, h, mi, s):
-        # days per month (no leap year handling for simplicity)
-        mdays = [31,28,31,30,31,30,31,31,30,31,30,31]
-
-        days = y * 365 + sum(mdays[:m-1]) + (d - 1)
-        return days * 86400 + h * 3600 + mi * 60 + s
-
-    o = to_seconds(*parse(open_time))
-    c = to_seconds(*parse(close_time))
-
-    diff = c - o
-
-    days = diff // 86400
-    diff %= 86400
-    hours = diff // 3600
-    diff %= 3600
-    minutes = diff // 60
-
+    seconds = max(0, int((parse(close_time) - parse(open_time)).total_seconds()))
+    days, remainder = divmod(seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
     return days, hours, minutes
 
 
@@ -185,9 +171,18 @@ class TradeEngine:
         save_money_recover_trigger_pct=75.0,
         verbose=True,
         optimize=False,
+        write_trades=True,
+        write_excel=False,
+        output_dir="outputs",
+        track_equity_curve=None,
         csv_logger=None,
     ):
-        self.csv_logger = csv_logger or TradeCSVLogger(optimize=optimize)
+        self.write_trades = bool(write_trades) and not bool(optimize)
+        self.output_dir = os.fspath(output_dir)
+        self.csv_logger = csv_logger or TradeCSVLogger(
+            optimize=not self.write_trades,
+            write_excel=write_excel,
+        )
         self.first_balance = first_balance
         self.monthly_profit_percent_stop_trade = monthly_profit_percent_stop_trade
         self.monthly_loss_percent_stop_trade = monthly_loss_percent_stop_trade
@@ -204,7 +199,9 @@ class TradeEngine:
         self.safe_leverage_balance_pct_high = safe_leverage_balance_pct_high
         self.save_money_recover_trigger_pct = save_money_recover_trigger_pct
         self.verbose = bool(verbose)
-        self.track_equity_curve = not bool(optimize)
+        if track_equity_curve is None:
+            track_equity_curve = not bool(optimize)
+        self.track_equity_curve = bool(track_equity_curve)
         self.equity_peak = None
         # self.just_one_time = True
 
@@ -245,9 +242,11 @@ class TradeEngine:
         }
 
     @staticmethod
-    def create_chart_state(optimize=False, plot_penalties=True):
+    def create_chart_state(optimize=False, plot_penalties=True, enabled=None):
         """Create chart bookkeeping without leaking renderer setup into a strategy."""
-        enabled = not optimize
+        if enabled is None:
+            enabled = not optimize
+        enabled = bool(enabled) and not bool(optimize)
         penalty_enabled = enabled and plot_penalties
         return {
             "chart_data": [] if enabled else None,
@@ -316,6 +315,17 @@ class TradeEngine:
         else:
             pnl_percent = (position["entry_price"] - price) / position["entry_price"] * 100
         return position["margin"] + position["margin"] * pnl_percent * position["leverage"] / 100
+
+    @staticmethod
+    def position_equity_no_fee(position, price):
+        """Mark one position using its fee-free size and margin fields."""
+        direction = 1.0 if position["side"] == "long" else -1.0
+        pnl = (
+            position["position_size_no_fee"]
+            * (price - position["entry_price"])
+            * direction
+        )
+        return position["margin_no_fee"] + pnl
 
     @classmethod
     def open_positions_equity(cls, positions, price, exclude_position=None):
@@ -1244,6 +1254,17 @@ class TradeEngine:
             'max_drawdown': max_drawdown,
             'close_price': close_price,
             'close_time_value': close_time_value,
+            'pnl': pnl,
+            'pnl_percent': pnl_percent,
+            'total_fee': total_fee,
+            'profit': profit,
+            'profit_percent': profit_percent,
+            'logged_balance_before': logged_balance_before,
+            'logged_balance_after': logged_balance_after,
+            'save_money': save_money,
+            'days': days,
+            'hours': hours,
+            'minutes': minutes,
             'total_liquids': total_liquids
         }
 
@@ -1307,9 +1328,19 @@ class TradeEngine:
         balance_without_fee = state["balance_without_fee"]
         save_money = state["save_money"]
         open_positions = state["open_positions"]
+        unrealized_profit = 0.0
         if open_positions:
-            balance += sum(position["margin"] for position in open_positions)
-            balance_without_fee += sum(position["margin_no_fee"] for position in open_positions)
+            ending_mark_price = float(state["ending_mark_price"])
+            marked_equity = self.open_positions_equity(
+                open_positions, ending_mark_price
+            )
+            open_margin = sum(position["margin"] for position in open_positions)
+            unrealized_profit = marked_equity - open_margin
+            balance += marked_equity
+            balance_without_fee += sum(
+                self.position_equity_no_fee(position, ending_mark_price)
+                for position in open_positions
+            )
         balance += save_money
 
         first_balance = state["first_balance"]
@@ -1391,11 +1422,13 @@ class TradeEngine:
                 rsi_profit=rsi_profit,
             )
 
-        output_file = os.path.join("outputs", "trades", "data_orders.csv")
+        total_profit = balance - first_balance
+        realized_profit = sum(profits)
+        output_file = os.path.join(self.output_dir, "trades", "data_orders.csv")
         self.csv_logger.save_csv(
             first_balance=first_balance,
             final_balance=balance,
-            total_profit=sum(profits),
+            total_profit=total_profit,
             total_profit_percent=t_profit_percent,
             total_fee=state["deducting_fee_total"],
             start_time=state["first_open_time"],
@@ -1406,7 +1439,7 @@ class TradeEngine:
             file_name=output_file,
         )
 
-        if not optimize:
+        if state.get("show_chart", not optimize):
             chart_payload = dict(state["chart_payload"])
             chart_payload.update(
                 balance=balance,
@@ -1421,10 +1454,14 @@ class TradeEngine:
             chart_result = render_backtest_chart(**chart_payload)
             if chart_result is not None:
                 return chart_result
+
+        if self.write_trades:
             try:
                 write_monthly_summary(
                     in_file=output_file,
-                    out_file=os.path.join("outputs", "monthly", "monthly_data_orders.csv"),
+                    out_file=os.path.join(
+                        self.output_dir, "monthly", "monthly_data_orders.csv"
+                    ),
                     quiet=True,
                 )
             except Exception:
@@ -1433,7 +1470,11 @@ class TradeEngine:
         return {
             "final_balance_static": state["total_money_static"],
             "final_balance_dynamic": state["total_money_dynamic"],
-            "total_profit": round(sum(profits), 6),
+            "final_balance": round(balance, 6),
+            "total_profit": round(total_profit, 6),
+            "realized_profit": round(realized_profit, 6),
+            "unrealized_profit": round(unrealized_profit, 6),
+            "open_positions": len(open_positions),
             "total_profit_percent": round(t_profit_percent, 6),
             "closed_trades": state["count_closed_orders"],
             "wins": total_wins,
@@ -1494,7 +1535,11 @@ class TradeEngine:
         print("Maximum Drawdown:", round(state["max_drawdown"], 2), "%")
         print(f'Total Duration : {report["days"]} days, {report["hours"]} hours, {report["minutes"]} minutes')
         print("Win Rate:", round(report["win_rate"], 2), "%")
-        print("Total Profit:", round(sum(state["profits_lst"]), 2), "$")
+        print(
+            "Total Profit:",
+            round(report["balance"] - state["first_balance"], 2),
+            "$",
+        )
         print("Total Profit Percent:", round(report["t_profit_percent"], 2), "%")
         print("saved Money:", round(state["save_money"], 2), "$")
         print("Count Liquids:", state["total_liquids"])
@@ -1704,6 +1749,17 @@ class TradeEngine:
             'max_drawdown': max_drawdown,
             'close_price': close_price,
             'close_time_value': close_time_value,
+            'pnl': pnl,
+            'pnl_percent': pnl_percent,
+            'total_fee': total_fee,
+            'profit': profit,
+            'profit_percent': profit_percent,
+            'logged_balance_before': logged_balance_before,
+            'logged_balance_after': logged_balance_after,
+            'save_money': save_money,
+            'days': days,
+            'hours': hours,
+            'minutes': minutes,
             'total_liquids': total_liquids
         }
 

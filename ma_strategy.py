@@ -2,13 +2,20 @@
 
 import argparse
 from collections import OrderedDict
+from dataclasses import asdict
+import json
 from pathlib import Path
+import sys
 import numpy as np
 
 from indicators import Indicator
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
-from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
+from strategy_config import (
+    build_ma_strategy_config,
+    load_ma_strategy_tune,
+    normalize_ma_strategy_tune,
+)
 
 
 DEFAULT_BEST_PARAMS_PATH = Path("outputs") / "optimize" / "best_params.json"
@@ -62,7 +69,18 @@ def _get_cached_indicator(kind, range_key, indicator_key, builder):
     return value
 
 # Main Trading Logic
-def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
+def ma_strategy(
+    tune: dict = None,
+    start="2025-01-01",
+    end="2026-02-23",
+    *,
+    show_chart=None,
+    chart_file=None,
+    verbose=None,
+    write_trades=None,
+    write_excel=False,
+    output_dir="outputs",
+):
     """Run the MA strategy over ``start`` (inclusive) to ``end`` (exclusive).
 
     ``start`` and ``end`` may be date strings (``YYYY-MM-DD``) or candle indices.
@@ -70,7 +88,15 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
 
     # detect optimization mode early so we can disable I/O and heavy bookkeeping
     optimize = bool(tune.get('optimize')) if tune else False
-    verbose = not optimize
+    if verbose is None:
+        verbose = not optimize
+    if show_chart is None:
+        show_chart = not optimize
+    if write_trades is None:
+        write_trades = not optimize
+    show_chart = bool(show_chart) and not optimize
+    write_trades = bool(write_trades) and not optimize
+    render_chart = (show_chart or bool(chart_file)) and not optimize
 
     market = TradeEngine.load_market_data(start=start, end=end)
     start = market["start"]
@@ -338,6 +364,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
     chart_state = TradeEngine.create_chart_state(
         optimize=optimize,
         plot_penalties=plot_post_cross_penalty_markers,
+        enabled=render_chart,
     )
     chart_data = chart_state["chart_data"]
     long_open_points = chart_state["long_open_points"]
@@ -412,6 +439,10 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         save_money_recover_trigger_pct=save_money_recover_trigger_pct,
         verbose=verbose,
         optimize=optimize,
+        write_trades=write_trades,
+        write_excel=write_excel,
+        output_dir=output_dir,
+        track_equity_curve=render_chart,
     )
 
     def capture_account_state():
@@ -602,7 +633,14 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 )
                 apply_account_state(account)
                 if liq_updates['liquidated']:
-                    liq_reason_text = "LONG EXIT (Liquidation)\nForced close by liquidation rule."
+                    liq_reason_text = (
+                        "LONG CLOSE - LIQUIDATION\n"
+                        "Reason: position was force-closed by the liquidation rule.\n\n"
+                        + generate_close_reason_text(
+                            p['trade_id'],
+                            {**p, **liq_updates},
+                        )
+                    )
                     open_positions.remove(p)
                     liquidated_any = True
                     if consecutive_losses_month_stop_filter:
@@ -634,7 +672,14 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 )
                 apply_account_state(account)
                 if liq_updates['liquidated']:
-                    liq_reason_text = "SHORT EXIT (Liquidation)\nForced close by liquidation rule."
+                    liq_reason_text = (
+                        "SHORT CLOSE - LIQUIDATION\n"
+                        "Reason: position was force-closed by the liquidation rule.\n\n"
+                        + generate_close_reason_text(
+                            p['trade_id'],
+                            {**p, **liq_updates},
+                        )
+                    )
                     open_positions.remove(p)
                     liquidated_any = True
                     if consecutive_losses_month_stop_filter:
@@ -861,7 +906,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                 if long_open_reasons is not None:
                                     # default texts
                                     entry_reason_text = f"opened long when monthly filter is on and rsi is lower than: {rsi_long_open_monthly_profit}\n"
-                                    entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
+                                    entry_reason_text += generate_entry_reason_text(trade_id=position['trade_id'], updates=updates)
                                     long_open_reasons[execution_i] = entry_reason_text
                             
                             next_trade_id += 1
@@ -929,7 +974,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                 if short_open_reasons is not None:
                                     # default texts
                                     entry_reason_text = f"opened short when monthly filter is on and rsi is upper than: {rsi_short_open_monthly_profit}\n"
-                                    entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
+                                    entry_reason_text += generate_entry_reason_text(trade_id=position['trade_id'], updates=updates)
                                     short_open_reasons[execution_i] = entry_reason_text
 
                             next_trade_id += 1
@@ -1077,7 +1122,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                             # open reason text
                             if long_open_reasons is not None:
                                 # default texts
-                                entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
+                                entry_reason_text += generate_entry_reason_text(trade_id=position['trade_id'], updates=updates)
                                 long_open_reasons[execution_i] = entry_reason_text
                         
                         next_trade_id += 1
@@ -1177,6 +1222,15 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                         long_scale_entry_text += (
                                             f"\nProfit filter score: {long_profit_scale_entry_score}/{profit_scale_entry_min_score}"
                                         )
+
+                                elif long_scale_entry_reason == "loss":
+                                    long_scale_entry_text += (
+                                        f"Price moved -{scale_entry_loss_trigger_pct*100:.2f}% from first LONG entry."
+                                    )
+
+                                long_scale_entry_text += "\n\n" + generate_entry_reason_text(
+                                    trade_id=position['trade_id'], updates=updates
+                                )
 
                                 long_open_reasons[execution_i] = long_scale_entry_text
                                 
@@ -1531,7 +1585,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                             # open reason text
                             if short_open_reasons is not None:
                                 # default texts
-                                entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
+                                entry_reason_text += generate_entry_reason_text(trade_id=position['trade_id'], updates=updates)
                                 short_open_reasons[execution_i] = entry_reason_text
 
                         next_trade_id += 1
@@ -1631,6 +1685,15 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                         short_scale_entry_text += (
                                             f"\nProfit filter score: {short_profit_scale_entry_score}/{profit_scale_entry_min_score}"
                                         )
+
+                                elif short_scale_entry_reason == "loss":
+                                    short_scale_entry_text += (
+                                        f"Price moved +{scale_entry_loss_trigger_pct*100:.2f}% from first SHORT entry."
+                                    )
+
+                                short_scale_entry_text += "\n\n" + generate_entry_reason_text(
+                                    trade_id=position['trade_id'], updates=updates
+                                )
 
                                 short_open_reasons[execution_i] = short_scale_entry_text
 
@@ -1871,6 +1934,8 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 
     return trade_engine.finalize_backtest(
         optimize=optimize,
+        show_chart=render_chart,
+        ending_mark_price=close_prices[-1],
         balance=balance,
         balance_without_fee=balance_without_fee,
         save_money=save_money,
@@ -1922,6 +1987,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
             "chart_data": chart_data,
             "close_prices": close_prices,
             "close_times": close_times,
+            "open_times": open_times,
             "open_prices": open_prices,
             "high_prices": high_prices,
             "low_prices": low_prices,
@@ -1954,12 +2020,51 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
             "plot_drag_preview_factor": plot_drag_preview_factor,
             "plot_drag_update_interval_ms": plot_drag_update_interval_ms,
             "plot_yscale_drag_sensitivity": plot_yscale_drag_sensitivity,
+            "chart_show": show_chart,
+            "chart_save_path": chart_file,
         },
     )
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run the MA backtest strategy.")
-    parser.add_argument("--start", default="2025-01-01", help="Inclusive date or candle index")
-    parser.add_argument("--end", default="2026-02-23", help="Exclusive date or candle index")
+def _parse_bound(value):
+    """Accept either a signed candle index or an ISO date string."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return value
+
+
+def _parse_set_overrides(items):
+    overrides = {}
+    for item in items or ():
+        if "=" not in item:
+            raise ValueError(f"--set expects NAME=VALUE, got: {item}")
+        name, raw_value = item.split("=", 1)
+        name = name.strip()
+        if not name:
+            raise ValueError("--set parameter name cannot be empty")
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            value = raw_value
+        overrides[name] = value
+    return normalize_ma_strategy_tune(overrides, source="--set")
+
+
+def _json_default(value):
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"cannot serialize {type(value).__name__}")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        description="Run the MA backtest with optional chart and report outputs."
+    )
+    parser.add_argument("--start", default="2025-01-01",
+                        help="inclusive YYYY-MM-DD date or candle index")
+    parser.add_argument("--end", default="2026-02-23",
+                        help="exclusive YYYY-MM-DD date or candle index")
     parser.add_argument(
         "--params-source", choices=("config", "best", "file"), default="config",
         help="config=strategy_config.py, best=optimizer winner, file=custom JSON",
@@ -1973,9 +2078,43 @@ if __name__ == "__main__":
         "--config", dest="legacy_config",
         help="legacy alias for --params-source=file --params-file=FILE",
     )
-    args = parser.parse_args()
-    parsed_start = int(args.start) if args.start.isdigit() else args.start
-    parsed_end = int(args.end) if args.end.isdigit() else args.end
+    parser.add_argument(
+        "--set", dest="set_values", action="append", default=[], metavar="NAME=VALUE",
+        help="override one strategy setting; may be repeated",
+    )
+    parser.add_argument("--list-params", action="store_true",
+                        help="print effective config defaults as JSON and exit")
+    parser.add_argument("--no-chart", action="store_true",
+                        help="skip the interactive chart for a faster run")
+    parser.add_argument("--save-chart", metavar="FILE",
+                        help="save the chart to PNG/PDF/SVG; works with --no-chart")
+    parser.add_argument("--quiet", action="store_true",
+                        help="suppress per-trade and summary console output")
+    parser.add_argument("--no-trade-log", action="store_true",
+                        help="do not write trade CSV/XLSX or monthly CSV")
+    parser.add_argument("--excel", action="store_true",
+                        help="also create a formatted XLSX trade report")
+    parser.add_argument("--output-dir", default="outputs",
+                        help="root directory for trade and monthly reports")
+    parser.add_argument("--result-json", metavar="FILE",
+                        help="write the final result dictionary as JSON")
+    parser.add_argument("--print-result", action="store_true",
+                        help="print the final result dictionary as JSON")
+    return parser
+
+
+def main(argv=None):
+    try:
+        sys.stdout.reconfigure(errors="replace")
+        sys.stderr.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.list_params:
+        print(json.dumps(asdict(build_ma_strategy_config()), indent=2, sort_keys=True))
+        return 0
     if args.legacy_config:
         if args.params_source != "config" or args.params_file:
             parser.error("--config cannot be combined with --params-source/--params-file")
@@ -1987,7 +2126,36 @@ if __name__ == "__main__":
             params_file=args.params_file,
             best_params=args.best_params,
         )
+        overrides = _parse_set_overrides(args.set_values)
     except (ValueError, FileNotFoundError) as exc:
         parser.error(str(exc))
-    print(f"Parameter source: {source_description}")
-    ma_strategy(tune=tune, start=parsed_start, end=parsed_end)
+    if overrides:
+        tune = {**(tune or {}), **overrides}
+
+    if not args.quiet:
+        print(f"Parameter source: {source_description}")
+        if overrides:
+            print(f"CLI overrides: {', '.join(sorted(overrides))}")
+    result = ma_strategy(
+        tune=tune,
+        start=_parse_bound(args.start),
+        end=_parse_bound(args.end),
+        show_chart=not args.no_chart,
+        chart_file=args.save_chart,
+        verbose=not args.quiet,
+        write_trades=not args.no_trade_log,
+        write_excel=args.excel,
+        output_dir=args.output_dir,
+    )
+    result_json = json.dumps(result, indent=2, sort_keys=True, default=_json_default)
+    if args.result_json:
+        result_path = Path(args.result_json)
+        result_path.parent.mkdir(parents=True, exist_ok=True)
+        result_path.write_text(result_json + "\n", encoding="utf-8")
+    if args.print_result:
+        print(result_json)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

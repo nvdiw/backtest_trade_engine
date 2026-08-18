@@ -241,7 +241,7 @@ class ChartConfig:
     # Minimum visible candles while zooming.
     plot_min_zoom_candles: int = 80
     # Max rendered candles after aggregation.
-    plot_max_render_candles: int = 1600
+    plot_max_render_candles: int = 900
     # Mouse-wheel zoom-in multiplier.
     plot_zoom_in_factor: float = 0.8
     # Mouse-wheel zoom-out multiplier.
@@ -251,9 +251,9 @@ class ChartConfig:
     # Chart window height relative to screen.
     plot_window_height_scale: float = 0.90
     # Render less data during drag for smoother chart movement.
-    plot_drag_preview_factor: float = 0.42
+    plot_drag_preview_factor: float = 0.20
     # Drag redraw throttle in milliseconds.
-    plot_drag_update_interval_ms: int = 16
+    plot_drag_update_interval_ms: int = 75
     # Vertical zoom sensitivity for right-drag.
     plot_yscale_drag_sensitivity: float = 0.0030
     # Show penalty markers on the chart.
@@ -401,19 +401,16 @@ _TUNE_ALIASES = {
 }
 
 
-def load_ma_strategy_tune(path):
-    """Load and validate a JSON parameter override for ``ma_strategy``."""
-    path = Path(path)
-    with path.open(encoding="utf-8") as config_file:
-        tune = json.load(config_file)
+def normalize_ma_strategy_tune(tune, source="parameter overrides"):
+    """Validate and type-coerce an MA strategy override mapping."""
     if not isinstance(tune, dict):
-        raise ValueError(f"{path} must contain a JSON object")
+        raise ValueError(f"{source} must contain a JSON object")
 
     valid_keys = {field.name for field in fields(MAStrategyConfig)} | _TUNE_ALIASES
     unknown = sorted(set(tune) - valid_keys)
     if unknown:
         raise ValueError(
-            f"{path} contains unknown strategy parameter(s): {', '.join(unknown)}"
+            f"{source} contains unknown strategy parameter(s): {', '.join(unknown)}"
         )
     # Build once to validate/coerce every supplied value before a long run starts.
     config = build_ma_strategy_config(tune)
@@ -421,3 +418,11 @@ def load_ma_strategy_tune(path):
         key: getattr(config, key) if hasattr(config, key) else value
         for key, value in tune.items()
     }
+
+
+def load_ma_strategy_tune(path):
+    """Load and validate a JSON parameter override for ``ma_strategy``."""
+    path = Path(path)
+    with path.open(encoding="utf-8") as config_file:
+        tune = json.load(config_file)
+    return normalize_ma_strategy_tune(tune, source=str(path))

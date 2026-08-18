@@ -1,7 +1,18 @@
 import pandas as pd
+from functools import lru_cache
+from pathlib import Path
 
-# open the csv file
-df = pd.read_csv("./data_candle/btc_15m_data_2018_to_2026.csv", parse_dates=["Open time"])
+DATA_FILE = Path(__file__).resolve().parent / "data_candle" / "btc_15m_data_2018_to_2026.csv"
+
+
+@lru_cache(maxsize=1)
+def _open_times():
+    """Load the timestamp index only when a date lookup is actually requested."""
+    return pd.read_csv(
+        DATA_FILE,
+        usecols=["Open time"],
+        parse_dates=["Open time"],
+    )["Open time"]
 
 # get candle index
 def get_candle_index(date, time=None):
@@ -19,12 +30,14 @@ def get_candle_index(date, time=None):
         - tuple (start_index, end_index)
     """
 
+    open_times = _open_times()
+
     def _to_index(d, t=None):
         if t:
             target = pd.to_datetime(f"{d} {t}")
         else:
             target = pd.to_datetime(d)
-        return df["Open time"].searchsorted(target)
+        return open_times.searchsorted(target)
 
     # ===== RANGE MODE =====
     if isinstance(date, tuple):
@@ -51,7 +64,7 @@ def get_month_start_indices(start_idx: int, end_idx: int, just_index : bool):
     inside [start_idx, end_idx)
     """
 
-    window = df["Open time"].iloc[start_idx:end_idx]
+    window = _open_times().iloc[start_idx:end_idx]
     first_day_rows = window[window.dt.day.eq(1)]
     month_keys = first_day_rows.dt.strftime("%Y-%m")
     keep = ~month_keys.duplicated()

@@ -1,90 +1,63 @@
-# write open reason text in chart
+"""Readable trade-detail blocks used by chart marker tooltips."""
+
+
+def _number(value, decimals=2, prefix="", suffix=""):
+    try:
+        return f"{prefix}{float(value):,.{decimals}f}{suffix}"
+    except (TypeError, ValueError):
+        return "N/A"
+
+
+def _timestamp(value):
+    if value is None:
+        return "N/A"
+    return str(value).split(".", 1)[0]
+
+
+def _fraction_as_percent(value):
+    try:
+        return float(value) * 100
+    except (TypeError, ValueError):
+        return None
+
+
 def generate_entry_reason_text(trade_id, updates):
-    # Extract main information from updates dictionary
-    entry_price = updates.get('entry_price', 'N/A')
-    leverage = updates.get('leverage', 'N/A')
-    open_time_value = updates.get('open_time_value', 'N/A')
-    margin = updates.get('margin', 'N/A')
-    
-    # Remove microseconds from time if present
-    if isinstance(open_time_value, str) and '.' in open_time_value:
-        open_time_value = open_time_value.split('.')[0]
-    
-    # Create list of lines
-    lines = [
-        f"Trade ID: {trade_id}",
-        f"Entry Price: {entry_price} $",
-        f"Time: {open_time_value}",
-        f"Leverage: {leverage}x",
-        f"Margin: ${margin:,.2f}",
-        "====================================\n"
-    ]
-    
-    # Add fee-free line if available
-    if 'margin_no_fee' in updates:
-        margin_no_fee = updates.get('margin_no_fee', 'N/A')
-        lines.pop(-1)
-        lines.append(f"Margin (Without Fee): ${margin_no_fee:,.2f}")
-        lines.append("=============================\n")
-    
-    # Find the longest line length
-    max_length = max(len(line) for line in lines)
-    
-    # Pad all lines to the same length (left aligned)
-    aligned_lines = [line.ljust(max_length) for line in lines]
-    
-    # Join with newlines
-    entry_reason_text = "\n".join(aligned_lines)
-    
-    return entry_reason_text
+    """Return complete execution details for an open marker."""
+    return "\n".join([
+        "EXECUTION DETAILS",
+        f"Trade ID       : {trade_id}",
+        f"Execution time : {_timestamp(updates.get('open_time_value'))}",
+        f"Entry price    : {_number(updates.get('entry_price'), prefix='$')}",
+        f"Position size  : {_number(updates.get('position_size'), decimals=8)}",
+        f"Position value : {_number(updates.get('position_value'), prefix='$')}",
+        f"Margin         : {_number(updates.get('margin'), prefix='$')}",
+        f"Leverage       : {_number(updates.get('leverage'), suffix='x')}",
+        f"Capital used   : {_number(_fraction_as_percent(updates.get('trade_amount_percent')), suffix='%')}",
+        f"Balance before : {_number(updates.get('balance_before_trade'), prefix='$')}",
+        f"Free balance   : {_number(updates.get('balance'), prefix='$')}",
+    ])
 
 
-# write close reason text in chart
 def generate_close_reason_text(trade_id, updates):
-    # Extract main information from updates dictionary
-    close_price = updates.get('close_price', 'N/A')
-    leverage = updates.get('leverage', 'N/A')
-    close_time_value = updates.get('close_time_value', 'N/A')
-    margin = updates.get('margin', 'N/A')
-    pnl = updates.get('pnl', 'N/A')
-    pnl_percent = updates.get('pnl_percent', 'N/A')
-    total_fee = updates.get('total_fee', 'N/A')
-    profit = updates.get('profit', 'N/A')
-    profit_percent = updates.get('profit_percent', 'N/A')
-    save_money = updates.get('save_money', 'N/A')
-    days = updates.get('days', 'N/A')
-    hours = updates.get('hours', 'N/A')
-    minutes = updates.get('minutes', 'N/A')
-    logged_balance_before = updates.get('logged_balance_before', 'N/A')
-    logged_balance_after = updates.get('logged_balance_after', 'N/A')
-    
-    # Remove microseconds from time if present
-    if isinstance(close_time_value, str) and '.' in close_time_value:
-        close_time_value = close_time_value.split('.')[0]
-    
-    # Create list of lines
-    lines = [
-        f"Close ID: {trade_id}",
-        f"Close Price: {close_price} $",
-        f"Close Time: {close_time_value}",
-        f"Leverage: {leverage}x",
-        f"Balance: ${logged_balance_before:,.2f} → ${logged_balance_after:,.2f}",
-        f"Save Money: ${save_money:,.2f}",
-        f"PNL: ${pnl:,.2f} ({pnl_percent:.2f}%)",
-        f"Margin: ${margin:,.0f}",
-        f"Fee: ${total_fee:,.2f}",
-        f"Profit: ${profit:,.2f} ({profit_percent:.2f}%)",
-        f"Duration: {days} days, {hours} hours, {minutes} minutes",
-        "============================\n"
-    ]
-    
-    # Find the longest line length
-    max_length = max(len(line) for line in lines)
-    
-    # Pad all lines to the same length (left aligned)
-    aligned_lines = [line.ljust(max_length) for line in lines]
-    
-    # Join with newlines
-    close_reason_text = "\n".join(aligned_lines)
-    
-    return close_reason_text
+    """Return complete PnL, fee, balance, and duration details for a close marker."""
+    before = _number(updates.get("logged_balance_before"), prefix="$")
+    after = _number(updates.get("logged_balance_after"), prefix="$")
+    return "\n".join([
+        "EXECUTION DETAILS",
+        f"Trade ID       : {trade_id}",
+        f"Execution time : {_timestamp(updates.get('close_time_value'))}",
+        f"Close price    : {_number(updates.get('close_price'), prefix='$')}",
+        f"Margin         : {_number(updates.get('margin'), prefix='$')}",
+        f"Leverage       : {_number(updates.get('leverage'), suffix='x')}",
+        f"Gross PnL      : {_number(updates.get('pnl'), prefix='$')}",
+        f"PnL / margin   : {_number(updates.get('pnl_percent'), suffix='%')}",
+        f"Total fees     : {_number(updates.get('total_fee'), decimals=4, prefix='$')}",
+        f"Net profit     : {_number(updates.get('profit'), prefix='$')}",
+        f"Profit/account : {_number(updates.get('profit_percent'), suffix='%')}",
+        f"Balance        : {before} -> {after}",
+        f"Saved money    : {_number(updates.get('save_money'), prefix='$')}",
+        "Duration       : "
+        f"{updates.get('days', 'N/A')}d "
+        f"{updates.get('hours', 'N/A')}h "
+        f"{updates.get('minutes', 'N/A')}m",
+    ])

@@ -1,17 +1,35 @@
 import time
+from pathlib import Path
+import textwrap
 import numpy as np
 import pandas as pd
 import mplfinance as mpf
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from matplotlib import transforms as mtransforms
 from matplotlib.backend_bases import MouseButton
+
+
+def nearest_marker_in_pixels(transform, hover_points, mouse_x, mouse_y, max_distance=18.0):
+    """Return the closest marker inside a screen-space hover radius."""
+    nearest_point = None
+    nearest_dist2 = None
+    max_dist2 = float(max_distance) ** 2
+    for point in hover_points:
+        marker_x, marker_y = transform((point["x"], point["y"]))
+        dx = float(mouse_x) - float(marker_x)
+        dy = float(mouse_y) - float(marker_y)
+        dist2 = dx * dx + dy * dy
+        if dist2 <= max_dist2 and (nearest_dist2 is None or dist2 < nearest_dist2):
+            nearest_point = point
+            nearest_dist2 = dist2
+    return nearest_point
 
 
 def render_backtest_chart(
     chart_data,
     close_prices,
     close_times,
+    open_times,
     open_prices,
     high_prices,
     low_prices,
@@ -52,10 +70,21 @@ def render_backtest_chart(
     total_losses,
     max_drawdown,
     lst_profit_percent_per_month,
+    chart_show=True,
+    chart_save_path=None,
 ):
-    ypoints_total_balance = [row[1] for row in chart_data]
-    zpoints_total_balance = [row[2] for row in chart_data]
-    total_candles = len(close_prices)
+    source_open = np.asarray(open_prices, dtype=float)
+    source_high = np.asarray(high_prices, dtype=float)
+    source_low = np.asarray(low_prices, dtype=float)
+    source_close = np.asarray(close_prices, dtype=float)
+    source_ema16 = np.asarray(ema_16, dtype=float)
+    source_ma50 = np.asarray(ma_50, dtype=float)
+    source_ma100 = np.asarray(ma_100, dtype=float)
+    source_ma200 = np.asarray(ma_200, dtype=float)
+    source_rsi = np.asarray(rsi_values, dtype=float)
+    source_times = pd.to_datetime(np.asarray(close_times, dtype=object), utc=True)
+    source_open_times = pd.to_datetime(np.asarray(open_times, dtype=object), utc=True)
+    total_candles = len(source_close)
     if total_candles == 0:
         return {
             'final_balance': balance,
@@ -67,6 +96,13 @@ def render_backtest_chart(
             'maximum_drawdown': round(max_drawdown, 2),
             "profit_more_than_8%": len(lst_profit_percent_per_month)
         }
+    chart_array = np.asarray(chart_data, dtype=float)
+    if chart_array.ndim != 2 or chart_array.shape[0] != total_candles:
+        ypoints_total_balance = np.full(total_candles, float(balance))
+        zpoints_total_balance = ypoints_total_balance.copy()
+    else:
+        ypoints_total_balance = chart_array[:, 1]
+        zpoints_total_balance = chart_array[:, 2]
     
     nav_offset = max(0, int(plot_end_offset))
     
@@ -238,6 +274,25 @@ def render_backtest_chart(
         "rendering": False,
         "last_click_time": 0.0,
         "last_click_axis": None,
+        "last_hover_draw_ts": 0.0,
+    }
+
+    def index_markers(points):
+        if not points:
+            return np.empty(0, dtype=int), np.empty(0, dtype=float)
+        ordered = sorted((int(idx), float(price)) for idx, price in points)
+        return (
+            np.fromiter((item[0] for item in ordered), dtype=int),
+            np.fromiter((item[1] for item in ordered), dtype=float),
+        )
+
+    marker_sources = {
+        "long_open": index_markers(long_open_points),
+        "long_close": index_markers(long_close_points),
+        "short_open": index_markers(short_open_points),
+        "short_close": index_markers(short_close_points),
+        "penalty_long": index_markers(penalty_long_points),
+        "penalty_short": index_markers(penalty_short_points),
     }
     
     def has_finite(series_obj):
@@ -248,30 +303,22 @@ def render_backtest_chart(
         if step <= 1:
             return open_arr, high_arr, low_arr, close_arr, time_arr
         n = len(close_arr)
-        o_out, h_out, l_out, c_out, t_out = [], [], [], [], []
-        for s in range(0, n, step):
-            e = min(s + step, n)
-            seg_h = high_arr[s:e]
-            seg_l = low_arr[s:e]
-            o_out.append(open_arr[s])
-            h_out.append(np.nanmax(seg_h) if np.isfinite(seg_h).any() else np.nan)
-            l_out.append(np.nanmin(seg_l) if np.isfinite(seg_l).any() else np.nan)
-            c_out.append(close_arr[e - 1])
-            t_out.append(time_arr[e - 1])
+        starts = np.arange(0, n, step, dtype=int)
+        ends = np.minimum(starts + step, n) - 1
         return (
-            np.asarray(o_out, dtype=float),
-            np.asarray(h_out, dtype=float),
-            np.asarray(l_out, dtype=float),
-            np.asarray(c_out, dtype=float),
-            np.asarray(t_out, dtype=object),
+            np.asarray(open_arr, dtype=float)[starts],
+            np.fmax.reduceat(np.asarray(high_arr, dtype=float), starts),
+            np.fmin.reduceat(np.asarray(low_arr, dtype=float), starts),
+            np.asarray(close_arr, dtype=float)[ends],
+            np.asarray(time_arr, dtype=object)[ends],
         )
     
     def downsample_last(arr, step):
         if step <= 1:
             return np.asarray(arr, dtype=float)
         n = len(arr)
-        out = [arr[min(s + step, n) - 1] for s in range(0, n, step)]
-        return np.asarray(out, dtype=float)
+        ends = np.minimum(np.arange(0, n, step, dtype=int) + step, n) - 1
+        return np.asarray(arr, dtype=float)[ends]
     
     def downsample_last_valid(arr, step):
         if step <= 1:
@@ -352,23 +399,23 @@ def render_backtest_chart(
             if plot_end <= plot_start:
                 return
     
-            full_open = np.asarray(open_prices[plot_start:plot_end], dtype=float)
-            full_high = np.asarray(high_prices[plot_start:plot_end], dtype=float)
-            full_low = np.asarray(low_prices[plot_start:plot_end], dtype=float)
-            full_close = np.asarray(close_prices[plot_start:plot_end], dtype=float)
-            full_close_times = np.asarray(close_times[plot_start:plot_end], dtype=object)
-            full_ema16 = np.asarray(ema_16[plot_start:plot_end], dtype=float)
-            full_ma50 = np.asarray(ma_50[plot_start:plot_end], dtype=float)
-            full_ma100 = np.asarray(ma_100[plot_start:plot_end], dtype=float)
-            full_ma200 = np.asarray(ma_200[plot_start:plot_end], dtype=float)
-            full_equity_static = np.asarray(ypoints_total_balance[plot_start:plot_end], dtype=float)
-            full_equity_dynamic = np.asarray(zpoints_total_balance[plot_start:plot_end], dtype=float)
-            full_rsi = np.asarray(rsi_values[plot_start:plot_end], dtype=float)
+            full_open = source_open[plot_start:plot_end]
+            full_high = source_high[plot_start:plot_end]
+            full_low = source_low[plot_start:plot_end]
+            full_close = source_close[plot_start:plot_end]
+            full_close_times = source_times[plot_start:plot_end]
+            full_ema16 = source_ema16[plot_start:plot_end]
+            full_ma50 = source_ma50[plot_start:plot_end]
+            full_ma100 = source_ma100[plot_start:plot_end]
+            full_ma200 = source_ma200[plot_start:plot_end]
+            full_equity_static = ypoints_total_balance[plot_start:plot_end]
+            full_equity_dynamic = zpoints_total_balance[plot_start:plot_end]
+            full_rsi = source_rsi[plot_start:plot_end]
             n_full = len(full_close)
             if n_full == 0:
                 return
     
-            time_index_full = pd.to_datetime(full_close_times, utc=True)
+            time_index_full = full_close_times
     
             # mark 13:30 UTC close points (use close_times)
             mark_arr = np.full(n_full, np.nan, dtype=float)
@@ -382,20 +429,21 @@ def render_backtest_chart(
             penalty_long_arr = np.full(n_full, np.nan, dtype=float)
             penalty_short_arr = np.full(n_full, np.nan, dtype=float)
     
-            def place_trade_markers(points, arr):
-                if not points:
+            def place_trade_markers(marker_source, arr):
+                indices, prices = marker_source
+                if indices.size == 0:
                     return
-                for idx, price in points:
-                    local_idx = idx - plot_start
-                    if 0 <= local_idx < len(arr) and idx < plot_end:
-                        arr[local_idx] = price
-    
-            place_trade_markers(long_open_points, long_open_arr)
-            place_trade_markers(long_close_points, long_close_arr)
-            place_trade_markers(short_open_points, short_open_arr)
-            place_trade_markers(short_close_points, short_close_arr)
-            place_trade_markers(penalty_long_points, penalty_long_arr)
-            place_trade_markers(penalty_short_points, penalty_short_arr)
+                left = int(np.searchsorted(indices, plot_start, side="left"))
+                right = int(np.searchsorted(indices, plot_end, side="left"))
+                if right > left:
+                    arr[indices[left:right] - plot_start] = prices[left:right]
+
+            place_trade_markers(marker_sources["long_open"], long_open_arr)
+            place_trade_markers(marker_sources["long_close"], long_close_arr)
+            place_trade_markers(marker_sources["short_open"], short_open_arr)
+            place_trade_markers(marker_sources["short_close"], short_close_arr)
+            place_trade_markers(marker_sources["penalty_long"], penalty_long_arr)
+            place_trade_markers(marker_sources["penalty_short"], penalty_short_arr)
     
             # Adaptive render density:
             # - Zoom in  => full detail (no downsample)
@@ -440,7 +488,7 @@ def render_backtest_chart(
             ds_penalty_long, ds_penalty_long_marker_idx = downsample_last_valid_with_index(penalty_long_arr, render_step)
             ds_penalty_short, ds_penalty_short_marker_idx = downsample_last_valid_with_index(penalty_short_arr, render_step)
     
-            time_index = pd.to_datetime(ds_times, utc=True)
+            time_index = pd.DatetimeIndex(ds_times)
             price_df = pd.DataFrame(
                 {
                     "Open": ds_open,
@@ -694,7 +742,7 @@ def render_backtest_chart(
                 ax_equity.set_ylim(fixed_equity_ylim)
     
             ax_price.set_title(
-                f"BTC - OHLC + MAs | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped} | Drag/Wheel/\u2190/\u2192 | \u2191 oldest | \u2193 latest | Left-click near trade marker for reasons",
+                f"BTC - OHLC + MAs | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped} | Drag/Wheel/\u2190/\u2192 | \u2191 oldest | \u2193 latest | Hover a trade marker for full details",
                 color=chart_palette["text"],
             )
             ax_price.set_ylabel("BTC Price")
@@ -838,44 +886,52 @@ def render_backtest_chart(
                 except Exception:
                     pass
             nav_state["marker_tooltip_artist"] = fig.text(
-                0.992,
-                0.968,
+                0.985,
+                0.965,
                 "",
                 transform=fig.transFigure,
                 ha="right",
                 va="top",
-                fontsize=8,
-                color=chart_palette["label_fg"],
+                multialignment="left",
+                fontsize=8.5,
+                family="monospace",
+                color=chart_palette["text"],
                 bbox=dict(
-                    boxstyle="round,pad=0.34",
-                    facecolor=chart_palette["label_bg"],
+                    boxstyle="round,pad=0.55",
+                    facecolor="#111A26",
                     edgecolor=chart_palette["label_edge"],
-                    linewidth=0.9,
+                    linewidth=1.4,
+                    alpha=0.97,
                 ),
                 visible=False,
                 zorder=120,
             )
-            nav_state["debug_overlay_artist"] = fig.text(
-                0.992,
-                0.998,
-                "DEBUG overlay ON",
-                transform=fig.transFigure,
-                ha="right",
-                va="top",
-                fontsize=8,
-                color="#EAF2FF",
-                bbox=dict(
-                    boxstyle="round,pad=0.26",
-                    facecolor="#1E2A39",
-                    edgecolor="#6C7F97",
-                    linewidth=0.9,
-                    alpha=0.92,
-                ),
-                visible=True,
-                zorder=140,
-            )
-    
-            def register_hover_points(values_arr, marker_local_idx, reasons_map):
+            nav_state["debug_overlay_artist"] = None
+
+            def format_tooltip(label, src_idx, price, timestamp, reason_text):
+                timestamp_text = pd.Timestamp(timestamp).strftime("%Y-%m-%d %H:%M:%S UTC")
+                wrapped_reason = []
+                for line in str(reason_text).strip().splitlines():
+                    wrapped_reason.extend(
+                        textwrap.wrap(line, width=82, replace_whitespace=False)
+                        or [""]
+                    )
+                return "\n".join([
+                    label,
+                    "=" * len(label),
+                    f"Candle : {src_idx}",
+                    f"Time   : {timestamp_text}",
+                    f"Price  : ${price:,.2f}",
+                    "",
+                    "FULL REASON / TRADE DETAILS",
+                    "-" * 29,
+                    *wrapped_reason,
+                ])
+
+            def register_hover_points(
+                values_arr, marker_local_idx, reasons_map, label, edge_color,
+                use_open_time=True,
+            ):
                 if reasons_map is None:
                     return
                 finite_mask = np.isfinite(values_arr)
@@ -888,26 +944,53 @@ def render_backtest_chart(
                     src_idx = int(plot_start + src_local_idx)
                     reason_text = reasons_map.get(src_idx)
                     if not reason_text:
-                        reason_text = f"Trade marker at index {src_idx}\nReason data not found in current run."
-                    ts = time_index[j]
+                        reason_text = "Reason data was not recorded for this marker."
+                    ts = (
+                        source_open_times[src_idx]
+                        if use_open_time
+                        else source_times[src_idx]
+                    )
                     if isinstance(ts, pd.Timestamp):
                         ts_dt = ts.to_pydatetime()
                     else:
                         ts_dt = pd.Timestamp(ts, tz="UTC").to_pydatetime()
                     nav_state["marker_hover_points"].append(
                         {
-                            "x": float(mdates.date2num(ts_dt)),
+                            # mplfinance uses sequential x positions when
+                            # show_nontrading=False (its default), not date numbers.
+                            "x": float(j),
                             "y": float(values_arr[j]),
-                            "text": reason_text,
+                            "text": format_tooltip(
+                                label, src_idx, float(values_arr[j]), ts_dt, reason_text
+                            ),
+                            "edge_color": edge_color,
                         }
                     )
-    
-            register_hover_points(ds_long_open, ds_long_open_marker_idx, long_open_reasons)
-            register_hover_points(ds_long_close, ds_long_close_marker_idx, long_close_reasons)
-            register_hover_points(ds_short_open, ds_short_open_marker_idx, short_open_reasons)
-            register_hover_points(ds_short_close, ds_short_close_marker_idx, short_close_reasons)
-            register_hover_points(ds_penalty_long, ds_penalty_long_marker_idx, penalty_long_reasons)
-            register_hover_points(ds_penalty_short, ds_penalty_short_marker_idx, penalty_short_reasons)
+
+            register_hover_points(
+                ds_long_open, ds_long_open_marker_idx, long_open_reasons,
+                "LONG OPEN", chart_palette["long_open"],
+            )
+            register_hover_points(
+                ds_long_close, ds_long_close_marker_idx, long_close_reasons,
+                "LONG CLOSE", chart_palette["long_close"],
+            )
+            register_hover_points(
+                ds_short_open, ds_short_open_marker_idx, short_open_reasons,
+                "SHORT OPEN", chart_palette["short_open"],
+            )
+            register_hover_points(
+                ds_short_close, ds_short_close_marker_idx, short_close_reasons,
+                "SHORT CLOSE", chart_palette["short_close"],
+            )
+            register_hover_points(
+                ds_penalty_long, ds_penalty_long_marker_idx, penalty_long_reasons,
+                "LONG PENALTY", chart_palette["penalty"], use_open_time=False,
+            )
+            register_hover_points(
+                ds_penalty_short, ds_penalty_short_marker_idx, penalty_short_reasons,
+                "SHORT PENALTY", chart_palette["penalty"], use_open_time=False,
+            )
             debug_overlay_artist = nav_state.get("debug_overlay_artist")
             if debug_overlay_artist is not None:
                 debug_overlay_artist.set_text(
@@ -971,17 +1054,12 @@ def render_backtest_chart(
         hover_points = nav_state.get("marker_hover_points", [])
         if not hover_points:
             return None
-        nearest_point = None
-        nearest_dist2 = None
-        for pt in hover_points:
-            px, py = ax_price.transData.transform((pt["x"], pt["y"]))
-            dx = float(event.x) - float(px)
-            dy = float(event.y) - float(py)
-            d2 = (dx * dx) + (dy * dy)
-            if nearest_dist2 is None or d2 < nearest_dist2:
-                nearest_dist2 = d2
-                nearest_point = pt
-        return nearest_point
+        return nearest_marker_in_pixels(
+            ax_price.transData.transform,
+            hover_points,
+            event.x,
+            event.y,
+        )
     
     def sync_from_axis_xlim(active_ax):
         initial_map = nav_state.get("initial_xlim_by_axis", {})
@@ -1060,8 +1138,10 @@ def render_backtest_chart(
             return None, None
         
         # ============ Calculate price range ============
-        visible_high = np.nanmax(high_prices[start_idx:end_idx]) if np.isfinite(high_prices[start_idx:end_idx]).any() else None
-        visible_low = np.nanmin(low_prices[start_idx:end_idx]) if np.isfinite(low_prices[start_idx:end_idx]).any() else None
+        visible_high_slice = source_high[start_idx:end_idx]
+        visible_low_slice = source_low[start_idx:end_idx]
+        visible_high = np.nanmax(visible_high_slice) if np.isfinite(visible_high_slice).any() else None
+        visible_low = np.nanmin(visible_low_slice) if np.isfinite(visible_low_slice).any() else None
         
         if visible_high is not None and visible_low is not None and np.isfinite([visible_high, visible_low]).all():
             # Add 1% padding on each side
@@ -1072,23 +1152,15 @@ def render_backtest_chart(
             price_ylim = None
         
         # ============ Calculate equity range (BOTH static AND dynamic) ============
-        all_balance_values = []
-        
-        # Add static balance values (closed positions only)
-        if ypoints_total_balance and len(ypoints_total_balance) >= end_idx:
-            for val in ypoints_total_balance[start_idx:end_idx]:
-                if val is not None and np.isfinite(val):
-                    all_balance_values.append(val)
-        
-        # Add dynamic balance values (includes open positions)
-        if zpoints_total_balance and len(zpoints_total_balance) >= end_idx:
-            for val in zpoints_total_balance[start_idx:end_idx]:
-                if val is not None and np.isfinite(val):
-                    all_balance_values.append(val)
-        
-        if all_balance_values:
-            max_balance = max(all_balance_values)
-            min_balance = min(all_balance_values)
+        visible_balances = np.concatenate((
+            ypoints_total_balance[start_idx:end_idx],
+            zpoints_total_balance[start_idx:end_idx],
+        ))
+        visible_balances = visible_balances[np.isfinite(visible_balances)]
+
+        if visible_balances.size:
+            max_balance = float(np.max(visible_balances))
+            min_balance = float(np.min(visible_balances))
             balance_range = max_balance - min_balance
             # Use 2% padding for better visualization (dynamic curve has more volatility)
             padding = balance_range * 0.02 if balance_range > 0 else min_balance * 0.01
@@ -1181,7 +1253,15 @@ def render_backtest_chart(
                 request_nav("older" if delta_px > 0 else "newer", shift_candles=shift)
                 nav_state["press_px"] = float(event.x)
             return
-    
+
+        # Mouse motion can fire hundreds of times per second.  A 30 Hz
+        # crosshair is visually smooth and avoids scheduling redundant full
+        # canvas draws while the previous one is still pending.
+        now_ts = time.perf_counter()
+        if now_ts - float(nav_state["last_hover_draw_ts"]) < (1.0 / 30.0):
+            return
+        nav_state["last_hover_draw_ts"] = now_ts
+
         if event.x is None or event.y is None:
             hide_crosshair(redraw=True)
             return
@@ -1296,6 +1376,9 @@ def render_backtest_chart(
             hit_point = find_nearest_marker_point(event)
             if hit_point is not None:
                 marker_tooltip_artist.set_text(hit_point["text"])
+                tooltip_box = marker_tooltip_artist.get_bbox_patch()
+                if tooltip_box is not None:
+                    tooltip_box.set_edgecolor(hit_point["edge_color"])
                 marker_tooltip_artist.set_visible(True)
             else:
                 marker_tooltip_artist.set_visible(False)
@@ -1509,7 +1592,14 @@ def render_backtest_chart(
     
     set_figure_fullscreen()
     render_current()
-    plt.show()
+    if chart_save_path:
+        output_path = Path(chart_save_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    if chart_show:
+        plt.show()
+    else:
+        plt.close(fig)
     
     fig.canvas.mpl_disconnect(cid_key)
     fig.canvas.mpl_disconnect(cid_press)
@@ -1517,3 +1607,4 @@ def render_backtest_chart(
     fig.canvas.mpl_disconnect(cid_scroll)
     fig.canvas.mpl_disconnect(cid_move)
     fig.canvas.mpl_disconnect(cid_leave)
+    fig.canvas.mpl_disconnect(cid_click)

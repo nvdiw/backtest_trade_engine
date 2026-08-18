@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from optimize import (
-    SmartCandidateGenerator, _robust_validation_score, grid_size,
+    SmartCandidateGenerator, _robust_validation_score, build_parser, grid_size,
     iter_grid_candidates, param_grid, run_optimization,
 )
 from ma_strategy import resolve_parameter_source
@@ -17,6 +17,16 @@ from trade_engine import TradeEngine
 
 
 class OptimizerSearchTests(unittest.TestCase):
+    def test_planning_and_output_options_are_available(self):
+        args = build_parser().parse_args([
+            "--profile", "risk", "--dry-run", "--top-n", "7",
+            "--output-dir", "custom-output",
+        ])
+        self.assertEqual(args.profile, "risk")
+        self.assertTrue(args.dry_run)
+        self.assertEqual(args.top_n, 7)
+        self.assertEqual(args.output_dir, "custom-output")
+
     def test_grid_is_complete_and_deterministic(self):
         grid = {"a": [1, 2], "b": ["x", "y", "z"]}
         candidates = list(iter_grid_candidates(grid))

@@ -1,4 +1,8 @@
 import pandas as pd
+from pathlib import Path
+
+
+DATA_FILE = Path(__file__).resolve().parent / "data_candle" / "btc_15m_data_2018_to_2026.csv"
 
 # Fetch data from CSV file
 def fetch_all_data(start: int, end: int):
@@ -8,7 +12,7 @@ def fetch_all_data(start: int, end: int):
 
     rows_to_read = end - start
     data = pd.read_csv(
-        './data_candle/btc_15m_data_2018_to_2026.csv',
+        DATA_FILE,
         skiprows=range(1, start + 1),
         nrows=rows_to_read,
         usecols=['Open time', 'Close time', 'Open', 'Close', 'Low', 'High', 'Volume'],
