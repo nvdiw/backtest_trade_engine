@@ -88,6 +88,18 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertEqual(position["target_close_price_loss"], 10.5)
         self.assertEqual(position.side, "long")
 
+    def test_position_can_be_merged_with_liquidation_details(self):
+        account = AccountState(balance=100.0)
+        position = self.make_position(
+            self.engine.open_long(0, [10.0], [OPEN_TIME], account)
+        )
+
+        merged = {**position.to_dict(), **{"close_price": 9.0, "liquidated": True}}
+
+        self.assertEqual(merged["trade_id"], position.trade_id)
+        self.assertEqual(merged["margin"], position.margin)
+        self.assertEqual(merged["close_price"], 9.0)
+
     def test_open_position_mark_to_market_includes_unrealized_pnl(self):
         account = AccountState(balance=100.0)
         position = self.make_position(

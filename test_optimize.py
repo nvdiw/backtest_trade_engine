@@ -137,6 +137,25 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertIn("objective_score", columns)
         self.assertIn("profit_per_trade", columns)
 
+    def test_keyboard_interrupt_stops_cleanly_and_keeps_checkpoint(self):
+        args = Namespace(
+            output_dir=None, mode="smart", tests=3, workers=1, batch_size=2,
+            chunksize=1, start="0", end="10", seed=3, log_every=0,
+            elite_size=2,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=KeyboardInterrupt
+            ):
+                best = run_optimization(args, grid={"entry_score_threshold": [7, 8]})
+            results_path = Path(temp_dir) / "optimization_results.csv"
+            rows = results_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertIsNone(best)
+        self.assertEqual(len(rows), 1)
+
 
 class PerformanceScoreTests(unittest.TestCase):
     def score(self, **overrides):

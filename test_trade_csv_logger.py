@@ -29,6 +29,14 @@ class TradeCSVLoggerWorkbookTests(unittest.TestCase):
                 days=1,
                 hours=0,
                 minutes=0,
+                overview_metrics={
+                    "Run": {"Start time": "2026-01-01 00:00:00"},
+                    "Capital": {"Final balance": 1011, "Total profit %": 1.1},
+                    "Performance": {"Maximum drawdown %": -2.5},
+                    "Trades": {"Closed trades": 3},
+                    "RSI": {"RSI trades": 1},
+                    "Scale": {"Scale trades": 1},
+                },
                 file_name=str(csv_path),
             )
             workbook = load_workbook(csv_path.with_suffix(".xlsx"), read_only=False)
@@ -38,6 +46,11 @@ class TradeCSVLoggerWorkbookTests(unittest.TestCase):
                 name: workbook[name].max_row
                 for name in ("Main Strategy", "RSI Strategy", "Scale Strategy")
             }
+            overview_headers = [cell.value for cell in workbook["Overview"][1]]
+            overview_metrics = [
+                workbook["Overview"].cell(row=row, column=2).value
+                for row in range(2, workbook["Overview"].max_row + 1)
+            ]
             workbook.close()
 
         self.assertEqual(
@@ -48,6 +61,8 @@ class TradeCSVLoggerWorkbookTests(unittest.TestCase):
         self.assertEqual(row_counts["Main Strategy"], 2)
         self.assertEqual(row_counts["RSI Strategy"], 2)
         self.assertEqual(row_counts["Scale Strategy"], 2)
+        self.assertEqual(overview_headers, ["Section", "Metric", "Value"])
+        self.assertIn("Maximum drawdown %", overview_metrics)
 
 
 if __name__ == "__main__":

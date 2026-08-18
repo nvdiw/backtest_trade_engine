@@ -633,14 +633,6 @@ def ma_strategy(
                 )
                 apply_account_state(account)
                 if liq_updates['liquidated']:
-                    liq_reason_text = (
-                        "LONG CLOSE - LIQUIDATION\n"
-                        "Reason: position was force-closed by the liquidation rule.\n\n"
-                        + generate_close_reason_text(
-                            p['trade_id'],
-                            {**p, **liq_updates},
-                        )
-                    )
                     open_positions.remove(p)
                     liquidated_any = True
                     if consecutive_losses_month_stop_filter:
@@ -654,6 +646,14 @@ def ma_strategy(
                     if long_close_points is not None:
                         long_close_points.append((i, liq_updates['close_price']))
                         if long_close_reasons is not None:
+                            liq_reason_text = (
+                                "LONG CLOSE - LIQUIDATION\n"
+                                "Reason: position was force-closed by the liquidation rule.\n\n"
+                                + generate_close_reason_text(
+                                    p['trade_id'],
+                                    {**p.to_dict(), **liq_updates},
+                                )
+                            )
                             long_close_reasons[i] = liq_reason_text
             elif p['side'] == "short":
                 remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
@@ -672,14 +672,6 @@ def ma_strategy(
                 )
                 apply_account_state(account)
                 if liq_updates['liquidated']:
-                    liq_reason_text = (
-                        "SHORT CLOSE - LIQUIDATION\n"
-                        "Reason: position was force-closed by the liquidation rule.\n\n"
-                        + generate_close_reason_text(
-                            p['trade_id'],
-                            {**p, **liq_updates},
-                        )
-                    )
                     open_positions.remove(p)
                     liquidated_any = True
                     if consecutive_losses_month_stop_filter:
@@ -693,6 +685,14 @@ def ma_strategy(
                     if short_close_points is not None:
                         short_close_points.append((i, liq_updates['close_price']))
                         if short_close_reasons is not None:
+                            liq_reason_text = (
+                                "SHORT CLOSE - LIQUIDATION\n"
+                                "Reason: position was force-closed by the liquidation rule.\n\n"
+                                + generate_close_reason_text(
+                                    p['trade_id'],
+                                    {**p.to_dict(), **liq_updates},
+                                )
+                            )
                             short_close_reasons[i] = liq_reason_text
         if liquidated_any:
             continue

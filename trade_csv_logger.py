@@ -118,6 +118,7 @@ class TradeCSVLogger:
         days,
         hours,
         minutes,
+        overview_metrics=None,
         file_name: str = os.path.join("outputs", "trades", "data_orders.csv")
     ):
         if self.optimize:
@@ -148,8 +149,11 @@ class TradeCSVLogger:
         if df.empty:
             df = pd.DataFrame([summary_row_full], columns=self.COLUMNS)
         else:
+            summary_frame = pd.DataFrame(
+                [summary_row_full], columns=self.COLUMNS, dtype=object
+            )
             df = pd.concat(
-                [df, pd.DataFrame([summary_row_full], columns=self.COLUMNS)],
+                [df.astype(object), summary_frame],
                 ignore_index=True,
             )
         while True:
@@ -159,14 +163,16 @@ class TradeCSVLogger:
                     os.makedirs(output_dir, exist_ok=True)
                 df.to_csv(file_name, index=False, encoding="utf-8")
                 if self.write_excel:
-                    self._save_colored_excel(df, file_name)
+                    self._save_colored_excel(df, file_name, overview_metrics)
                 break
             except PermissionError:
                 answer = input(f"please close: {file_name} after close write ok: ")
                 if answer == "ok":
                     print("thanks!")
 
-    def _save_colored_excel(self, df: pd.DataFrame, csv_file_name: str):
+    def _save_colored_excel(
+        self, df: pd.DataFrame, csv_file_name: str, overview_metrics=None
+    ):
         """Create a polished multi-sheet workbook alongside the raw CSV."""
         if df.empty:
             return
@@ -190,19 +196,27 @@ class TradeCSVLogger:
         ].copy()
 
         summary_values = summary_df.iloc[0].to_dict() if not summary_df.empty else {}
-        overview = pd.DataFrame([
-            ("Start time", summary_values.get("open_time")),
-            ("End time", summary_values.get("close_time")),
-            ("Starting balance", summary_values.get("balance_before")),
-            ("Final balance", summary_values.get("balance_after")),
-            ("Total profit", summary_values.get("profit")),
-            ("Total profit %", summary_values.get("profit_percent")),
-            ("Total fees", summary_values.get("fee_paid")),
-            ("Closed trades", len(trades_df)),
-            ("Main trades", len(main_df)),
-            ("RSI trades", len(rsi_df)),
-            ("Scale trades", len(scale_df)),
-        ], columns=["Metric", "Value"])
+        if overview_metrics:
+            overview_rows = [
+                (section, metric, value)
+                for section, metrics in overview_metrics.items()
+                for metric, value in metrics.items()
+            ]
+        else:
+            overview_rows = [
+                ("Run", "Start time", summary_values.get("open_time")),
+                ("Run", "End time", summary_values.get("close_time")),
+                ("Capital", "Starting balance", summary_values.get("balance_before")),
+                ("Capital", "Final balance", summary_values.get("balance_after")),
+                ("Capital", "Total profit", summary_values.get("profit")),
+                ("Capital", "Total profit %", summary_values.get("profit_percent")),
+                ("Capital", "Total fees", summary_values.get("fee_paid")),
+                ("Trades", "Closed trades", len(trades_df)),
+                ("Trades", "Main trades", len(main_df)),
+                ("RSI", "RSI trades", len(rsi_df)),
+                ("Scale", "Scale trades", len(scale_df)),
+            ]
+        overview = pd.DataFrame(overview_rows, columns=["Section", "Metric", "Value"])
 
         sheets = {
             "Overview": overview,
@@ -229,6 +243,14 @@ class TradeCSVLogger:
         profit_fill = PatternFill("solid", fgColor="E2F0D9")
         loss_fill = PatternFill("solid", fgColor="FCE4D6")
         grouped_fill = PatternFill("solid", fgColor="DDEBF7")
+        section_fills = {
+            "Run": PatternFill("solid", fgColor="E2F0D9"),
+            "Capital": PatternFill("solid", fgColor="D9EAF7"),
+            "Performance": PatternFill("solid", fgColor="FFF2CC"),
+            "Trades": PatternFill("solid", fgColor="E4DFEC"),
+            "RSI": PatternFill("solid", fgColor="FCE4D6"),
+            "Scale": PatternFill("solid", fgColor="DDEBF7"),
+        }
         money_columns = {
             "entry_price", "close_price", "tactical_balance", "balance_before",
             "balance_after", "total_assets", "amount", "profit", "fee_paid",
@@ -263,6 +285,29 @@ class TradeCSVLogger:
                 if column_index:
                     for row_index in range(2, ws.max_row + 1):
                         ws.cell(row_index, column_index).number_format = '0.00"%";[Red]-0.00"%"'
+            if ws.title == "Overview":
+                section_column = headers.get("Section")
+                metric_column = headers.get("Metric")
+                value_column = headers.get("Value")
+                for row_index in range(2, ws.max_row + 1):
+                    section = str(ws.cell(row_index, section_column).value or "")
+                    metric = str(ws.cell(row_index, metric_column).value or "")
+                    ws.cell(row_index, section_column).font = Font(bold=True, color="1F1F1F")
+                    ws.cell(row_index, section_column).fill = section_fills.get(
+                        section, PatternFill("solid", fgColor="F2F2F2")
+                    )
+                    value_cell = ws.cell(row_index, value_column)
+                    metric_lower = metric.lower()
+                    if any(token in metric_lower for token in (
+                        "balance", "profit", "fees", "saved money",
+                    )) and "%" not in metric:
+                        value_cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                    elif "%" in metric or "win rate" in metric_lower or "drawdown" in metric_lower:
+                        value_cell.number_format = '0.00"%";[Red]-0.00"%"'
+                    elif any(token in metric_lower for token in (
+                        "trades", "wins", "losses", "positions", "liquidations", "months",
+                    )):
+                        value_cell.number_format = '#,##0'
             if ws.max_row >= 2:
                 table = Table(
                     displayName=f"TradeReportTable{sheet_index}", ref=ws.dimensions

@@ -13,6 +13,7 @@ import math
 import multiprocessing
 import os
 import random
+import signal
 import time
 from pathlib import Path
 
@@ -153,18 +154,27 @@ FULL_PARAM_GRID = {
 }
 
 FOCUSED_PARAM_GRID = {
-    "ema_16_period": [10, 12, 14, 16, 18, 20, 24],
-    "ma_50_period": [35, 40, 45, 50, 55, 60, 70],
-    "ma_100_period": [80, 90, 100, 102, 110, 125, 140],
-    "ma_200_period": [160, 180, 198, 200, 220, 240, 260],
-    "leverage": [1, 2, 3, 4, 5, 7, 10, 12, 15],
-    "safe_leverage_low": [1, 2, 3, 4, 5],
-    "safe_leverage_med": [2, 3, 4, 5, 6, 8],
-    "safe_leverage_high": [3, 4, 5, 6, 8, 10],
-    "safe_leverage_balance_pct_low": [70, 75, 80],
-    "safe_leverage_balance_pct_med": [75, 80, 85],
-    "safe_leverage_balance_pct_high": [80, 85, 90, 95],
-    "save_money_recover_trigger_pct": [65, 70, 75, 80],
+    "entry_score_threshold": [6, 7, 8, 9, 10, 11, 12],
+    "exit_score_threshold": [4, 5, 6, 7, 8, 9, 10],
+    # Score weights
+    "entry_score_cross": [1, 2, 3, 4],
+    "entry_score_ema_vs_ma50": [1, 2, 3, 4],
+    "entry_score_ma_trend": [1, 2, 3],
+    "entry_score_ma_distance_or_candle": [1, 2, 3],
+    "entry_score_adx": [1, 2, 3],
+    "entry_score_volume": [1, 2, 3],
+    "entry_late_penalty": [0, 1, 2, 3, 4],
+    "exit_score_loss_guard_1": [1, 2, 3, 4],
+    "exit_score_loss_guard_2": [1, 2, 3, 4],
+    "exit_score_profit_guard_1": [1, 2, 3, 4],
+    "exit_score_profit_guard_2": [1, 2, 3, 4],
+    "exit_score_ema_slope": [1, 2, 3, 4],
+    "exit_score_ema_cross": [1, 2, 3, 4],
+    "exit_score_ma_trend": [1, 2, 3],
+    "exit_score_trailing": [1, 2, 3, 4],
+    "exit_score_adx": [1, 2, 3],
+    "exit_score_opposite_candle": [1, 2, 3],
+    "post_cross_penalty_score": [0, 1, 2, 3, 4, 5],
 }
 
 
@@ -438,8 +448,10 @@ def _parse_bound(value):
         return value
 
 
-def _init_worker(start, end, base_tune=None):
+def _init_worker(start, end, base_tune=None, ignore_keyboard_interrupt=False):
     global _WORKER_START, _WORKER_END, _WORKER_BASE_TUNE
+    if ignore_keyboard_interrupt:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
     _WORKER_START = start
     _WORKER_END = end
     _WORKER_BASE_TUNE = dict(base_tune or {})
@@ -737,11 +749,15 @@ def _validate_top_candidates(records, args, workers, chunksize):
     tasks = [(record["index"], record["params"]) for record in candidates]
     if workers > 1:
         pool = multiprocessing.Pool(
-            workers, initializer=_init_worker, initargs=(start, end, {})
+            workers, initializer=_init_worker, initargs=(start, end, {}, True)
         )
         try:
             evaluated = list(pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize))
-        finally:
+        except KeyboardInterrupt:
+            pool.terminate()
+            pool.join()
+            raise
+        else:
             pool.close()
             pool.join()
     else:
@@ -869,7 +885,7 @@ def run_optimization(args, grid=None):
             pool = multiprocessing.Pool(
                 workers,
                 initializer=_init_worker,
-                initargs=(start, end, base_tune),
+                initargs=(start, end, base_tune, True),
             )
         else:
             # Warm cached market data once in the parent for serial searches.
@@ -924,6 +940,8 @@ def run_optimization(args, grid=None):
                 time.perf_counter() - started, args.seed, run_metadata,
             )
 
+        interrupted = False
+        pool_terminated = False
         try:
             if args.mode == "grid":
                 while True:
@@ -951,10 +969,29 @@ def run_optimization(args, grid=None):
                     batch = list(enumerate(candidates, start=next_index))
                     next_index += len(batch)
                     consume(batch)
+        except KeyboardInterrupt:
+            interrupted = True
+            csv_file.flush()
+            _write_best_files(
+                output_dir, best, args.mode, requested_tests, completed,
+                time.perf_counter() - started, args.seed,
+                {**run_metadata, "interrupted": True},
+            )
+            if pool is not None:
+                pool.terminate()
+                pool_terminated = True
+            print(
+                f"\nStopped by user after {completed:,} completed tests. "
+                "Checkpoint saved; use --resume to continue."
+            )
         finally:
             if pool is not None:
-                pool.close()
+                if not pool_terminated:
+                    pool.close()
                 pool.join()
+
+    if interrupted:
+        return best
 
     elapsed = time.perf_counter() - started
     training_best = best

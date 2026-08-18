@@ -32,6 +32,10 @@ class _DataclassMapping:
     def __contains__(self, key):
         return any(item.name == key for item in fields(self))
 
+    def to_dict(self):
+        """Return a real mapping for serialization and dictionary merging."""
+        return {item.name: getattr(self, item.name) for item in fields(self)}
+
 
 @dataclass
 class Position(_DataclassMapping):
@@ -1436,6 +1440,83 @@ class TradeEngine:
             days=days,
             hours=hours,
             minutes=minutes,
+            overview_metrics={
+                "Run": {
+                    "Start time": state["first_open_time"],
+                    "End time": state["last_close_time"],
+                    "Duration": f"{days}d {hours}h {minutes}m",
+                },
+                "Capital": {
+                    "Starting balance": first_balance,
+                    "Final balance": balance,
+                    "Final balance without fees": balance_without_fee,
+                    "Static balance": state["total_money_static"],
+                    "Dynamic marked balance": state["total_money_dynamic"],
+                    "Saved money": save_money,
+                    "Total profit": total_profit,
+                    "Realized profit": realized_profit,
+                    "Unrealized profit": unrealized_profit,
+                    "Total profit %": t_profit_percent,
+                    "Total fees": state["deducting_fee_total"],
+                },
+                "Performance": {
+                    "Optimizer score": score,
+                    "Maximum drawdown %": max_drawdown,
+                    "Win rate %": win_rate,
+                    "Profit factor": profit_factor,
+                    "Expectancy %": expectancy_pct,
+                    "Calmar ratio": calmar_ratio,
+                    "Profitable months": profit_months_count,
+                    "Losing months": loss_months_count,
+                },
+                "Trades": {
+                    "Closed trades": state["count_closed_orders"],
+                    "Open positions": len(open_positions),
+                    "Wins": total_wins,
+                    "Losses": total_losses,
+                    "Long trades": state["total_long"],
+                    "Long wins": state["total_wins_long"],
+                    "Long losses": state["total_long"] - state["total_wins_long"],
+                    "Short trades": state["total_short"],
+                    "Short wins": state["total_wins_short"],
+                    "Short losses": state["total_short"] - state["total_wins_short"],
+                    "Liquidations": state["total_liquids"],
+                    "Realized profit / trade": (
+                        realized_profit / state["count_closed_orders"]
+                        if state["count_closed_orders"] else 0
+                    ),
+                },
+                "RSI": {
+                    "RSI trades": rsi_total,
+                    "RSI wins": rsi_wins,
+                    "RSI losses": rsi_losses,
+                    "RSI win rate %": rsi_winrate,
+                    "RSI profit": rsi_profit,
+                    "RSI long trades": state["rsi_long_total"],
+                    "RSI long wins": state["rsi_long_wins"],
+                    "RSI long losses": state["rsi_long_losses"],
+                    "RSI long profit": state["rsi_long_total_profit"],
+                    "RSI short trades": state["rsi_short_total"],
+                    "RSI short wins": state["rsi_short_wins"],
+                    "RSI short losses": state["rsi_short_losses"],
+                    "RSI short profit": state["rsi_short_total_profit"],
+                },
+                "Scale": {
+                    "Scale trades": scale_total,
+                    "Scale wins": scale_wins,
+                    "Scale losses": scale_losses,
+                    "Scale win rate %": scale_winrate,
+                    "Scale profit": scale_profit,
+                    "Scale long trades": scale_long_total,
+                    "Scale long wins": state["scale_ma_long_wins"],
+                    "Scale long losses": state["scale_ma_long_losses"],
+                    "Scale long profit": state["scale_ma_long_total_profit"],
+                    "Scale short trades": scale_short_total,
+                    "Scale short wins": state["scale_ma_short_wins"],
+                    "Scale short losses": state["scale_ma_short_losses"],
+                    "Scale short profit": state["scale_ma_short_total_profit"],
+                },
+            },
             file_name=output_file,
         )
 
