@@ -516,6 +516,9 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
 
     # ---- MAIN ----
     for i in range(len(close_prices)):
+        # A signal exists only after candle i closes, so it can be filled no
+        # earlier than the next candle's open.
+        execution_i = i + 1
         # print(start+i)
 
         # margin static
@@ -649,6 +652,11 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         if liquidated_any:
             continue
 
+        # Keep final-candle mark-to-market/liquidation checks, but do not create
+        # an order when the dataset contains no following open price.
+        if execution_i >= len(open_prices):
+            continue
+
         if rsi_trade_monthly_filter_on:
             # ---- close long when monthly filter is on
             long_positions_to_close = [p for p in open_positions[:] if p['side'] == "long" and p['reason'] == 'rsi_ma_strategy']
@@ -657,11 +665,11 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                     remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
                     remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                     # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                    close_price = close_prices[i]
+                    close_price = open_prices[execution_i]
                     # ---- close long ----
                     account = capture_account_state()
                     updates = trade_engine.close_long(
-                        i, close_prices, close_times, p, account,
+                        execution_i, open_prices, open_times, p, account,
                         fee_rate=fee_rate,
                         cooldown_after_big_pnl=cooldown_after_big_pnl,
                         remaining_open_margin=remaining_open_margin,
@@ -683,12 +691,12 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
 
                     # close point on chart
                     if long_close_points is not None:
-                        long_close_points.append((i, close_price))
+                        long_close_points.append((execution_i, close_price))
                         # close reason text
                         if long_close_reasons is not None:
                             long_exit_reason_text = f"closed long when monthly filter is on and rsi is upper than: {rsi_long_close_monthly_profit}\n"
                             long_exit_reason_text += generate_close_reason_text(trade_id=p['trade_id'], updates=updates)
-                            long_close_reasons[i] = long_exit_reason_text
+                            long_close_reasons[execution_i] = long_exit_reason_text
                     
                     # calculate last stop loss with rsi on mothly filter
                     if rsi_cooldown_filter:
@@ -717,11 +725,11 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                     remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
                     remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                     # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                    close_price = close_prices[i]
+                    close_price = open_prices[execution_i]
                     # ---- close short ----
                     account = capture_account_state()
                     updates = trade_engine.close_short(
-                        i, close_prices, close_times, p, account,
+                        execution_i, open_prices, open_times, p, account,
                         fee_rate=fee_rate,
                         cooldown_after_big_pnl=cooldown_after_big_pnl,
                         remaining_open_margin=remaining_open_margin,
@@ -742,12 +750,12 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
 
                     # close point on chart
                     if short_close_points is not None:
-                        short_close_points.append((i, close_price))
+                        short_close_points.append((execution_i, close_price))
                         # close reason text
                         if short_close_reasons is not None:
                             short_exit_reason_text = f"closed short when monthly filter is on and rsi is lower than: {rsi_short_close_monthly_profit}\n"
                             short_exit_reason_text += generate_close_reason_text(trade_id=p['trade_id'], updates=updates)
-                            short_close_reasons[i] = short_exit_reason_text
+                            short_close_reasons[execution_i] = short_exit_reason_text
                     
                     # calculate last stop loss with rsi on mothly filter
                     if rsi_cooldown_filter:
@@ -826,7 +834,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                         # ---- open long ----
                         account = capture_account_state()
                         updates = trade_engine.open_long(
-                            i, close_prices, close_times, account,
+                            execution_i, open_prices, open_times, account,
                             trade_amount_percent=rsi_trade_amount_percent,
                             margin_balance=balance + sum(p['margin'] for p in open_positions),
                             margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
@@ -839,22 +847,22 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                 updates,
                                 trade_id=f"{trade_reason}_{next_trade_id:04d}",
                                 side="long",
-                                entry_index=i,
-                                high_price=high_prices[i],
-                                low_price=low_prices[i],
+                                entry_index=execution_i,
+                                high_price=open_prices[execution_i],
+                                low_price=open_prices[execution_i],
                                 reason=trade_reason,
                             )
                             open_positions.append(position)
                             
                             # open point on chart
                             if long_open_points is not None:
-                                long_open_points.append((i, position['entry_price']))
+                                long_open_points.append((execution_i, position['entry_price']))
                                 # open reason text
                                 if long_open_reasons is not None:
                                     # default texts
                                     entry_reason_text = f"opened long when monthly filter is on and rsi is lower than: {rsi_long_open_monthly_profit}\n"
                                     entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
-                                    long_open_reasons[i] = entry_reason_text
+                                    long_open_reasons[execution_i] = entry_reason_text
                             
                             next_trade_id += 1
                             # record which cross enabled this trade and init trailing state
@@ -894,7 +902,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                         # ---- open short ----
                         account = capture_account_state()
                         updates = trade_engine.open_short(
-                            i, close_prices, close_times, account,
+                            execution_i, open_prices, open_times, account,
                             trade_amount_percent=rsi_trade_amount_percent,
                             margin_balance=balance + sum(p['margin'] for p in open_positions),
                             margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
@@ -907,22 +915,22 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                 updates,
                                 trade_id=f"{trade_reason}_{next_trade_id:04d}",
                                 side="short",
-                                entry_index=i,
-                                high_price=high_prices[i],
-                                low_price=low_prices[i],
+                                entry_index=execution_i,
+                                high_price=open_prices[execution_i],
+                                low_price=open_prices[execution_i],
                                 reason=trade_reason,
                             )
                             open_positions.append(position)
                             
                             # open point on chart
                             if short_open_points is not None:
-                                short_open_points.append((i, position['entry_price']))
+                                short_open_points.append((execution_i, position['entry_price']))
                                 # open reason text
                                 if short_open_reasons is not None:
                                     # default texts
                                     entry_reason_text = f"opened short when monthly filter is on and rsi is upper than: {rsi_short_open_monthly_profit}\n"
                                     entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
-                                    short_open_reasons[i] = entry_reason_text
+                                    short_open_reasons[execution_i] = entry_reason_text
 
                             next_trade_id += 1
                             # record which cross enabled this trade and init trailing state
@@ -1043,7 +1051,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                     # ---- open long ----
                     account = capture_account_state()
                     updates = trade_engine.open_long(
-                        i, close_prices, close_times, account,
+                        execution_i, open_prices, open_times, account,
                         trade_amount_percent=trade_amount_percent,
                         margin_balance=balance + sum(p['margin'] for p in open_positions),
                         margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
@@ -1056,21 +1064,21 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                             updates,
                             trade_id=f"{trade_reason}_{next_trade_id:04d}",
                             side="long",
-                            entry_index=i,
-                            high_price=high_prices[i],
-                            low_price=low_prices[i],
+                            entry_index=execution_i,
+                            high_price=open_prices[execution_i],
+                            low_price=open_prices[execution_i],
                             reason=trade_reason,
                         )
                         open_positions.append(position)
                         
                         # open point on chart
                         if long_open_points is not None:
-                            long_open_points.append((i, position['entry_price']))
+                            long_open_points.append((execution_i, position['entry_price']))
                             # open reason text
                             if long_open_reasons is not None:
                                 # default texts
                                 entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
-                                long_open_reasons[i] = entry_reason_text
+                                long_open_reasons[execution_i] = entry_reason_text
                         
                         next_trade_id += 1
                         # record which cross enabled this trade and init trailing state
@@ -1080,7 +1088,8 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         # ===================== SCALE ENTRY LONG =====================
         if scale_in_enabled and len(open_positions) < max_open_trades and _count_open("short") == 0 and _count_open("long") > 0 and i >= cooldown_until_index:
             first_long_position = min(
-                (p for p in open_positions if p['side'] == "long"),
+                (p for p in open_positions
+                 if p['side'] == "long" and p['entry_index'] <= i),
                 key=lambda x: x['entry_index'],
                 default=None
             )
@@ -1125,7 +1134,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 if long_scale_entry_reason is not None:
                     account = capture_account_state()
                     updates = trade_engine.open_long(
-                        i, close_prices, close_times, account,
+                        execution_i, open_prices, open_times, account,
                         trade_amount_percent=scale_entry_amount_percent,
                         margin_balance=balance + sum(p['margin'] for p in open_positions),
                         margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
@@ -1145,15 +1154,15 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                             updates,
                             trade_id=f"{trade_reason}_{next_trade_id:04d}",
                             side="long",
-                            entry_index=i,
-                            high_price=high_prices[i],
-                            low_price=low_prices[i],
+                            entry_index=execution_i,
+                            high_price=open_prices[execution_i],
+                            low_price=open_prices[execution_i],
                             reason=trade_reason,
                         )
                         open_positions.append(position)
                         next_trade_id += 1
                         if long_open_points is not None:
-                            long_open_points.append((i, position['entry_price']))
+                            long_open_points.append((execution_i, position['entry_price']))
                             if long_open_reasons is not None:
                                 long_scale_entry_text = (
                                     f"LONG SCALE ENTRY\n"
@@ -1169,7 +1178,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                             f"\nProfit filter score: {long_profit_scale_entry_score}/{profit_scale_entry_min_score}"
                                         )
 
-                                long_open_reasons[i] = long_scale_entry_text
+                                long_open_reasons[execution_i] = long_scale_entry_text
                                 
                     updates = None
 
@@ -1179,6 +1188,8 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         long_exit_reason_text = None
         for p in open_positions[:]:
             if p['side'] != "long":
+                continue
+            if p['entry_index'] is not None and p['entry_index'] > i:
                 continue
             exit_score = 0
             exit_reasons = []
@@ -1280,15 +1291,18 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 break
 
         if close_all_longs:
-            long_positions_to_close = [p for p in open_positions[:] if p['side'] == "long"]
+            long_positions_to_close = [
+                p for p in open_positions[:]
+                if p['side'] == "long" and p['entry_index'] <= i
+            ]
             for p in long_positions_to_close:
                 remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
                 remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                 # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                close_price = close_prices[i]
+                close_price = open_prices[execution_i]
                 account = capture_account_state()
                 updates = trade_engine.close_long(
-                    i, close_prices, close_times, p, account,
+                    execution_i, open_prices, open_times, p, account,
                     fee_rate=fee_rate,
                     cooldown_after_big_pnl=cooldown_after_big_pnl,
                     remaining_open_margin=remaining_open_margin,
@@ -1315,14 +1329,14 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 
                 # close point on chart
                 if long_close_points is not None:
-                    long_close_points.append((i, close_price))
+                    long_close_points.append((execution_i, close_price))
                     # close reason text
                     if long_close_reasons is not None:
                         long_exit_reason_text += generate_close_reason_text(trade_id=p['trade_id'], updates=updates)
                         if len(long_positions_to_close) > 1:
-                            long_close_reasons[i] = f"\n{long_exit_reason_text}\nBatch close: all open LONG positions closed together."
+                            long_close_reasons[execution_i] = f"\n{long_exit_reason_text}\nBatch close: all open LONG positions closed together."
                         else:
-                            long_close_reasons[i] = long_exit_reason_text
+                            long_close_reasons[execution_i] = long_exit_reason_text
                 
                 updates = None
 
@@ -1491,7 +1505,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                     # ---- open short ----
                     account = capture_account_state()
                     updates = trade_engine.open_short(
-                        i, close_prices, close_times, account,
+                        execution_i, open_prices, open_times, account,
                         trade_amount_percent=trade_amount_percent,
                         margin_balance=balance + sum(p['margin'] for p in open_positions),
                         margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
@@ -1504,21 +1518,21 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                             updates,
                             trade_id=f"{trade_reason}_{next_trade_id:04d}",
                             side="short",
-                            entry_index=i,
-                            high_price=high_prices[i],
-                            low_price=low_prices[i],
+                            entry_index=execution_i,
+                            high_price=open_prices[execution_i],
+                            low_price=open_prices[execution_i],
                             reason=trade_reason,
                         )
                         open_positions.append(position)
                         
                         # open point on chart
                         if short_open_points is not None:
-                            short_open_points.append((i, position['entry_price']))
+                            short_open_points.append((execution_i, position['entry_price']))
                             # open reason text
                             if short_open_reasons is not None:
                                 # default texts
                                 entry_reason_text += generate_entry_reason_text(trade_id=next_trade_id, updates=updates)
-                                short_open_reasons[i] = entry_reason_text
+                                short_open_reasons[execution_i] = entry_reason_text
 
                         next_trade_id += 1
                         # record which cross enabled this trade and init trailing state
@@ -1528,7 +1542,8 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         # ===================== SCALE ENTRY SHORT =====================
         if scale_in_enabled and len(open_positions) < max_open_trades and _count_open("long") == 0 and _count_open("short") > 0 and i >= cooldown_until_index:
             first_short_position = min(
-                (p for p in open_positions if p['side'] == "short"),
+                (p for p in open_positions
+                 if p['side'] == "short" and p['entry_index'] <= i),
                 key=lambda x: x['entry_index'],
                 default=None
             )
@@ -1573,7 +1588,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 if short_scale_entry_reason is not None:
                     account = capture_account_state()
                     updates = trade_engine.open_short(
-                        i, close_prices, close_times, account,
+                        execution_i, open_prices, open_times, account,
                         trade_amount_percent=scale_entry_amount_percent,
                         margin_balance=balance + sum(p['margin'] for p in open_positions),
                         margin_balance_no_fee=balance_without_fee + sum(p['margin_no_fee'] for p in open_positions),
@@ -1593,15 +1608,15 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                             updates,
                             trade_id=f"{trade_reason}_{next_trade_id:04d}",
                             side="short",
-                            entry_index=i,
-                            high_price=high_prices[i],
-                            low_price=low_prices[i],
+                            entry_index=execution_i,
+                            high_price=open_prices[execution_i],
+                            low_price=open_prices[execution_i],
                             reason=trade_reason,
                         )
                         open_positions.append(position)
                         next_trade_id += 1
                         if short_open_points is not None:
-                            short_open_points.append((i, position['entry_price']))
+                            short_open_points.append((execution_i, position['entry_price']))
                             if short_open_reasons is not None:
                                 short_scale_entry_text = (
                                     f"SHORT SCALE ENTRY\n"
@@ -1617,7 +1632,7 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                                             f"\nProfit filter score: {short_profit_scale_entry_score}/{profit_scale_entry_min_score}"
                                         )
 
-                                short_open_reasons[i] = short_scale_entry_text
+                                short_open_reasons[execution_i] = short_scale_entry_text
 
                     updates = None
 
@@ -1627,6 +1642,8 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
         short_exit_reason_text = None
         for p in open_positions[:]:
             if p['side'] != "short":
+                continue
+            if p['entry_index'] is not None and p['entry_index'] > i:
                 continue
             exit_score = 0
             exit_reasons = []
@@ -1727,15 +1744,18 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
                 break
 
         if close_all_shorts:
-            short_positions_to_close = [p for p in open_positions[:] if p['side'] == "short"]
+            short_positions_to_close = [
+                p for p in open_positions[:]
+                if p['side'] == "short" and p['entry_index'] <= i
+            ]
             for p in short_positions_to_close:
                 remaining_open_margin = sum(x['margin'] for x in open_positions if x is not p)
                 remaining_open_margin_no_fee = sum(x['margin_no_fee'] for x in open_positions if x is not p)
                 # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                close_price = close_prices[i]
+                close_price = open_prices[execution_i]
                 account = capture_account_state()
                 updates = trade_engine.close_short(
-                    i, close_prices, close_times, p, account,
+                    execution_i, open_prices, open_times, p, account,
                     fee_rate=fee_rate,
                     cooldown_after_big_pnl=cooldown_after_big_pnl,
                     remaining_open_margin=remaining_open_margin,
@@ -1762,14 +1782,14 @@ def ma_strategy(tune: dict = None, start="2025-01-01", end="2026-02-23"):
 
                 # close point on chart
                 if short_close_points is not None:
-                    short_close_points.append((i, close_price))
+                    short_close_points.append((execution_i, close_price))
                     # close reason text
                     if short_close_reasons is not None:
                         short_exit_reason_text += generate_close_reason_text(trade_id=p['trade_id'], updates=updates)
                         if len(short_positions_to_close) > 1:
-                            short_close_reasons[i] = f"\n{short_exit_reason_text}\nBatch close: all open SHORT positions closed together."
+                            short_close_reasons[execution_i] = f"\n{short_exit_reason_text}\nBatch close: all open SHORT positions closed together."
                         else:
-                            short_close_reasons[i] = short_exit_reason_text
+                            short_close_reasons[execution_i] = short_exit_reason_text
 
                 updates = None
 

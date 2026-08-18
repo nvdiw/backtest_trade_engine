@@ -1,3 +1,5 @@
+import ast
+from pathlib import Path
 import unittest
 
 from trade_engine import AccountState, Position, TradeEngine
@@ -118,6 +120,48 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertEqual(liquid_account.total_liquids, 1)
         self.assertEqual(liquid_account.total_losses, 1)
         self.assertEqual(liquid_account.profits_lst, [-100.0])
+
+
+class StrategyExecutionTimingTests(unittest.TestCase):
+    def test_strategy_orders_execute_at_next_candle_open(self):
+        source = Path("ma_strategy.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        order_methods = {"open_long", "open_short", "close_long", "close_short"}
+        order_calls = []
+
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "trade_engine"
+                and node.func.attr in order_methods
+            ):
+                order_calls.append(node)
+
+        self.assertTrue(order_calls)
+        for call in order_calls:
+            self.assertEqual(ast.unparse(call.args[0]), "execution_i")
+            self.assertEqual(ast.unparse(call.args[1]), "open_prices")
+            self.assertEqual(ast.unparse(call.args[2]), "open_times")
+
+    def test_new_positions_are_timestamped_at_execution_candle(self):
+        source = Path("ma_strategy.py").read_text(encoding="utf-8-sig")
+        tree = ast.parse(source)
+        position_calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "from_open_result"
+        ]
+
+        self.assertTrue(position_calls)
+        for call in position_calls:
+            entry_index = next(
+                keyword.value for keyword in call.keywords
+                if keyword.arg == "entry_index"
+            )
+            self.assertEqual(ast.unparse(entry_index), "execution_i")
 
 
 if __name__ == "__main__":

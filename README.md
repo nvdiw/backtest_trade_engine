@@ -80,6 +80,10 @@ calls use 100% of available capital and 1x leverage unless overridden. Closing
 methods accept these objects, close the full supplied position, and update the
 account atomically.
 
+The MA strategy evaluates signals after candle `i` has closed and fills every
+signal-based entry or exit at candle `i+1` open. The final candle can update
+mark-to-market and liquidation state, but cannot create an unfillable order.
+
 ```python
 from trade_engine import AccountState, Position, TradeEngine
 
