@@ -1,6 +1,12 @@
 NEW SEARCH FROM strategy_config.py:
 python optimize.py --mode smart --profile focused --base-source config --tests 5000 -w 8
 
+CONTINUOUS AUTO SEARCH (STOP WITH CTRL+C):
+python optimize.py --auto -w 16
+
+RESUME CONTINUOUS AUTO SEARCH:
+python optimize.py --auto --resume -w 16
+
 REFINE THE CURRENT BEST PARAMETERS:
 python optimize.py --mode smart --profile exit --base-source best --base-params outputs/optimize/best_params.json --tests 5000 -w 8 --output-dir outputs/optimize/refine_exit
 

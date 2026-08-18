@@ -1,6 +1,8 @@
 """Parallel full-grid and budgeted adaptive optimization for ``ma_strategy``.
 
 Examples:
+    python optimize.py --auto -w 16
+    python optimize.py --auto --resume -w 16
     python optimize.py --mode smart --tests 5000 -w 8
     python optimize.py --mode grid -w 8
 """
@@ -14,7 +16,9 @@ import multiprocessing
 import os
 import random
 import signal
+import statistics
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ma_strategy import ma_strategy
@@ -187,7 +191,7 @@ def _grid_subset(*prefixes, extra=()):
 
 
 PARAMETER_PROFILES = {
-    # The focused profile preserves the user's current MA/leverage search.
+    # The focused profile preserves the user's current score-weight search.
     "focused": FOCUSED_PARAM_GRID,
     "signal": _grid_subset(
         "entry_", "ma_distance", "candle_move", "impulse_", "late_entry_",
@@ -237,6 +241,7 @@ DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
 _WORKER_BASE_TUNE = {}
+DEFAULT_OUTPUT_DIR = os.path.join("outputs", "optimize")
 
 
 def grid_size(grid):
@@ -285,15 +290,30 @@ def is_valid_candidate(candidate):
 
 
 class SmartCandidateGenerator:
-    """Reproducible adaptive search over a discrete parameter space."""
+    """Reproducible adaptive search over discrete or locally refined values."""
 
-    def __init__(self, grid, seed=42, baseline_params=None):
+    def __init__(
+        self,
+        grid,
+        seed=42,
+        baseline_params=None,
+        continuous_refinement=False,
+        parameter_importance=None,
+        refinement_round=1,
+    ):
         if not grid or any(not values for values in grid.values()):
             raise ValueError("param_grid must contain at least one value per parameter")
         self.grid = {key: tuple(values) for key, values in grid.items()}
         self.keys = tuple(self.grid)
         self.mutable_keys = tuple(key for key, values in self.grid.items() if len(values) > 1)
         self.random = random.Random(seed)
+        self.continuous_refinement = bool(continuous_refinement)
+        self.refinement_round = max(1, int(refinement_round))
+        supplied_importance = parameter_importance or {}
+        self.parameter_importance = {
+            key: max(0.01, float(supplied_importance.get(key, 1.0)))
+            for key in self.mutable_keys
+        }
         self.seen = set()
         self.local_queue = []
         self.local_queued = set()
@@ -359,17 +379,96 @@ class SmartCandidateGenerator:
     def _random_candidate(self):
         return {key: self.random.choice(values) for key, values in self.grid.items()}
 
+    @staticmethod
+    def _is_numeric_values(values):
+        return all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        )
+
+    def _numeric_refinement_step(self, values):
+        ordered = sorted(set(values))
+        if all(isinstance(value, int) and not isinstance(value, bool) for value in ordered):
+            return 1
+        gaps = [
+            right - left for left, right in zip(ordered, ordered[1:])
+            if right > left
+        ]
+        if not gaps:
+            return 0
+        # Each completed auto cycle can halve the smallest coarse-grid gap. The
+        # cap avoids creating meaningless floating-point precision indefinitely.
+        divisor = 2 ** min(4, self.refinement_round)
+        return min(gaps) / divisor
+
+    @staticmethod
+    def _float_precision(values, step):
+        def decimal_places(value):
+            text = f"{float(value):.12f}".rstrip("0")
+            return len(text.partition(".")[2])
+
+        return min(12, max([decimal_places(value) for value in values] + [decimal_places(step)]))
+
+    def _refined_neighbors(self, key, current):
+        values = self.grid[key]
+        if not self.continuous_refinement or not self._is_numeric_values(values):
+            ordered = list(values)
+            if current in ordered:
+                index = ordered.index(current)
+            else:
+                index = min(range(len(ordered)), key=lambda i: abs(ordered[i] - current))
+            return [
+                ordered[neighbor_index]
+                for neighbor_index in (index - 1, index + 1)
+                if 0 <= neighbor_index < len(ordered)
+            ]
+
+        lower, upper = min(values), max(values)
+        step = self._numeric_refinement_step(values)
+        if step <= 0:
+            return []
+        precision = self._float_precision(values, step)
+        neighbors = []
+        for direction in (-1, 1):
+            value = current + direction * step
+            value = max(lower, min(upper, value))
+            if all(isinstance(item, int) and not isinstance(item, bool) for item in values):
+                value = int(round(value))
+            else:
+                value = round(value, precision)
+            if value != current and value not in neighbors:
+                neighbors.append(value)
+        return neighbors
+
+    def _weighted_mutation_keys(self, count):
+        available = list(self.mutable_keys)
+        chosen = []
+        while available and len(chosen) < count:
+            weights = [self.parameter_importance.get(key, 1.0) for key in available]
+            key = self.random.choices(available, weights=weights, k=1)[0]
+            available.remove(key)
+            chosen.append(key)
+        return chosen
+
+    def _mutate_key(self, candidate, key, prefer_local=True):
+        values = self.grid[key]
+        neighbors = self._refined_neighbors(key, candidate[key])
+        if prefer_local and neighbors and self.random.random() < 0.85:
+            candidate[key] = self.random.choice(neighbors)
+        else:
+            candidate[key] = self.random.choice(values)
+
     def _elite_choice(self, elites):
         # Rank weighting prevents one early lucky candidate from monopolizing search.
         weights = list(range(len(elites), 0, -1))
         return self.random.choices(elites, weights=weights, k=1)[0]
 
-    def _guided_candidate(self, elites, progress=0.0):
+    def _guided_candidate(self, elites, progress=0.0, crossover_probability=0.20):
         # Occasionally cross two good candidates, then mutate. Mutation becomes
         # narrower as the budget is consumed (exploration -> exploitation).
         parent = self._elite_choice(elites)
         candidate = {key: parent["params"][key] for key in self.keys}
-        if len(elites) > 1 and self.random.random() < 0.20:
+        if len(elites) > 1 and self.random.random() < crossover_probability:
             other = self._elite_choice(elites)["params"]
             for key in self.mutable_keys:
                 if self.random.random() < 0.5:
@@ -378,32 +477,30 @@ class SmartCandidateGenerator:
         max_mutations = max(2, round(math.sqrt(max(1, len(self.mutable_keys)))))
         mutation_count = max(1, round(max_mutations * (1.0 - 0.70 * progress)))
         mutation_count = min(len(self.mutable_keys), mutation_count)
-        for key in self.random.sample(self.mutable_keys, mutation_count):
-            values = self.grid[key]
-            elite_value = candidate[key]
-            if self.random.random() < 0.80 and len(values) > 1:
-                index = values.index(elite_value)
-                offset = self.random.choice((-1, 1))
-                candidate[key] = values[max(0, min(len(values) - 1, index + offset))]
-            else:
-                candidate[key] = self.random.choice(values)
+        for key in self._weighted_mutation_keys(mutation_count):
+            self._mutate_key(candidate, key, prefer_local=True)
+        return candidate
+
+    def _crossover_candidate(self, elites, progress=0.0):
+        candidate = self._guided_candidate(
+            elites, progress=progress, crossover_probability=1.0
+        )
         return candidate
 
     def _queue_elite_neighbors(self, elites):
         """Queue deterministic one-step neighbors around the current elites."""
         for elite in elites:
             parent = {key: elite["params"][key] for key in self.keys}
-            for key in self.mutable_keys:
-                values = self.grid[key]
+            ordered_keys = sorted(
+                self.mutable_keys,
+                key=lambda key: self.parameter_importance.get(key, 1.0),
+                reverse=True,
+            )
+            for key in ordered_keys:
                 current = parent[key]
-                if current not in values:
-                    continue
-                index = values.index(current)
-                for neighbor_index in (index - 1, index + 1):
-                    if not 0 <= neighbor_index < len(values):
-                        continue
+                for neighbor in self._refined_neighbors(key, current):
                     candidate = dict(parent)
-                    candidate[key] = values[neighbor_index]
+                    candidate[key] = neighbor
                     candidate = self._canonicalize(candidate)
                     signature = self._signature(candidate)
                     if (
@@ -432,6 +529,36 @@ class SmartCandidateGenerator:
                 candidate = self._guided_candidate(elites, progress=progress)
             else:
                 candidate = self._random_candidate()
+            candidate = self._canonicalize(candidate)
+            signature = self._signature(candidate)
+            if signature in self.seen or not is_valid_candidate(candidate):
+                continue
+            self.seen.add(signature)
+            candidates.append(candidate)
+        return candidates
+
+    def generate_auto(self, count, elites=None):
+        """Generate the 25% exploration / 15% crossover / 60% local mix."""
+        if not elites:
+            return self.generate(count)
+        self._queue_elite_neighbors(elites)
+        candidates = []
+        attempts = 0
+        max_attempts = max(2000, count * 200)
+        while len(candidates) < count and attempts < max_attempts:
+            attempts += 1
+            roll = self.random.random()
+            if roll < 0.25:
+                candidate = self._random_candidate()
+            elif roll < 0.40:
+                candidate = self._crossover_candidate(elites, progress=0.85)
+            elif self.local_queue and self.random.random() < 0.50:
+                candidate = self.local_queue.pop(0)
+                self.local_queued.discard(self._signature(candidate))
+            else:
+                candidate = self._guided_candidate(
+                    elites, progress=0.85, crossover_probability=0.0
+                )
             candidate = self._canonicalize(candidate)
             signature = self._signature(candidate)
             if signature in self.seen or not is_valid_candidate(candidate):
@@ -516,6 +643,207 @@ def _robust_validation_score(train_result, validation_result, overfit_penalty=0.
         return -math.inf
     optimistic_gap = max(0.0, train_score - validation_score)
     return validation_score - overfit_penalty * optimistic_gap
+
+
+AUTO_STAGE_ORDER = ("discovery", "validation", "stress", "final")
+AUTO_STAGE_WEIGHTS = {
+    "discovery": 0.40,
+    "validation": 0.30,
+    "stress": 0.20,
+    "final": 0.10,
+}
+AUTO_STATE_VERSION = 1
+
+
+def _finite_number(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _importance_target(record, target):
+    if target == "objective_score":
+        return _finite_number(record.get("objective_score"))
+    return _finite_number((record.get("result") or {}).get(target))
+
+
+def _learn_parameter_importance(records, parameter_keys, target="objective_score"):
+    """Estimate which parameters explain the largest share of result variance.
+
+    Exact values are grouped for small discrete spaces. Highly varied numeric
+    parameters are binned so locally refined off-grid values remain useful.
+    A small exploration floor prevents an early noisy estimate from permanently
+    freezing any parameter.
+    """
+    usable = []
+    for record in records:
+        value = _importance_target(record, target)
+        if value is not None:
+            usable.append((record["params"], value))
+    if len(usable) < 4:
+        equal = 1.0 / max(1, len(parameter_keys))
+        return {
+            key: {"weight": equal, "effect": 0.0, "groups": 0, "samples": len(usable)}
+            for key in parameter_keys
+        }
+
+    targets = [value for _, value in usable]
+    overall_mean = statistics.fmean(targets)
+    total_variance = statistics.fmean((value - overall_mean) ** 2 for value in targets)
+    raw = {}
+    for key in parameter_keys:
+        key_values = [params[key] for params, _ in usable]
+        unique = list(dict.fromkeys(key_values))
+        numeric = all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in unique
+        )
+        groups = {}
+        if numeric and len(unique) > 12:
+            lower, upper = min(unique), max(unique)
+            width = (upper - lower) / 8 if upper > lower else 0
+            for (params, target_value) in usable:
+                group = 0 if width == 0 else min(7, int((params[key] - lower) / width))
+                groups.setdefault(group, []).append(target_value)
+        else:
+            for params, target_value in usable:
+                groups.setdefault((type(params[key]).__name__, params[key]), []).append(target_value)
+
+        between = sum(
+            len(values) * (statistics.fmean(values) - overall_mean) ** 2
+            for values in groups.values()
+        ) / len(usable)
+        effect = between / total_variance if total_variance > 0 else 0.0
+        confidence = min(1.0, len(usable) / max(20.0, len(groups) * 4.0))
+        raw[key] = {
+            "effect": max(0.0, min(1.0, effect)) * confidence,
+            "groups": len(groups),
+            "samples": len(usable),
+        }
+
+    # The floor reserves exploration for every variable while high-effect
+    # variables receive most local mutations and deterministic neighbor tests.
+    scores = {key: 0.05 + item["effect"] for key, item in raw.items()}
+    total = sum(scores.values()) or 1.0
+    return {
+        key: {**raw[key], "weight": scores[key] / total}
+        for key in parameter_keys
+    }
+
+
+def _smooth_parameter_importance(previous, learned, previous_weight=0.65):
+    if not previous:
+        return learned
+    blended = {}
+    for key, item in learned.items():
+        old = previous.get(key, {})
+        weight = previous_weight * float(old.get("weight", 0.0)) + (
+            1.0 - previous_weight
+        ) * float(item.get("weight", 0.0))
+        blended[key] = {**item, "weight": weight}
+    total = sum(item["weight"] for item in blended.values()) or 1.0
+    for item in blended.values():
+        item["weight"] /= total
+    return blended
+
+
+def _record_percentiles(records):
+    valid = [
+        record for record in records
+        if _finite_number(record.get("objective_score")) is not None
+    ]
+    valid.sort(key=lambda record: float(record["objective_score"]), reverse=True)
+    denominator = max(1, len(valid) - 1)
+    return {
+        record["candidate_id"]: 1.0 - rank / denominator
+        for rank, record in enumerate(valid)
+    }
+
+
+def _combine_auto_stage_records(stage_records):
+    """Rank candidates across every completed, non-overlapping market regime."""
+    completed_stages = [stage for stage in AUTO_STAGE_ORDER if stage in stage_records]
+    if not completed_stages:
+        return []
+    final_stage = completed_stages[-1]
+    record_maps = {
+        stage: {record["candidate_id"]: record for record in records}
+        for stage, records in stage_records.items()
+    }
+    percentiles = {
+        stage: _record_percentiles(records) for stage, records in stage_records.items()
+    }
+    combined = []
+    for latest in stage_records[final_stage]:
+        candidate_id = latest["candidate_id"]
+        if any(candidate_id not in record_maps[stage] for stage in completed_stages):
+            continue
+        ranks = []
+        weighted_total = 0.0
+        weight_total = 0.0
+        stage_scores = {}
+        stage_metrics = {}
+        qualified = True
+        for stage in completed_stages:
+            record = record_maps[stage][candidate_id]
+            score = _finite_number(record.get("objective_score"))
+            percentile = percentiles[stage].get(candidate_id)
+            if score is None or percentile is None:
+                qualified = False
+                break
+            weight = AUTO_STAGE_WEIGHTS[stage]
+            ranks.append(percentile)
+            weighted_total += weight * percentile
+            weight_total += weight
+            stage_scores[stage] = score
+            stage_metrics[stage] = record["result"]
+        if not qualified:
+            robust_score = -math.inf
+        else:
+            weighted_rank = weighted_total / weight_total
+            dispersion = statistics.pstdev(ranks) if len(ranks) > 1 else 0.0
+            transformed_quality = sum(
+                AUTO_STAGE_WEIGHTS[stage]
+                * math.copysign(math.log1p(abs(stage_scores[stage])), stage_scores[stage])
+                for stage in completed_stages
+            ) / weight_total
+            robust_score = (
+                50.0 * weighted_rank
+                + 20.0 * min(ranks)
+                - 10.0 * dispersion
+                + 10.0 * transformed_quality
+            )
+        combined.append({
+            "candidate_id": candidate_id,
+            "params": latest["params"],
+            "robust_score": robust_score,
+            "worst_stage_percentile": min(ranks) if ranks else None,
+            "stage_scores": stage_scores,
+            "stage_metrics": stage_metrics,
+        })
+    combined.sort(key=lambda record: record["robust_score"], reverse=True)
+    return combined
+
+
+def _latest_market_end():
+    """Return an exclusive timestamp immediately after the last valid candle."""
+    from get_candle_index import _open_times
+
+    open_times = _open_times().dropna()
+    if open_times.empty:
+        raise ValueError("market data does not contain a valid Open time")
+    recent = open_times.tail(100).sort_values()
+    deltas = recent.diff().dropna()
+    candle_delta = deltas.median() if not deltas.empty else timedelta(minutes=15)
+    if candle_delta <= timedelta(0):
+        candle_delta = timedelta(minutes=15)
+    return (open_times.iloc[-1] + candle_delta).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _timestamp_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _json_safe(value):
@@ -795,6 +1123,710 @@ def _validate_top_candidates(records, args, workers, chunksize):
     return (validated[0] if validated else None), validated
 
 
+def _auto_ranges(args, resolved_end):
+    return {
+        "discovery": [args.auto_discovery_start, resolved_end],
+        "validation": [args.auto_validation_start, args.auto_discovery_start],
+        "stress": [args.auto_stress_start, args.auto_validation_start],
+        "final": [args.auto_stress_start, resolved_end],
+    }
+
+
+def _bound_index(value):
+    parsed = _parse_bound(value)
+    if isinstance(parsed, int):
+        return parsed
+    from get_candle_index import get_candle_index
+
+    return int(get_candle_index(parsed))
+
+
+def _validate_auto_ranges(ranges):
+    discovery_start = _bound_index(ranges["discovery"][0])
+    validation_start = _bound_index(ranges["validation"][0])
+    stress_start = _bound_index(ranges["stress"][0])
+    final_end = _bound_index(ranges["final"][1])
+    if not stress_start < validation_start < discovery_start < final_end:
+        raise ValueError(
+            "auto ranges must satisfy: stress-start < validation-start < "
+            "discovery-start < auto-end"
+        )
+
+
+def _auto_configuration(args, profile, grid, base_tune, base_description, resolved_end):
+    ranges = _auto_ranges(args, resolved_end)
+    _validate_auto_ranges(ranges)
+    return {
+        "profile": profile,
+        "parameter_grid": {key: list(values) for key, values in grid.items()},
+        "base_source": base_description,
+        "base_tune": base_tune,
+        "tests_per_cycle": args.auto_tests,
+        "validation_top": args.auto_validation_top,
+        "stress_top": args.auto_stress_top,
+        "final_top": args.auto_final_top,
+        "hall_size": args.auto_hall_size,
+        "importance_target": args.auto_importance_target,
+        "seed": args.seed,
+        "minimum_trades": args.min_trades,
+        "maximum_allowed_drawdown": args.max_drawdown,
+        "ranges": ranges,
+    }
+
+
+def _load_json(path, default=None):
+    path = Path(path)
+    if not path.is_file():
+        return default
+    with path.open(encoding="utf-8") as file:
+        return json.load(file)
+
+
+def _candidate_signature(params, keys):
+    return tuple(params[key] for key in keys)
+
+
+def _load_auto_seen(output_dir, keys):
+    seen = set()
+    for path in sorted((Path(output_dir) / "cycles").glob("cycle_*/discovery_candidates.json")):
+        payload = _load_json(path, {}) or {}
+        for candidate in payload.get("candidates", []):
+            params = candidate.get("params", {})
+            if all(key in params for key in keys):
+                seen.add(_candidate_signature(params, keys))
+    return seen
+
+
+def _count_auto_evaluations(output_dir):
+    completed = 0
+    for path in (Path(output_dir) / "cycles").glob("cycle_*/*_results.csv"):
+        with path.open(newline="", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file)
+            completed += sum(1 for _ in reader)
+    return completed
+
+
+def _write_candidate_plan(path, cycle, stage, candidates):
+    _write_json(path, {
+        "cycle": cycle,
+        "stage": stage,
+        "candidate_count": len(candidates),
+        "candidates": candidates,
+    })
+
+
+def _read_candidate_plan(path):
+    payload = _load_json(path, {}) or {}
+    return payload.get("candidates", [])
+
+
+def _auto_stage_fieldnames(keys):
+    return [
+        "candidate_id", "cycle", "stage", "range_start", "range_end",
+        *keys, *RESULT_COLUMNS, *DERIVED_RESULT_COLUMNS, "duration_s", "error",
+    ]
+
+
+def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
+                     params, result, duration, objective_score, error):
+    row = {
+        "candidate_id": candidate_id,
+        "cycle": cycle,
+        "stage": stage,
+        "range_start": range_start,
+        "range_end": range_end,
+        "duration_s": round(duration, 4),
+        "objective_score": objective_score,
+        "error": error,
+    }
+    row.update({key: params[key] for key in keys})
+    if result:
+        row.update({key: result.get(key) for key in RESULT_COLUMNS})
+        closed_trades = int(result.get("closed_trades", 0) or 0)
+        realized_profit = result.get("realized_profit")
+        if realized_profit is None:
+            realized_profit = result.get("total_profit", 0)
+        row["profit_per_trade"] = (
+            float(realized_profit or 0) / closed_trades if closed_trades else None
+        )
+    return row
+
+
+def _read_auto_stage_records(path, candidates):
+    path = Path(path)
+    if not path.is_file():
+        return []
+    candidate_map = {candidate["candidate_id"]: candidate for candidate in candidates}
+    records = {}
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        if "candidate_id" not in (reader.fieldnames or ()):
+            raise ValueError(f"invalid auto checkpoint: {path}")
+        for row in reader:
+            candidate = candidate_map.get(row["candidate_id"])
+            if candidate is None:
+                continue
+            result = {key: _parse_metric(row.get(key)) for key in RESULT_COLUMNS}
+            records[row["candidate_id"]] = {
+                "candidate_id": row["candidate_id"],
+                "params": candidate["params"],
+                "result": result,
+                "objective_score": _parse_metric(row.get("objective_score")),
+                "duration": float(row.get("duration_s") or 0),
+                "error": row.get("error") or None,
+            }
+    return [
+        records[candidate["candidate_id"]]
+        for candidate in candidates
+        if candidate["candidate_id"] in records
+    ]
+
+
+def _run_auto_stage(
+    args,
+    cycle,
+    stage,
+    candidates,
+    range_start,
+    range_end,
+    base_tune,
+    cycle_dir,
+    state,
+    state_path,
+):
+    """Evaluate one auto stage and persist every yielded result for exact resume."""
+    keys = tuple(state["config"]["parameter_grid"])
+    results_path = Path(cycle_dir) / f"{stage}_results.csv"
+    existing = _read_auto_stage_records(results_path, candidates)
+    records = {record["candidate_id"]: record for record in existing}
+    pending = [
+        candidate for candidate in candidates
+        if candidate["candidate_id"] not in records
+    ]
+    total = len(candidates)
+    print(
+        f"Cycle {cycle} | {stage}: {len(existing):,}/{total:,} complete | "
+        f"range {range_start} -> {range_end}"
+    )
+    if not pending:
+        return existing, False
+
+    fieldnames = _auto_stage_fieldnames(keys)
+    append = results_path.is_file() and results_path.stat().st_size > 0
+    workers = min(max(1, args.workers), len(pending))
+    batch_size = args.batch_size or max(32, workers * 8)
+    chunksize = args.chunksize or max(1, batch_size // (workers * 4))
+    started = time.perf_counter()
+    pool = None
+    pool_terminated = False
+    interrupted = False
+
+    with results_path.open("a" if append else "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        if not append:
+            writer.writeheader()
+        if workers > 1:
+            pool = multiprocessing.Pool(
+                workers,
+                initializer=_init_worker,
+                initargs=(
+                    _parse_bound(range_start), _parse_bound(range_end), base_tune, True,
+                ),
+            )
+        else:
+            _init_worker(
+                _parse_bound(range_start), _parse_bound(range_end), base_tune
+            )
+
+        tasks = [
+            (candidate["candidate_id"], candidate["params"])
+            for candidate in pending
+        ]
+        if pool is not None:
+            evaluated = pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize)
+        else:
+            evaluated = (
+                _evaluate_candidate(
+                    candidate_id,
+                    params,
+                    base_tune,
+                    _parse_bound(range_start),
+                    _parse_bound(range_end),
+                )
+                for candidate_id, params in tasks
+            )
+
+        try:
+            for candidate_id, params, result, duration, error in evaluated:
+                objective_score = None
+                if not error:
+                    closed_trades = int(result.get("closed_trades", 0) or 0)
+                    if closed_trades > 0:
+                        value = _objective_score(
+                            result,
+                            min_trades=args.min_trades,
+                            max_drawdown=args.max_drawdown,
+                        )
+                        objective_score = value if math.isfinite(value) else None
+                writer.writerow(_auto_result_row(
+                    keys, candidate_id, cycle, stage, range_start, range_end,
+                    params, result, duration, objective_score, error,
+                ))
+                csv_file.flush()
+                records[candidate_id] = {
+                    "candidate_id": candidate_id,
+                    "params": params,
+                    "result": result or {},
+                    "objective_score": objective_score,
+                    "duration": duration,
+                    "error": error,
+                }
+                state["total_evaluations"] += 1
+                state["stage_completed"] = len(records)
+                if args.log_every and (
+                    len(records) % args.log_every == 0 or len(records) == total
+                ):
+                    best_score = max(
+                        (_finite_number(record["objective_score"]) for record in records.values()),
+                        default=None,
+                        key=lambda value: -math.inf if value is None else value,
+                    )
+                    elapsed = time.perf_counter() - started
+                    shown = "n/a" if best_score is None else f"{best_score:.4f}"
+                    print(
+                        f"  [{len(records):,}/{total:,}] best={shown} "
+                        f"elapsed={elapsed:.1f}s"
+                    )
+                if len(records) % max(1, min(25, args.log_every or 25)) == 0:
+                    state["updated_at"] = _timestamp_now()
+                    _write_json(state_path, state)
+        except KeyboardInterrupt:
+            interrupted = True
+            state.update({
+                "status": "interrupted",
+                "stage": stage,
+                "stage_completed": len(records),
+                "updated_at": _timestamp_now(),
+            })
+            _write_json(state_path, state)
+            if pool is not None:
+                pool.terminate()
+                pool_terminated = True
+            print(
+                f"\nAuto mode stopped during {stage} after {len(records):,}/{total:,} "
+                "stage tests. Checkpoint saved; use --auto --resume."
+            )
+        finally:
+            if pool is not None:
+                if not pool_terminated:
+                    pool.close()
+                pool.join()
+
+    ordered = [
+        records[candidate["candidate_id"]]
+        for candidate in candidates
+        if candidate["candidate_id"] in records
+    ]
+    return ordered, interrupted
+
+
+def _write_rows_atomic(path, fieldnames, rows):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temporary, path)
+
+
+def _flatten_hall_record(record, keys, rank):
+    row = {
+        "rank": rank,
+        "cycle": record["cycle"],
+        "candidate_id": record["candidate_id"],
+        "robust_score": record["robust_score"],
+        "worst_stage_percentile": record.get("worst_stage_percentile"),
+    }
+    row.update({key: record["params"].get(key) for key in keys})
+    metric_names = (
+        "score", "total_profit", "total_profit_percent", "closed_trades",
+        "win_rate", "maximum_drawdown", "profit_factor", "expectancy_percent",
+        "calmar_ratio", "liquidations",
+    )
+    for stage in AUTO_STAGE_ORDER:
+        metrics = record.get("stage_metrics", {}).get(stage, {})
+        for metric in metric_names:
+            row[f"{stage}_{metric}"] = metrics.get(metric)
+    return row
+
+
+def _save_auto_workbook(output_dir, hall_rows, importance_rows):
+    if not hall_rows:
+        return None
+    try:
+        import pandas as pd
+        from openpyxl import load_workbook
+        from openpyxl.formatting.rule import ColorScaleRule
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+    except ImportError:
+        return None
+
+    output_path = Path(output_dir) / "auto_report.xlsx"
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        pd.DataFrame(hall_rows).to_excel(writer, sheet_name="Hall of Fame", index=False)
+        pd.DataFrame(importance_rows).to_excel(
+            writer, sheet_name="Parameter Importance", index=False
+        )
+    workbook = load_workbook(output_path)
+    header_fill = PatternFill("solid", fgColor="17365D")
+    header_font = Font(color="FFFFFF", bold=True)
+    for index, worksheet in enumerate(workbook.worksheets, start=1):
+        worksheet.freeze_panes = "A2"
+        worksheet.sheet_view.showGridLines = False
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center")
+        for column_index, cells in enumerate(worksheet.columns, start=1):
+            width = min(38, max(10, max(len(str(cell.value or "")) for cell in cells[:200]) + 2))
+            worksheet.column_dimensions[get_column_letter(column_index)].width = width
+        if worksheet.max_row >= 2:
+            table = Table(displayName=f"AutoOptimizerTable{index}", ref=worksheet.dimensions)
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2", showRowStripes=True,
+                showFirstColumn=False, showLastColumn=False,
+                showColumnStripes=False,
+            )
+            worksheet.add_table(table)
+        headers = {cell.value: cell.column for cell in worksheet[1]}
+        for metric in ("robust_score", "weight", "effect"):
+            column = headers.get(metric)
+            if column and worksheet.max_row >= 3:
+                letter = get_column_letter(column)
+                worksheet.conditional_formatting.add(
+                    f"{letter}2:{letter}{worksheet.max_row}",
+                    ColorScaleRule(
+                        start_type="min", start_color="F8696B",
+                        mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                        end_type="max", end_color="63BE7B",
+                    ),
+                )
+    workbook.save(output_path)
+    return output_path
+
+
+def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled=True):
+    output_dir = Path(output_dir)
+    ranked_hall = sorted(hall, key=lambda record: record["robust_score"], reverse=True)
+    _write_json(output_dir / "hall_of_fame.json", ranked_hall)
+    _write_json(output_dir / "parameter_importance.json", importance)
+    if ranked_hall:
+        _write_json(output_dir / "best_params.json", ranked_hall[0]["effective_params"])
+    hall_rows = [
+        _flatten_hall_record(record, keys, rank)
+        for rank, record in enumerate(ranked_hall, start=1)
+    ]
+    importance_rows = [
+        {"rank": rank, "parameter": key, **item}
+        for rank, (key, item) in enumerate(
+            sorted(importance.items(), key=lambda pair: pair[1]["weight"], reverse=True),
+            start=1,
+        )
+    ]
+    if hall_rows:
+        _write_rows_atomic(output_dir / "hall_of_fame.csv", list(hall_rows[0]), hall_rows)
+    if importance_rows:
+        _write_rows_atomic(
+            output_dir / "parameter_importance.csv",
+            list(importance_rows[0]),
+            importance_rows,
+        )
+    workbook = (
+        _save_auto_workbook(output_dir, hall_rows, importance_rows)
+        if excel_enabled else None
+    )
+    summary = {
+        "mode": "auto",
+        "status": state["status"],
+        "cycles_completed": state["cycles_completed"],
+        "current_cycle": state["cycle"],
+        "current_stage": state["stage"],
+        "total_evaluations": state["total_evaluations"],
+        "hall_of_fame_size": len(ranked_hall),
+        "best_robust_score": ranked_hall[0]["robust_score"] if ranked_hall else None,
+        "best_params": ranked_hall[0]["effective_params"] if ranked_hall else None,
+        "excel_report": str(workbook) if workbook else None,
+        "updated_at": state["updated_at"],
+    }
+    _write_json(output_dir / "auto_summary.json", summary)
+
+
+def _merge_hall_of_fame(hall, finalists, cycle, keys, base_tune, limit):
+    by_signature = {
+        _candidate_signature(record["params"], keys): record for record in hall
+    }
+    for finalist in finalists:
+        if not math.isfinite(finalist["robust_score"]):
+            continue
+        record = {
+            **finalist,
+            "cycle": cycle,
+            "effective_params": {**base_tune, **finalist["params"]},
+        }
+        signature = _candidate_signature(record["params"], keys)
+        previous = by_signature.get(signature)
+        if previous is None or record["robust_score"] > previous["robust_score"]:
+            by_signature[signature] = record
+    return sorted(
+        by_signature.values(), key=lambda record: record["robust_score"], reverse=True
+    )[:limit]
+
+
+def run_auto_optimization(args, grid=None):
+    """Run an unlimited, staged, importance-guided optimization campaign."""
+    profile = getattr(args, "profile", "focused")
+    grid = PARAMETER_PROFILES[profile] if grid is None else grid
+    keys = tuple(grid)
+    base_tune, base_description = _load_base_tune(args)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / "auto_state.json"
+    resolved_end = _latest_market_end() if args.auto_end == "latest" else args.auto_end
+    config = _auto_configuration(
+        args, profile, grid, base_tune, base_description, resolved_end
+    )
+
+    if args.resume:
+        state = _load_json(state_path)
+        if state is None:
+            raise FileNotFoundError(
+                f"auto checkpoint not found: {state_path}. Start without --resume first."
+            )
+        if state.get("version") != AUTO_STATE_VERSION:
+            raise ValueError("auto checkpoint version is not compatible")
+        if state.get("config") != config:
+            raise ValueError(
+                "auto checkpoint settings differ from this command; use the original "
+                "profile, ranges, test counts, base parameters, and constraints"
+            )
+        hall = _load_json(output_dir / "hall_of_fame.json", []) or []
+        importance = _load_json(output_dir / "parameter_importance.json", {}) or {}
+        state.update({
+            "status": "running",
+            "total_evaluations": _count_auto_evaluations(output_dir),
+            "updated_at": _timestamp_now(),
+        })
+        print(
+            f"Resuming auto cycle {state['cycle']} at {state['stage']} | "
+            f"{state['total_evaluations']:,} total evaluations"
+        )
+    else:
+        if state_path.exists():
+            raise FileExistsError(
+                f"an auto campaign already exists in {output_dir}; use --auto --resume "
+                "or choose another --output-dir"
+            )
+        equal_weight = 1.0 / max(1, len(keys))
+        importance = {
+            key: {"weight": equal_weight, "effect": 0.0, "groups": 0, "samples": 0}
+            for key in keys
+        }
+        hall = []
+        state = {
+            "version": AUTO_STATE_VERSION,
+            "status": "running",
+            "cycle": 1,
+            "cycles_completed": 0,
+            "stage": "discovery",
+            "stage_completed": 0,
+            "total_evaluations": 0,
+            "importance_cycle": 0,
+            "created_at": _timestamp_now(),
+            "updated_at": _timestamp_now(),
+            "config": config,
+        }
+    _write_json(state_path, state)
+
+    ranges = config["ranges"]
+    print(
+        f"Mode: auto | {args.auto_tests:,} discovery tests/cycle | "
+        f"workers: {max(1, args.workers)}"
+    )
+    print(
+        f"Funnel: {args.auto_tests:,} -> {args.auto_validation_top} -> "
+        f"{args.auto_stress_top} -> {args.auto_final_top} | profile: {profile}"
+    )
+    print(f"Latest market end: {resolved_end}")
+
+    cycle_limit = max(0, int(args.auto_cycles))
+    try:
+        while cycle_limit == 0 or state["cycles_completed"] < cycle_limit:
+            cycle = int(state["cycle"])
+            cycle_dir = output_dir / "cycles" / f"cycle_{cycle:06d}"
+            cycle_dir.mkdir(parents=True, exist_ok=True)
+            discovery_plan_path = cycle_dir / "discovery_candidates.json"
+            if discovery_plan_path.is_file():
+                discovery_candidates = _read_candidate_plan(discovery_plan_path)
+            else:
+                seen = _load_auto_seen(output_dir, keys)
+                elite_records = [
+                    {
+                        "params": {key: record["params"][key] for key in keys},
+                        "result": record.get("stage_metrics", {}).get("final", {}),
+                    }
+                    for record in hall
+                ]
+                generator = SmartCandidateGenerator(
+                    grid,
+                    seed=args.seed + cycle - 1,
+                    baseline_params=base_tune,
+                    continuous_refinement=bool(elite_records),
+                    parameter_importance={
+                        key: item.get("weight", 1.0) for key, item in importance.items()
+                    },
+                    refinement_round=max(1, cycle - 1),
+                )
+                generator.seen.update(seen)
+                generated = (
+                    generator.generate_auto(args.auto_tests, elites=elite_records)
+                    if elite_records else generator.generate(args.auto_tests)
+                )
+                discovery_candidates = [
+                    {
+                        "candidate_id": f"c{cycle:06d}-{index:06d}",
+                        "params": params,
+                    }
+                    for index, params in enumerate(generated, start=1)
+                ]
+                _write_candidate_plan(
+                    discovery_plan_path, cycle, "discovery", discovery_candidates
+                )
+            if not discovery_candidates:
+                state.update({"status": "exhausted", "updated_at": _timestamp_now()})
+                _write_json(state_path, state)
+                print("Auto search space is exhausted; no unique discovery candidates remain.")
+                break
+
+            stage_results = {}
+            state.update({
+                "status": "running", "stage": "discovery", "stage_completed": 0,
+                "updated_at": _timestamp_now(),
+            })
+            _write_json(state_path, state)
+            discovery_records, interrupted = _run_auto_stage(
+                args, cycle, "discovery", discovery_candidates,
+                *ranges["discovery"], base_tune, cycle_dir, state, state_path,
+            )
+            stage_results["discovery"] = discovery_records
+            if interrupted:
+                _write_auto_reports(
+                    output_dir, hall, importance, state, keys,
+                    excel_enabled=bool(args.excel_top),
+                )
+                return hall[0] if hall else None
+
+            if int(state.get("importance_cycle", 0)) < cycle:
+                learned = _learn_parameter_importance(
+                    discovery_records, keys, target=args.auto_importance_target
+                )
+                importance = _smooth_parameter_importance(importance, learned)
+                state["importance_cycle"] = cycle
+                state["updated_at"] = _timestamp_now()
+                _write_json(output_dir / "parameter_importance.json", importance)
+                _write_json(state_path, state)
+
+            stage_plan = (
+                ("validation", args.auto_validation_top),
+                ("stress", args.auto_stress_top),
+                ("final", args.auto_final_top),
+            )
+            for stage, keep_count in stage_plan:
+                plan_path = cycle_dir / f"{stage}_candidates.json"
+                if plan_path.is_file():
+                    candidates = _read_candidate_plan(plan_path)
+                else:
+                    ranked = _combine_auto_stage_records(stage_results)
+                    candidates = [
+                        {
+                            "candidate_id": record["candidate_id"],
+                            "params": record["params"],
+                        }
+                        for record in ranked[:keep_count]
+                        if math.isfinite(record["robust_score"])
+                    ]
+                    _write_candidate_plan(plan_path, cycle, stage, candidates)
+                state.update({
+                    "stage": stage, "stage_completed": 0, "updated_at": _timestamp_now(),
+                })
+                _write_json(state_path, state)
+                records, interrupted = _run_auto_stage(
+                    args, cycle, stage, candidates, *ranges[stage], base_tune,
+                    cycle_dir, state, state_path,
+                )
+                stage_results[stage] = records
+                if interrupted:
+                    _write_auto_reports(
+                        output_dir, hall, importance, state, keys,
+                        excel_enabled=bool(args.excel_top),
+                    )
+                    return hall[0] if hall else None
+
+            finalists = _combine_auto_stage_records(stage_results)
+            hall = _merge_hall_of_fame(
+                hall, finalists, cycle, keys, base_tune, args.auto_hall_size
+            )
+            state.update({
+                "cycles_completed": state["cycles_completed"] + 1,
+                "cycle": cycle + 1,
+                "stage": "discovery",
+                "stage_completed": 0,
+                "status": "running",
+                "updated_at": _timestamp_now(),
+            })
+            _write_json(state_path, state)
+            _write_auto_reports(
+                output_dir, hall, importance, state, keys,
+                excel_enabled=bool(args.excel_top),
+            )
+            best_text = (
+                f"{hall[0]['robust_score']:.4f}" if hall else "no qualified finalist"
+            )
+            important = sorted(
+                importance.items(), key=lambda pair: pair[1]["weight"], reverse=True
+            )[:5]
+            print(
+                f"Cycle {cycle} complete | Hall of Fame: {len(hall)} | best: {best_text}"
+            )
+            print(
+                "Most influential parameters: "
+                + ", ".join(f"{key} ({item['weight']:.1%})" for key, item in important)
+            )
+    except KeyboardInterrupt:
+        state.update({"status": "interrupted", "updated_at": _timestamp_now()})
+        _write_json(state_path, state)
+        _write_auto_reports(
+            output_dir, hall, importance, state, keys,
+            excel_enabled=bool(args.excel_top),
+        )
+        print("\nAuto mode stopped safely. Use --auto --resume to continue.")
+        return hall[0] if hall else None
+
+    state.update({"status": "completed", "updated_at": _timestamp_now()})
+    _write_json(state_path, state)
+    _write_auto_reports(
+        output_dir, hall, importance, state, keys,
+        excel_enabled=bool(args.excel_top),
+    )
+    print(
+        f"Auto campaign stopped after {state['cycles_completed']} completed cycle(s). "
+        f"Resume with --auto --resume."
+    )
+    return hall[0] if hall else None
+
+
 def run_optimization(args, grid=None):
     profile = getattr(args, "profile", "focused")
     grid = PARAMETER_PROFILES[profile] if grid is None else grid
@@ -1058,7 +2090,13 @@ def run_optimization(args, grid=None):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="Optimize ma_strategy in full-grid or smart mode.")
+    parser = argparse.ArgumentParser(
+        description="Optimize ma_strategy in grid, smart, or continuous auto mode."
+    )
+    parser.add_argument(
+        "--auto", action="store_true",
+        help="run endless staged discovery/validation/stress/final optimization",
+    )
     parser.add_argument("--mode", choices=("smart", "grid"), default="smart",
                         help="smart uses a test budget; grid evaluates the full Cartesian product")
     parser.add_argument("--tests", type=int, default=5000,
@@ -1096,7 +2134,7 @@ def build_parser():
                         help="disqualify candidates with fewer closed trades")
     parser.add_argument("--max-drawdown", type=float,
                         help="disqualify candidates whose absolute drawdown exceeds this percent")
-    parser.add_argument("--output-dir", default=os.path.join("outputs", "optimize"))
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--resume", action="store_true",
                         help="continue a compatible CSV checkpoint in output-dir")
     parser.add_argument("--log-every", type=int, default=10,
@@ -1111,6 +2149,52 @@ def build_parser():
                         help="show optimization profiles and exit")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the planned search size without evaluating candidates")
+    parser.add_argument(
+        "--auto-tests", type=int, default=2000,
+        help="new discovery candidates generated in every auto cycle (default: 2000)",
+    )
+    parser.add_argument(
+        "--auto-validation-top", type=int, default=30,
+        help="discovery finalists sent to the independent validation range",
+    )
+    parser.add_argument(
+        "--auto-stress-top", type=int, default=10,
+        help="validation finalists sent to the older stress range",
+    )
+    parser.add_argument(
+        "--auto-final-top", type=int, default=3,
+        help="stress finalists tested on the complete market range",
+    )
+    parser.add_argument(
+        "--auto-hall-size", type=int, default=20,
+        help="maximum robust winners retained across all auto cycles",
+    )
+    parser.add_argument(
+        "--auto-cycles", type=int, default=0,
+        help="stop after N completed cycles (0 runs until Ctrl+C)",
+    )
+    parser.add_argument(
+        "--auto-discovery-start", default="2025-01-01",
+        help="start of the recent discovery range",
+    )
+    parser.add_argument(
+        "--auto-validation-start", default="2023-01-01",
+        help="start of validation; it ends at auto-discovery-start",
+    )
+    parser.add_argument(
+        "--auto-stress-start", default="2019-01-01",
+        help="start of stress testing and the complete final range",
+    )
+    parser.add_argument(
+        "--auto-end", default="latest",
+        help="exclusive campaign end or 'latest' to detect the final candle",
+    )
+    parser.add_argument(
+        "--auto-importance-target",
+        choices=("objective_score", "total_profit", "total_profit_percent"),
+        default="objective_score",
+        help="metric used to learn which parameters deserve more mutations",
+    )
     return parser
 
 
@@ -1136,10 +2220,43 @@ def main(argv=None):
         raise SystemExit("--top-n must be greater than zero")
     if args.excel_top < 0:
         raise SystemExit("--excel-top cannot be negative")
+    if args.auto_tests <= 0:
+        raise SystemExit("--auto-tests must be greater than zero")
+    if min(
+        args.auto_validation_top, args.auto_stress_top,
+        args.auto_final_top, args.auto_hall_size,
+    ) <= 0:
+        raise SystemExit("auto funnel and Hall of Fame sizes must be greater than zero")
+    if not (
+        args.auto_tests >= args.auto_validation_top
+        >= args.auto_stress_top >= args.auto_final_top
+    ):
+        raise SystemExit(
+            "auto funnel must satisfy: auto-tests >= auto-validation-top >= "
+            "auto-stress-top >= auto-final-top"
+        )
+    if args.auto_cycles < 0:
+        raise SystemExit("--auto-cycles cannot be negative")
     if bool(args.validation_start) != bool(args.validation_end):
         raise SystemExit("--validation-start and --validation-end must be used together")
     if args.dry_run:
         selected_grid = PARAMETER_PROFILES[args.profile]
+        if args.auto:
+            resolved_end = _latest_market_end() if args.auto_end == "latest" else args.auto_end
+            ranges = _auto_ranges(args, resolved_end)
+            _validate_auto_ranges(ranges)
+            print("Mode: auto")
+            print(f"Profile: {args.profile} ({len(selected_grid)} parameters)")
+            print(
+                f"Funnel per cycle: {args.auto_tests:,} -> "
+                f"{args.auto_validation_top} -> {args.auto_stress_top} -> "
+                f"{args.auto_final_top}"
+            )
+            print(f"Cycles: {'unlimited' if args.auto_cycles == 0 else args.auto_cycles}")
+            print(f"Workers: {args.workers}")
+            for stage in AUTO_STAGE_ORDER:
+                print(f"{stage.title()}: {ranges[stage][0]} -> {ranges[stage][1]}")
+            return
         planned = (
             min(args.tests, grid_size(selected_grid))
             if args.mode == "smart"
@@ -1152,7 +2269,12 @@ def main(argv=None):
         print(f"Range: {args.start} -> {args.end}")
         return
     multiprocessing.freeze_support()
-    run_optimization(args)
+    if args.auto:
+        if args.output_dir == DEFAULT_OUTPUT_DIR:
+            args.output_dir = os.path.join(DEFAULT_OUTPUT_DIR, "auto")
+        run_auto_optimization(args)
+    else:
+        run_optimization(args)
 
 
 if __name__ == "__main__":

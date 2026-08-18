@@ -41,6 +41,9 @@ python ma_strategy.py --start 2025-01-01 --end 2026-01-01 `
 # Reproducible smart optimization
 python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
   --start 2023-01-01 --end 2025-01-01
+
+# Continuous staged search; stop safely with Ctrl+C
+python optimize.py --auto -w 16
 ```
 
 ## `ma_strategy.py` manual
@@ -243,7 +246,7 @@ python optimize.py --profile risk --mode grid --dry-run
 
 | Profile | Intended use |
 |---|---|
-| `focused` | MA periods and leverage/safety tiers; practical starting point. |
+| `focused` | Entry/exit score thresholds and score weights; practical starting point. |
 | `signal` | Entry thresholds, indicators, filters, and entry weights. |
 | `exit` | Exit thresholds, trailing behavior, guards, and exit weights. |
 | `risk` | Sizing, leverage, monthly rules, cooldowns, and scale-ins. |
@@ -304,6 +307,66 @@ validation_results.json       out-of-sample finalist details
 ```
 
 JSON writes are atomic. CSV is flushed after each batch for reliable resume. Workers receive the base parameter set once at startup and only candidate deltas are transferred per task. Smart mode combines exploration and crossover with deterministic one-step refinement around elite candidates while suppressing duplicate effective configurations.
+
+### Continuous Auto mode
+
+`--auto` runs a resumable campaign until `Ctrl+C`. Every cycle uses a non-overlapping robustness funnel: 2,000 recent discovery tests, 30 validation finalists, 10 older stress finalists, and 3 full-history finalists. The default ranges are:
+
+```text
+Discovery    2025-01-01 -> latest candle
+Validation   2023-01-01 -> 2025-01-01
+Stress       2019-01-01 -> 2023-01-01
+Final        2019-01-01 -> latest candle
+```
+
+```powershell
+# Start an unlimited campaign; default output is outputs/optimize/auto
+python .\optimize.py --auto -w 16
+
+# Stop safely
+# Press Ctrl+C once
+
+# Continue the exact cycle and stage
+python .\optimize.py --auto --resume -w 16
+
+# Inspect the plan without running backtests
+python .\optimize.py --auto --dry-run -w 16
+
+# Run two cycles for a bounded experiment
+python .\optimize.py --auto --auto-cycles 2 -w 16 `
+  --output-dir outputs/optimize/auto_two_cycles
+```
+
+After the first cycle, Auto mode can create numeric values not present in the coarse grid. For example, an elite value of `20` in `[10, 20, 30]` produces local tests such as `19` and `21`. Float gaps become finer across cycles. Values remain inside the original numeric bounds, boolean/enum parameters remain discrete, invalid relationships are rejected, and previously planned discovery combinations are not repeated.
+
+Auto mode learns parameter importance from completed discovery results. Approximately 60% of each later cycle searches locally around Hall-of-Fame winners, 25% remains random exploration, and 15% crosses strong candidates. High-effect parameters receive more mutations and neighbor tests, while every parameter retains an exploration floor. The safe default target is `objective_score`, which includes profit and risk; use `--auto-importance-target total_profit` only when raw profit is intentionally preferred.
+
+| Auto option | Default | Meaning |
+|---|---:|---|
+| `--auto` | off | Start the continuous staged campaign. |
+| `--auto-tests N` | `2000` | New discovery candidates per cycle. |
+| `--auto-validation-top N` | `30` | Discovery finalists sent to validation. |
+| `--auto-stress-top N` | `10` | Validation finalists sent to stress testing. |
+| `--auto-final-top N` | `3` | Stress finalists sent to the full-range test. |
+| `--auto-hall-size N` | `20` | Winners retained across cycles. |
+| `--auto-cycles N` | `0` | Completed-cycle limit; `0` means until `Ctrl+C`. |
+| `--auto-discovery-start VALUE` | `2025-01-01` | Recent discovery start. |
+| `--auto-validation-start VALUE` | `2023-01-01` | Validation start; ends at discovery start. |
+| `--auto-stress-start VALUE` | `2019-01-01` | Stress and complete-history start. |
+| `--auto-end VALUE` | `latest` | Exclusive end; `latest` detects the dataset automatically. |
+| `--auto-importance-target METRIC` | `objective_score` | Importance target: objective score, profit, or profit %. |
+
+Auto checkpoints are flushed per result and stored per cycle/stage. Resume requires the same profile, grid, base parameters, ranges, funnel sizes, and risk constraints. Worker count and logging frequency may change.
+
+```text
+auto_state.json              exact campaign/cycle/stage checkpoint
+best_params.json             best robust Hall-of-Fame parameters
+hall_of_fame.json/.csv       cross-cycle robust winners
+parameter_importance.json/.csv learned mutation priorities
+auto_summary.json            campaign status and best result
+auto_report.xlsx             Hall of Fame and Parameter Importance sheets
+cycles/cycle_*/              plans and result CSVs for every stage
+```
 
 ## Testing
 

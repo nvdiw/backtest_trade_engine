@@ -51,6 +51,9 @@ python ma_strategy.py --start 2025-01-01 --end 2026-01-01 `
 # بهینه‌سازی هوشمند و تکرارپذیر
 python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
   --start 2023-01-01 --end 2025-01-01
+
+# جست‌وجوی مرحله‌ای پیوسته؛ توقف امن با Ctrl+C
+python optimize.py --auto -w 16
 ```
 
 ## دفترچه راهنمای `ma_strategy.py`
@@ -257,7 +260,7 @@ python optimize.py --profile risk --mode grid --dry-run
 
 | Profile | کاربرد |
 |---|---|
-| `focused` | دوره‌های MA و سطح‌های leverage ایمن؛ شروع عملی و سریع‌تر. |
+| `focused` | آستانه‌ها و وزن‌های امتیاز ورود و خروج؛ شروع عملی و سریع‌تر. |
 | `signal` | شرط‌های ورود، indicatorها، filterها و وزن‌های ورود. |
 | `exit` | شرط خروج، trailing، guardها و وزن‌های خروج. |
 | `risk` | حجم معامله، اهرم، قوانین ماهانه، cooldown و scale-in. |
@@ -318,6 +321,65 @@ validation_results.json       جزئیات finalistهای خارج از نمون
 ```
 
 نوشتن JSON اتمیک است و CSV بعد از هر batch flush می‌شود تا ادامه اجرا با `--resume` قابل‌اعتمادتر باشد. تنظیمات پایه فقط یک‌بار به هر worker ارسال می‌شوند و هر task تنها تغییرات candidate را منتقل می‌کند. Smart Search علاوه بر exploration و crossover، همسایه‌های یک‌مرحله‌ای eliteها را به‌شکل deterministic بررسی می‌کند و ترکیب‌های مؤثر تکراری را کنار می‌گذارد.
+
+### حالت پیوسته Auto
+
+گزینه `--auto` یک کمپین قابل‌ادامه را تا زمان زدن `Ctrl+C` اجرا می‌کند. هر چرخه دارای قیف پایداری با بازه‌های مستقل است: ۲۰۰۰ تست روی داده جدید، ۳۰ finalist برای validation، سپس ۱۰ مورد برای stress و در پایان ۳ مورد روی کل تاریخچه. بازه‌های پیش‌فرض عبارت‌اند از:
+
+```text
+Discovery    2025-01-01 -> آخرین کندل
+Validation   2023-01-01 -> 2025-01-01
+Stress       2019-01-01 -> 2023-01-01
+Final        2019-01-01 -> آخرین کندل
+```
+
+```powershell
+# شروع اجرای نامحدود؛ خروجی پیش‌فرض outputs/optimize/auto است
+python .\optimize.py --auto -w 16
+
+# برای توقف امن یک‌بار Ctrl+C بزنید
+
+# ادامه دقیق همان چرخه و مرحله
+python .\optimize.py --auto --resume -w 16
+
+# دیدن برنامه بدون اجرای بک‌تست
+python .\optimize.py --auto --dry-run -w 16
+
+# آزمایش محدود دوچرخه‌ای
+python .\optimize.py --auto --auto-cycles 2 -w 16 `
+  --output-dir outputs/optimize/auto_two_cycles
+```
+
+پس از چرخه اول، Auto می‌تواند مقادیر عددی خارج از grid اولیه بسازد. مثلاً اگر مقدار `20` از `[10, 20, 30]` برنده شود، مقادیری مانند `19` و `21` نیز تست می‌شوند. فاصله floatها در چرخه‌های بعد دقیق‌تر می‌شود. اعداد داخل مرز حداقل و حداکثر grid می‌مانند، boolean و enum همچنان گسسته هستند، روابط نامعتبر حذف می‌شوند و ترکیب‌های discovery قبلی تکرار نمی‌شوند.
+
+Auto از نتایج Discovery یاد می‌گیرد کدام پارامترها اثر بیشتری دارند. تقریباً ۶۰٪ چرخه بعد جست‌وجوی محلی اطراف برندگان Hall of Fame، حدود ۲۵٪ exploration تصادفی و ۱۵٪ crossover است. پارامترهای اثرگذار mutation و تست همسایه بیشتری می‌گیرند، اما برای جلوگیری از قفل‌شدن زودهنگام همه متغیرها حداقل شانس جست‌وجو دارند. معیار امن پیش‌فرض `objective_score` است که سود و ریسک را با هم می‌سنجد؛ برای اولویت‌دادن عمدی به سود خام می‌توان `--auto-importance-target total_profit` را استفاده کرد.
+
+| گزینه Auto | پیش‌فرض | کاربرد |
+|---|---:|---|
+| `--auto` | خاموش | شروع کمپین پیوسته و مرحله‌ای. |
+| `--auto-tests N` | `2000` | تعداد candidate جدید Discovery در هر چرخه. |
+| `--auto-validation-top N` | `30` | تعداد برندگان Discovery برای Validation. |
+| `--auto-stress-top N` | `10` | تعداد برندگان Validation برای Stress. |
+| `--auto-final-top N` | `3` | تعداد برندگان Stress برای تست کل تاریخچه. |
+| `--auto-hall-size N` | `20` | تعداد برندگان نگه‌داری‌شده بین چرخه‌ها. |
+| `--auto-cycles N` | `0` | محدودیت چرخه؛ صفر یعنی ادامه تا `Ctrl+C`. |
+| `--auto-discovery-start VALUE` | `2025-01-01` | شروع بازه جدید Discovery. |
+| `--auto-validation-start VALUE` | `2023-01-01` | شروع Validation؛ پایان آن شروع Discovery است. |
+| `--auto-stress-start VALUE` | `2019-01-01` | شروع Stress و تاریخچه کامل. |
+| `--auto-end VALUE` | `latest` | پایان exclusive؛ مقدار latest آخرین کندل را پیدا می‌کند. |
+| `--auto-importance-target METRIC` | `objective_score` | معیار اهمیت: امتیاز نهایی، سود یا درصد سود. |
+
+نتیجه هر تست بلافاصله flush می‌شود و برای هر چرخه و مرحله checkpoint جدا وجود دارد. برای Resume باید profile، grid، پارامتر پایه، بازه‌ها، اندازه قیف و محدودیت‌های ریسک یکسان بمانند؛ تعداد worker و فاصله گزارش را می‌توان تغییر داد.
+
+```text
+auto_state.json              وضعیت دقیق کمپین، چرخه و مرحله
+best_params.json             بهترین پارامتر مقاوم Hall of Fame
+hall_of_fame.json/.csv       برندگان پایدار بین چرخه‌ها
+parameter_importance.json/.csv اولویت یادگرفته‌شده پارامترها
+auto_summary.json            خلاصه وضعیت و بهترین نتیجه
+auto_report.xlsx             برگه‌های Hall of Fame و اهمیت پارامترها
+cycles/cycle_*/              برنامه و CSV نتیجه هر مرحله
+```
 
 ## اجرای تست‌ها
 

@@ -10,8 +10,9 @@ from unittest.mock import patch
 from openpyxl import load_workbook
 
 from optimize import (
-    SmartCandidateGenerator, _robust_validation_score, build_parser, grid_size,
-    iter_grid_candidates, param_grid, run_optimization,
+    SmartCandidateGenerator, _learn_parameter_importance,
+    _robust_validation_score, build_parser, grid_size, iter_grid_candidates,
+    param_grid, run_auto_optimization, run_optimization,
 )
 from ma_strategy import resolve_parameter_source
 from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
@@ -28,6 +29,13 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertTrue(args.dry_run)
         self.assertEqual(args.top_n, 7)
         self.assertEqual(args.output_dir, "custom-output")
+
+        auto_args = build_parser().parse_args(["--auto"])
+        self.assertTrue(auto_args.auto)
+        self.assertEqual(auto_args.auto_tests, 2000)
+        self.assertEqual(auto_args.auto_validation_top, 30)
+        self.assertEqual(auto_args.auto_stress_top, 10)
+        self.assertEqual(auto_args.auto_final_top, 3)
 
     def test_grid_is_complete_and_deterministic(self):
         grid = {"a": [1, 2], "b": ["x", "y", "z"]}
@@ -82,6 +90,145 @@ class OptimizerSearchTests(unittest.TestCase):
             [candidate["entry_score_threshold"] for candidate in generator.local_queue],
             [7, 9],
         )
+
+    def test_auto_refinement_creates_values_between_grid_points(self):
+        generator = SmartCandidateGenerator(
+            {"ma_50_period": [10, 20, 30]},
+            seed=11,
+            continuous_refinement=True,
+        )
+        generator.seen.add((20,))
+        generator._queue_elite_neighbors([
+            {"params": {"ma_50_period": 20}}
+        ])
+
+        self.assertEqual(
+            [candidate["ma_50_period"] for candidate in generator.local_queue],
+            [19, 21],
+        )
+
+    def test_parameter_importance_favors_variables_with_large_score_effect(self):
+        records = []
+        for index in range(40):
+            important = index % 2
+            noise = (index // 2) % 2
+            records.append({
+                "params": {"important": important, "noise": noise},
+                "objective_score": important * 100 + noise,
+                "result": {},
+            })
+
+        learned = _learn_parameter_importance(
+            records, ("important", "noise"), target="objective_score"
+        )
+
+        self.assertGreater(learned["important"]["weight"], learned["noise"]["weight"])
+
+    def test_auto_mode_runs_full_funnel_and_writes_resumable_state(self):
+        args = build_parser().parse_args([
+            "--auto", "--auto-tests", "4", "--auto-validation-top", "3",
+            "--auto-stress-top", "2", "--auto-final-top", "1",
+            "--auto-cycles", "1", "--auto-stress-start", "0",
+            "--auto-validation-start", "20", "--auto-discovery-start", "30",
+            "--auto-end", "40", "--workers", "1", "--log-every", "0",
+            "--excel-top", "1",
+        ])
+
+        def fake_strategy(tune, start, end):
+            value = tune["x"]
+            return {
+                "score": value,
+                "total_profit": value * 10,
+                "total_profit_percent": value,
+                "closed_trades": 10,
+                "maximum_drawdown": -1,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=fake_strategy
+            ) as strategy:
+                best = run_auto_optimization(args, grid={"x": [1, 2, 3, 4]})
+            state = json.loads(
+                (Path(temp_dir) / "auto_state.json").read_text(encoding="utf-8")
+            )
+            saved = json.loads(
+                (Path(temp_dir) / "best_params.json").read_text(encoding="utf-8")
+            )
+            workbook = load_workbook(
+                Path(temp_dir) / "auto_report.xlsx", read_only=True
+            )
+            auto_sheets = workbook.sheetnames
+            workbook.close()
+
+        self.assertEqual(strategy.call_count, 10)
+        self.assertEqual(state["cycles_completed"], 1)
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(saved, {"x": 4})
+        self.assertEqual(best["params"], {"x": 4})
+        self.assertEqual(auto_sheets, ["Hall of Fame", "Parameter Importance"])
+
+    def test_auto_resume_continues_the_interrupted_stage(self):
+        args = build_parser().parse_args([
+            "--auto", "--auto-tests", "2", "--auto-validation-top", "2",
+            "--auto-stress-top", "1", "--auto-final-top", "1",
+            "--auto-cycles", "1", "--auto-stress-start", "0",
+            "--auto-validation-start", "20", "--auto-discovery-start", "30",
+            "--auto-end", "40", "--workers", "1", "--log-every", "0",
+            "--excel-top", "0",
+        ])
+
+        def fake_strategy(tune, start, end):
+            value = tune["x"]
+            return {
+                "score": value,
+                "total_profit": value,
+                "closed_trades": 2,
+                "maximum_drawdown": -1,
+            }
+
+        interrupted_calls = 0
+
+        def interrupt_after_one_result(tune, start, end):
+            nonlocal interrupted_calls
+            interrupted_calls += 1
+            if interrupted_calls == 2:
+                raise KeyboardInterrupt
+            return fake_strategy(tune, start, end)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=interrupt_after_one_result
+            ):
+                first = run_auto_optimization(args, grid={"x": [1, 2]})
+            interrupted_state = json.loads(
+                (Path(temp_dir) / "auto_state.json").read_text(encoding="utf-8")
+            )
+
+            args.resume = True
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=fake_strategy
+            ):
+                resumed = run_auto_optimization(args, grid={"x": [1, 2]})
+            completed_state = json.loads(
+                (Path(temp_dir) / "auto_state.json").read_text(encoding="utf-8")
+            )
+            with (
+                Path(temp_dir) / "cycles" / "cycle_000001" / "discovery_results.csv"
+            ).open(encoding="utf-8") as results_file:
+                discovery_rows = list(csv.DictReader(results_file))
+
+        self.assertIsNone(first)
+        self.assertEqual(interrupted_state["status"], "interrupted")
+        self.assertEqual(interrupted_state["stage_completed"], 1)
+        self.assertEqual(completed_state["status"], "completed")
+        self.assertEqual(completed_state["cycles_completed"], 1)
+        self.assertEqual(completed_state["total_evaluations"], 6)
+        self.assertEqual(len(discovery_rows), 2)
+        self.assertEqual(len({row["candidate_id"] for row in discovery_rows}), 2)
+        self.assertEqual(resumed["params"], {"x": 2})
 
     def test_inactive_filter_parameters_collapse_to_one_effective_signature(self):
         generator = SmartCandidateGenerator({
