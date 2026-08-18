@@ -78,7 +78,7 @@ def ma_strategy(
     chart_file=None,
     verbose=None,
     write_trades=None,
-    write_excel=False,
+    write_excel=True,
     output_dir="outputs",
 ):
     """Run the MA strategy over ``start`` (inclusive) to ``end`` (exclusive).
@@ -2092,8 +2092,15 @@ def build_parser():
                         help="suppress per-trade and summary console output")
     parser.add_argument("--no-trade-log", action="store_true",
                         help="do not write trade CSV/XLSX or monthly CSV")
-    parser.add_argument("--excel", action="store_true",
-                        help="also create a formatted XLSX trade report")
+    excel_group = parser.add_mutually_exclusive_group()
+    excel_group.add_argument(
+        "--excel", dest="excel", action="store_true", default=True,
+        help="create the formatted multi-sheet XLSX report (default)",
+    )
+    excel_group.add_argument(
+        "--no-excel", dest="excel", action="store_false",
+        help="skip the XLSX report and write only CSV files",
+    )
     parser.add_argument("--output-dir", default="outputs",
                         help="root directory for trade and monthly reports")
     parser.add_argument("--result-json", metavar="FILE",

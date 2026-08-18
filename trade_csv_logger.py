@@ -37,7 +37,7 @@ class TradeCSVLogger:
         "reason",
     ]
 
-    def __init__(self, optimize: bool = False, write_excel: bool = False):
+    def __init__(self, optimize: bool = False, write_excel: bool = True):
         self.optimize = bool(optimize)
         self.write_excel = bool(write_excel)
         if self.optimize:
@@ -148,7 +148,10 @@ class TradeCSVLogger:
         if df.empty:
             df = pd.DataFrame([summary_row_full], columns=self.COLUMNS)
         else:
-            df.loc[len(df), self.COLUMNS] = [summary_row_full[col] for col in self.COLUMNS]
+            df = pd.concat(
+                [df, pd.DataFrame([summary_row_full], columns=self.COLUMNS)],
+                ignore_index=True,
+            )
         while True:
             try:
                 output_dir = os.path.dirname(file_name)
@@ -164,46 +167,124 @@ class TradeCSVLogger:
                     print("thanks!")
 
     def _save_colored_excel(self, df: pd.DataFrame, csv_file_name: str):
-        """
-        CSV cannot store background colors.
-        Create a companion XLSX with very light-blue rows for trades
-        that share the same close_time (2+ trades closed together).
-        """
+        """Create a polished multi-sheet workbook alongside the raw CSV."""
         if df.empty:
             return
 
         try:
             from openpyxl import load_workbook
-            from openpyxl.styles import PatternFill
+            from openpyxl.styles import Alignment, Font, PatternFill
+            from openpyxl.utils import get_column_letter
+            from openpyxl.worksheet.table import Table, TableStyleInfo
         except Exception:
             return
 
         excel_file_name = os.path.splitext(csv_file_name)[0] + ".xlsx"
-        df.to_excel(excel_file_name, index=False)
+        summary_df = df[df["type"] == "SUMMARY"].copy()
+        trades_df = df[df["type"] != "SUMMARY"].copy()
+        trade_ids = trades_df["trade_id"].fillna("").astype(str)
+        rsi_df = trades_df[trade_ids.str.startswith("rsi_ma_strategy_")].copy()
+        scale_df = trades_df[trade_ids.str.startswith("scale_ma_strategy_")].copy()
+        main_df = trades_df[
+            ~trade_ids.str.startswith(("rsi_ma_strategy_", "scale_ma_strategy_"))
+        ].copy()
 
-        close_times = [str(x) for x in df.get("close_time", [])]
-        types = [str(x) for x in df.get("type", [])]
+        summary_values = summary_df.iloc[0].to_dict() if not summary_df.empty else {}
+        overview = pd.DataFrame([
+            ("Start time", summary_values.get("open_time")),
+            ("End time", summary_values.get("close_time")),
+            ("Starting balance", summary_values.get("balance_before")),
+            ("Final balance", summary_values.get("balance_after")),
+            ("Total profit", summary_values.get("profit")),
+            ("Total profit %", summary_values.get("profit_percent")),
+            ("Total fees", summary_values.get("fee_paid")),
+            ("Closed trades", len(trades_df)),
+            ("Main trades", len(main_df)),
+            ("RSI trades", len(rsi_df)),
+            ("Scale trades", len(scale_df)),
+        ], columns=["Metric", "Value"])
+
+        sheets = {
+            "Overview": overview,
+            "All Trades": trades_df,
+            "Main Strategy": main_df,
+            "RSI Strategy": rsi_df,
+            "Scale Strategy": scale_df,
+        }
+        with pd.ExcelWriter(excel_file_name, engine="openpyxl") as writer:
+            for sheet_name, sheet_df in sheets.items():
+                sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)
+
+        close_times = [str(x) for x in trades_df.get("close_time", [])]
+        types = [str(x) for x in trades_df.get("type", [])]
         valid_close_times = [
             ct for ct, t in zip(close_times, types)
             if ct and ct.lower() != "none" and t != "SUMMARY"
         ]
         close_counts = Counter(valid_close_times)
         multi_close_times = {ct for ct, c in close_counts.items() if c >= 2}
-        if not multi_close_times:
-            return
-
         wb = load_workbook(excel_file_name)
-        ws = wb.active
-        fill = PatternFill(fill_type="solid", fgColor="EAF4FF")  # very light blue
+        header_fill = PatternFill("solid", fgColor="17365D")
+        header_font = Font(color="FFFFFF", bold=True)
+        profit_fill = PatternFill("solid", fgColor="E2F0D9")
+        loss_fill = PatternFill("solid", fgColor="FCE4D6")
+        grouped_fill = PatternFill("solid", fgColor="DDEBF7")
+        money_columns = {
+            "entry_price", "close_price", "tactical_balance", "balance_before",
+            "balance_after", "total_assets", "amount", "profit", "fee_paid",
+            "save_money",
+        }
+        percent_columns = {
+            "profit_percent", "pnl_percent", "trade_amount_percent",
+            "profit_percent_per_month",
+        }
 
-        # Row 1 is header, data starts from row 2
-        for idx, row in enumerate(df.itertuples(index=False), start=2):
-            row_type = str(getattr(row, "type", ""))
-            row_close_time = str(getattr(row, "close_time", ""))
-            if row_type == "SUMMARY":
-                continue
-            if row_close_time in multi_close_times:
-                for col in range(1, ws.max_column + 1):
-                    ws.cell(row=idx, column=col).fill = fill
+        for sheet_index, ws in enumerate(wb.worksheets, start=1):
+            ws.freeze_panes = "A2"
+            ws.auto_filter.ref = ws.dimensions
+            ws.sheet_view.showGridLines = False
+            ws.row_dimensions[1].height = 24
+            for cell in ws[1]:
+                cell.fill = header_fill
+                cell.font = header_font
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+            headers = {cell.value: cell.column for cell in ws[1]}
+            for column_index, cells in enumerate(ws.columns, start=1):
+                values = [str(cell.value or "") for cell in cells[:250]]
+                width = min(55, max(11, max(map(len, values), default=10) + 2))
+                ws.column_dimensions[get_column_letter(column_index)].width = width
+            for name in money_columns:
+                column_index = headers.get(name)
+                if column_index:
+                    for row_index in range(2, ws.max_row + 1):
+                        ws.cell(row_index, column_index).number_format = '$#,##0.00;[Red]-$#,##0.00'
+            for name in percent_columns:
+                column_index = headers.get(name)
+                if column_index:
+                    for row_index in range(2, ws.max_row + 1):
+                        ws.cell(row_index, column_index).number_format = '0.00"%";[Red]-0.00"%"'
+            if ws.max_row >= 2:
+                table = Table(
+                    displayName=f"TradeReportTable{sheet_index}", ref=ws.dimensions
+                )
+                table.tableStyleInfo = TableStyleInfo(
+                    name="TableStyleMedium2", showRowStripes=True,
+                    showFirstColumn=False, showLastColumn=False,
+                    showColumnStripes=False,
+                )
+                ws.add_table(table)
+
+            profit_column = headers.get("profit")
+            close_time_column = headers.get("close_time")
+            if profit_column:
+                for row_index in range(2, ws.max_row + 1):
+                    profit = ws.cell(row_index, profit_column).value
+                    row_fill = profit_fill if isinstance(profit, (int, float)) and profit >= 0 else loss_fill
+                    if close_time_column:
+                        close_time = str(ws.cell(row_index, close_time_column).value)
+                        if close_time in multi_close_times:
+                            row_fill = grouped_fill
+                    for column_index in range(1, ws.max_column + 1):
+                        ws.cell(row_index, column_index).fill = row_fill
 
         wb.save(excel_file_name)

@@ -209,6 +209,11 @@ class StrategyCliTests(unittest.TestCase):
         self.assertTrue(args.excel)
         self.assertEqual(args.save_chart, "chart.png")
 
+        defaults = build_parser().parse_args([])
+        csv_only = build_parser().parse_args(["--no-excel"])
+        self.assertTrue(defaults.excel)
+        self.assertFalse(csv_only.excel)
+
 
 if __name__ == "__main__":
     unittest.main()

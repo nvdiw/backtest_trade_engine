@@ -19,11 +19,11 @@
 
 - Python 3.9 یا جدیدتر
 - `pandas`، `numpy`، `matplotlib` و `mplfinance`
-- برای خروجی Excel اختیاری: `openpyxl`
+- `openpyxl` برای گزارش‌های قالب‌بندی‌شده Excel
 
 ```powershell
 python -m pip install pandas numpy matplotlib mplfinance
-python -m pip install openpyxl  # فقط برای --excel
+python -m pip install openpyxl
 ```
 
 مسیر پیش‌فرض داده در `fetch_calculate_data.py` تنظیم شده است:
@@ -88,7 +88,8 @@ python ma_strategy.py --start 100000 --end 120000
 | `--save-chart FILE` | — | ذخیره چارت با فرمت PNG/PDF/SVG. |
 | `--quiet` | خاموش | عدم نمایش پیام معامله‌ها و گزارش متنی. |
 | `--no-trade-log` | خاموش | نساختن CSV معاملات، CSV ماهانه و Excel. |
-| `--excel` | خاموش | ساخت XLSX قالب‌بندی‌شده؛ چون کندتر است اختیاری شده. |
+| `--excel` | روشن | ساخت گزارش XLSX چندبرگه‌ای؛ برای سازگاری نگه داشته شده است. |
+| `--no-excel` | خاموش | نساختن XLSX و نگه‌داشتن فقط خروجی‌های CSV. |
 | `--output-dir DIR` | `outputs` | پوشه اصلی گزارش معاملات و گزارش ماهانه. |
 | `--result-json FILE` | — | ذخیره دیکشنری نتیجه نهایی در JSON. |
 | `--print-result` | خاموش | چاپ دیکشنری نتیجه نهایی به‌صورت JSON. |
@@ -147,8 +148,8 @@ python ma_strategy.py --output-dir outputs/runs/conservative `
   --result-json outputs/runs/conservative/result.json `
   --set leverage=3 --set trade_amount_percent=0.25
 
-# ساخت CSV، گزارش ماهانه و Excel بدون چارت
-python ma_strategy.py --excel --no-chart
+# ساخت CSV، گزارش ماهانه و Excel پیش‌فرض بدون چارت
+python ma_strategy.py --no-chart
 ```
 
 ### فایل‌های خروجی بک‌تست
@@ -158,11 +159,13 @@ python ma_strategy.py --excel --no-chart
 ```text
 outputs/
 ├── trades/data_orders.csv
-├── trades/data_orders.xlsx       # فقط با --excel
+├── trades/data_orders.xlsx       # پیش‌فرض؛ غیرفعال‌سازی با --no-excel
 └── monthly/monthly_data_orders.csv
 ```
 
-نتیجه نهایی شامل موجودی نهایی، سود کل، realized و unrealized، تعداد پوزیشن باز، درصد بازده، تعداد معاملات بسته، برد و باخت، win rate، maximum drawdown، score، profit factor، expectancy، Calmar ratio و آمار بخش‌های MA و RSI است.
+فایل XLSX دارای سربرگ ثابت، فیلتر، رنگ‌بندی سود و زیان و برگه‌های جداگانه Overview، All Trades، Main Strategy، RSI Strategy و Scale Strategy است. فایل CSV خام برای پردازش برنامه‌ای نیز حفظ می‌شود.
+
+نتیجه نهایی شامل موجودی نهایی، سود کل، realized و unrealized، تعداد پوزیشن باز، درصد بازده، تعداد معاملات بسته، برد و باخت، win rate، maximum drawdown، score، profit factor، expectancy، Calmar ratio و آمار بخش‌های MA، RSI و Scale است.
 
 ### کنترل‌های چارت تعاملی
 
@@ -240,6 +243,7 @@ optimizer هنگام ارزیابی کاندیدها چارت، پیام‌ها�
 | `--resume` | خاموش | ادامه یک `optimization_results.csv` سازگار. |
 | `--log-every N` | `10` | فاصله چاپ پیشرفت؛ صفر یعنی بدون گزارش پیشرفت. |
 | `--top-n N` | `20` | تعداد گزینه‌های ذخیره‌شده در `top_results.json`. |
+| `--excel-top N` | `5000` | تعداد بهترین candidateها در XLSX؛ مقدار `0` گزارش Excel را غیرفعال می‌کند. |
 | `--list-profiles` | — | نمایش اندازه profileها و خروج. |
 | `--dry-run` | — | نمایش اندازه برنامه جستجو بدون اجرای تست‌ها. |
 
@@ -305,6 +309,7 @@ score از بازده، maximum drawdown، Calmar ratio، profit factor، expect
 
 ```text
 optimization_results.csv     تمام کاندیدهای تکمیل‌شده و checkpoint
+optimization_results.xlsx    برگه‌های رتبه‌بندی، پارامترها، معیارهای اصلی، RSI و Scale
 best_params.json              برنده نهایی
 optimization_summary.json     مشخصات اجرا و معیارهای برنده
 top_results.json              تعداد --top-n از بهترین نتایج
@@ -312,7 +317,7 @@ best_training_params.json     برنده train در حالت validation
 validation_results.json       جزئیات finalistهای خارج از نمونه
 ```
 
-نوشتن JSON اتمیک است و CSV بعد از هر batch flush می‌شود تا ادامه اجرا با `--resume` قابل‌اعتمادتر باشد.
+نوشتن JSON اتمیک است و CSV بعد از هر batch flush می‌شود تا ادامه اجرا با `--resume` قابل‌اعتمادتر باشد. تنظیمات پایه فقط یک‌بار به هر worker ارسال می‌شوند و هر task تنها تغییرات candidate را منتقل می‌کند. Smart Search علاوه بر exploration و crossover، همسایه‌های یک‌مرحله‌ای eliteها را به‌شکل deterministic بررسی می‌کند و ترکیب‌های مؤثر تکراری را کنار می‌گذارد.
 
 ## اجرای تست‌ها
 
@@ -324,7 +329,7 @@ python -m py_compile ma_strategy.py optimize.py trade_engine.py chart_renderer.p
 ## رفع اشکال
 
 - چارت کند است: `plot_max_candles` و `plot_max_render_candles` را کم کنید یا برای تحقیق `--no-chart` بزنید.
-- ساخت گزارش کند است: Excel اختیاری است؛ `--excel` را حذف کنید.
+- ساخت گزارش کند است: با `--no-excel` گزارش قالب‌بندی‌شده را غیرفعال کنید.
 - CSV/XLSX در Excel باز است: فایل را ببندید یا `--output-dir` دیگری انتخاب کنید.
 - optimizer حافظه زیادی می‌گیرد: ابتدا `--workers` و سپس `--batch-size` را کاهش دهید.
 - خطای multiprocessing ویندوز: با `-w 1` اجرا کنید تا خطای اصلی واضح شود.

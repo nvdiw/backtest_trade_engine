@@ -19,11 +19,11 @@ A candle-by-candle BTC backtesting and parameter-optimization project. It suppor
 
 - Python 3.9+
 - `pandas`, `numpy`, `matplotlib`, `mplfinance`
-- Optional: `openpyxl` when `--excel` is used
+- `openpyxl` for the default formatted Excel reports
 
 ```powershell
 python -m pip install pandas numpy matplotlib mplfinance
-python -m pip install openpyxl  # optional Excel output
+python -m pip install openpyxl
 ```
 
 The default file is configured in `fetch_calculate_data.py` as `data_candle/btc_15m_data_2018_to_2026.csv`. Required columns are `Open time`, `Open`, `High`, `Low`, `Close`, `Volume`, and `Close time`.
@@ -78,7 +78,8 @@ The end must resolve after the start. Date lookup uses timestamps in the configu
 | `--save-chart FILE` | — | Save PNG, PDF, or SVG; combine with `--no-chart` for headless export. |
 | `--quiet` | off | Suppress trade and summary console messages. |
 | `--no-trade-log` | off | Skip trade CSV, monthly CSV, and XLSX generation. |
-| `--excel` | off | Also create formatted XLSX. Excel is opt-in because it is slower. |
+| `--excel` | on | Create the formatted multi-sheet XLSX report (kept for compatibility). |
+| `--no-excel` | off | Skip XLSX generation and keep only the raw CSV reports. |
 | `--output-dir DIR` | `outputs` | Root for trade and monthly reports. |
 | `--result-json FILE` | — | Save the final result dictionary as JSON. |
 | `--print-result` | off | Print the final result dictionary as JSON. |
@@ -135,8 +136,8 @@ python ma_strategy.py --output-dir outputs/runs/conservative `
   --result-json outputs/runs/conservative/result.json `
   --set leverage=3 --set trade_amount_percent=0.25
 
-# CSV, monthly CSV, and XLSX without a chart
-python ma_strategy.py --excel --no-chart
+# CSV, monthly CSV, and the default XLSX report without a chart
+python ma_strategy.py --no-chart
 ```
 
 ### Backtest outputs
@@ -146,11 +147,13 @@ Unless disabled, files are written below `--output-dir`:
 ```text
 outputs/
 ├── trades/data_orders.csv
-├── trades/data_orders.xlsx       # only with --excel
+├── trades/data_orders.xlsx       # default; disable with --no-excel
 └── monthly/monthly_data_orders.csv
 ```
 
-The result dictionary includes final balance, total/realized/unrealized profit, open positions, return percent, closed trades, wins/losses, win rate, maximum drawdown, score, profit factor, expectancy, Calmar ratio, and MA/RSI sub-strategy statistics.
+The XLSX workbook freezes every header row, enables filters, applies profit/loss color coding, and separates Overview, All Trades, Main Strategy, RSI Strategy, and Scale Strategy into individual sheets. The raw CSV remains available for scripts and data tools.
+
+The result dictionary includes final balance, total/realized/unrealized profit, open positions, return percent, closed trades, wins/losses, win rate, maximum drawdown, score, profit factor, expectancy, Calmar ratio, and MA/RSI/Scale sub-strategy statistics.
 
 ### Interactive chart controls
 
@@ -226,6 +229,7 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `--resume` | off | Continue a compatible results CSV. |
 | `--log-every N` | `10` | Progress interval; `0` is silent. |
 | `--top-n N` | `20` | Ranked candidates saved to `top_results.json`. |
+| `--excel-top N` | `5000` | Best candidates included in XLSX; `0` disables the workbook. |
 | `--list-profiles` | — | Print profile sizes and exit. |
 | `--dry-run` | — | Print planned search size and exit. |
 
@@ -291,6 +295,7 @@ With validation, robust score equals validation score minus `overfit_penalty × 
 
 ```text
 optimization_results.csv     every completed candidate/checkpoint
+optimization_results.xlsx    ranked, parameter, core, RSI, and Scale sheets
 best_params.json              final selected winner
 optimization_summary.json     metadata and winner metrics
 top_results.json              top --top-n candidates
@@ -298,7 +303,7 @@ best_training_params.json     training winner with validation
 validation_results.json       out-of-sample finalist details
 ```
 
-JSON writes are atomic. CSV is flushed after each batch for reliable resume.
+JSON writes are atomic. CSV is flushed after each batch for reliable resume. Workers receive the base parameter set once at startup and only candidate deltas are transferred per task. Smart mode combines exploration and crossover with deterministic one-step refinement around elite candidates while suppressing duplicate effective configurations.
 
 ## Testing
 
@@ -310,7 +315,7 @@ python -m py_compile ma_strategy.py optimize.py trade_engine.py chart_renderer.p
 ## Troubleshooting
 
 - Slow chart: lower `plot_max_candles` / `plot_max_render_candles`, or use `--no-chart`.
-- Slow reports: XLSX is opt-in; omit `--excel`.
+- Slow reports: use `--no-excel` to skip the formatted workbook.
 - Locked CSV/XLSX: close it in Excel or choose another `--output-dir`.
 - Optimizer RAM pressure: lower `--workers`, then `--batch-size`.
 - Windows multiprocessing problem: use `-w 1` to expose the original error.

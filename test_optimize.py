@@ -7,6 +7,8 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
+from openpyxl import load_workbook
+
 from optimize import (
     SmartCandidateGenerator, _robust_validation_score, build_parser, grid_size,
     iter_grid_candidates, param_grid, run_optimization,
@@ -67,6 +69,39 @@ class OptimizerSearchTests(unittest.TestCase):
             ]
             self.assertEqual(periods, sorted(periods))
 
+    def test_smart_search_queues_exact_neighbors_around_elites(self):
+        generator = SmartCandidateGenerator(
+            {"entry_score_threshold": [6, 7, 8, 9, 10]}, seed=11
+        )
+        generator.seen.add((8,))
+        generator._queue_elite_neighbors([
+            {"params": {"entry_score_threshold": 8}}
+        ])
+
+        self.assertEqual(
+            [candidate["entry_score_threshold"] for candidate in generator.local_queue],
+            [7, 9],
+        )
+
+    def test_inactive_filter_parameters_collapse_to_one_effective_signature(self):
+        generator = SmartCandidateGenerator({
+            "volume_filter": [False, True],
+            "volume_spike_multiplier": [1.0, 1.5],
+            "entry_score_volume": [1, 2],
+        })
+        first = generator._canonicalize({
+            "volume_filter": False,
+            "volume_spike_multiplier": 1.0,
+            "entry_score_volume": 1,
+        })
+        second = generator._canonicalize({
+            "volume_filter": False,
+            "volume_spike_multiplier": 1.5,
+            "entry_score_volume": 2,
+        })
+
+        self.assertEqual(generator._signature(first), generator._signature(second))
+
     def test_grid_run_writes_best_params_as_json_by_score(self):
         args = Namespace(
             output_dir=None, mode="grid", tests=99, workers=1, batch_size=2,
@@ -84,9 +119,23 @@ class OptimizerSearchTests(unittest.TestCase):
                 best = run_optimization(args, grid={"x": [1, 2, 3]})
             with (Path(temp_dir) / "best_params.json").open(encoding="utf-8") as file:
                 saved = json.load(file)
+            workbook = load_workbook(
+                Path(temp_dir) / "optimization_results.xlsx", read_only=True
+            )
+            with (Path(temp_dir) / "optimization_results.csv").open(
+                encoding="utf-8"
+            ) as results_file:
+                columns = next(csv.reader(results_file))
+            sheet_names = workbook.sheetnames
+            workbook.close()
 
         self.assertEqual(best["params"], {"x": 3})
         self.assertEqual(saved, {"x": 3})
+        self.assertIn("Core Metrics", sheet_names)
+        self.assertIn("RSI Metrics", sheet_names)
+        self.assertIn("Scale Metrics", sheet_names)
+        self.assertIn("objective_score", columns)
+        self.assertIn("profit_per_trade", columns)
 
 
 class PerformanceScoreTests(unittest.TestCase):

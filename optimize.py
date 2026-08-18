@@ -203,17 +203,30 @@ PARAMETER_PROFILES = {
 param_grid = FULL_PARAM_GRID
 
 RESULT_COLUMNS = [
-    "final_balance_static", "final_balance_dynamic", "total_profit",
-    "total_profit_percent", "closed_trades", "wins", "losses",
+    "final_balance_static", "final_balance_dynamic", "final_balance",
+    "final_balance_without_fee",
+    "total_profit", "realized_profit", "unrealized_profit", "open_positions",
+    "total_fees", "saved_money", "liquidations", "total_profit_percent",
+    "closed_trades", "wins", "losses", "long_trades", "long_wins",
+    "long_losses", "short_trades", "short_wins", "short_losses",
     "maximum_drawdown", "win_rate", "profit_months", "loss_months",
     "score", "profit_factor", "expectancy_percent", "calmar_ratio",
     "rsi_total_trades", "rsi_wins", "rsi_losses", "rsi_winrate",
-    "rsi_total_profit", "scale_total_trades", "scale_wins", "scale_losses",
-    "scale_winrate", "scale_total_profit",
+    "rsi_total_profit", "rsi_long_trades", "rsi_long_wins", "rsi_long_losses",
+    "rsi_long_winrate", "rsi_long_profit", "rsi_short_trades", "rsi_short_wins",
+    "rsi_short_losses", "rsi_short_winrate", "rsi_short_profit",
+    "scale_total_trades", "scale_wins", "scale_losses", "scale_winrate",
+    "scale_total_profit", "scale_long_trades", "scale_long_wins",
+    "scale_long_losses", "scale_long_winrate", "scale_long_profit",
+    "scale_short_trades", "scale_short_wins", "scale_short_losses",
+    "scale_short_winrate", "scale_short_profit",
 ]
+
+DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
 
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
+_WORKER_BASE_TUNE = {}
 
 
 def grid_size(grid):
@@ -272,6 +285,8 @@ class SmartCandidateGenerator:
         self.mutable_keys = tuple(key for key, values in self.grid.items() if len(values) > 1)
         self.random = random.Random(seed)
         self.seen = set()
+        self.local_queue = []
+        self.local_queued = set()
         self.baseline_attempted = False
         defaults = build_ma_strategy_config(baseline_params)
         self.baseline = {
@@ -298,10 +313,37 @@ class SmartCandidateGenerator:
                 for key in ("scale_entry_loss_trigger_pct",):
                     if key in candidate:
                         candidate[key] = self.baseline[key]
+            if candidate.get("profit_scale_entry_filter_enabled") is False:
+                for key in (
+                    "profit_scale_entry_min_score",
+                    "profit_scale_entry_atr_ratio_min",
+                ):
+                    if key in candidate:
+                        candidate[key] = self.baseline[key]
         if candidate.get("rsi_trade_monthly_filter_on") is False:
             for key in self.keys:
-                if key.startswith("rsi_") and key != "rsi_trade_monthly_filter_on":
+                if (
+                    key.startswith(("rsi_", "lowest_rsi_", "highest_rsi_"))
+                    and key != "rsi_trade_monthly_filter_on"
+                ):
                     candidate[key] = self.baseline[key]
+        elif candidate.get("rsi_cooldown_filter") is False:
+            if "rsi_cooldown_bars" in candidate:
+                candidate["rsi_cooldown_bars"] = self.baseline["rsi_cooldown_bars"]
+        inactive_filter_settings = (
+            ("adx_filter", ("entry_adx_threshold", "entry_score_adx")),
+            ("atr_filter", ("entry_atr_threshold",)),
+            ("volume_filter", ("volume_spike_multiplier", "entry_score_volume")),
+            (
+                "consecutive_losses_month_stop_filter",
+                ("consecutive_losses_stop_until_month",),
+            ),
+        )
+        for switch, dependent_keys in inactive_filter_settings:
+            if candidate.get(switch) is False:
+                for key in dependent_keys:
+                    if key in candidate:
+                        candidate[key] = self.baseline[key]
         return candidate
 
     def _random_candidate(self):
@@ -316,7 +358,7 @@ class SmartCandidateGenerator:
         # Occasionally cross two good candidates, then mutate. Mutation becomes
         # narrower as the budget is consumed (exploration -> exploitation).
         parent = self._elite_choice(elites)
-        candidate = dict(parent["params"])
+        candidate = {key: parent["params"][key] for key in self.keys}
         if len(elites) > 1 and self.random.random() < 0.20:
             other = self._elite_choice(elites)["params"]
             for key in self.mutable_keys:
@@ -337,16 +379,46 @@ class SmartCandidateGenerator:
                 candidate[key] = self.random.choice(values)
         return candidate
 
+    def _queue_elite_neighbors(self, elites):
+        """Queue deterministic one-step neighbors around the current elites."""
+        for elite in elites:
+            parent = {key: elite["params"][key] for key in self.keys}
+            for key in self.mutable_keys:
+                values = self.grid[key]
+                current = parent[key]
+                if current not in values:
+                    continue
+                index = values.index(current)
+                for neighbor_index in (index - 1, index + 1):
+                    if not 0 <= neighbor_index < len(values):
+                        continue
+                    candidate = dict(parent)
+                    candidate[key] = values[neighbor_index]
+                    candidate = self._canonicalize(candidate)
+                    signature = self._signature(candidate)
+                    if (
+                        signature not in self.seen
+                        and signature not in self.local_queued
+                        and is_valid_candidate(candidate)
+                    ):
+                        self.local_queue.append(candidate)
+                        self.local_queued.add(signature)
+
     def generate(self, count, elites=None, progress=0.0):
         candidates = []
         attempts = 0
         max_attempts = max(1000, count * 100)
+        if elites:
+            self._queue_elite_neighbors(elites)
         while len(candidates) < count and attempts < max_attempts:
             attempts += 1
             if not self.baseline_attempted:
                 candidate = dict(self.baseline)
                 self.baseline_attempted = True
-            elif elites and self.random.random() >= max(0.08, 0.35 * (1.0 - progress)):
+            elif self.local_queue and self.random.random() < (0.35 + 0.50 * progress):
+                candidate = self.local_queue.pop(0)
+                self.local_queued.discard(self._signature(candidate))
+            elif elites and self.random.random() >= max(0.12, 0.40 * (1.0 - progress)):
                 candidate = self._guided_candidate(elites, progress=progress)
             else:
                 candidate = self._random_candidate()
@@ -366,29 +438,37 @@ def _parse_bound(value):
         return value
 
 
-def _init_worker(start, end):
-    global _WORKER_START, _WORKER_END
+def _init_worker(start, end, base_tune=None):
+    global _WORKER_START, _WORKER_END, _WORKER_BASE_TUNE
     _WORKER_START = start
     _WORKER_END = end
+    _WORKER_BASE_TUNE = dict(base_tune or {})
     # Warm the largest repeated I/O cost once per process.
     from trade_engine import TradeEngine
     TradeEngine.load_market_data(start=start, end=end)
 
 
-def _evaluate_task(task):
-    index, params = task
+def _evaluate_candidate(index, params, base_tune, start, end):
     started = time.perf_counter()
     try:
         result = ma_strategy(
-            tune={**params, "optimize": True},
-            start=_WORKER_START,
-            end=_WORKER_END,
+            tune={**base_tune, **params, "optimize": True},
+            start=start,
+            end=end,
         )
         error = None
     except Exception as exc:  # return errors to the parent without killing the run
         result = None
         error = f"{type(exc).__name__}: {exc}"
     return index, params, result, time.perf_counter() - started, error
+
+
+def _evaluate_task(task):
+    """Small multiprocessing payload: workers merge the shared base tune locally."""
+    index, params = task
+    return _evaluate_candidate(
+        index, params, _WORKER_BASE_TUNE, _WORKER_START, _WORKER_END
+    )
 
 
 def _score(result):
@@ -447,6 +527,107 @@ def _write_json(path, payload):
     os.replace(temporary, path)
 
 
+def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows=5000):
+    """Create a filterable, frozen-header XLSX companion to the raw CSV."""
+    try:
+        import pandas as pd
+        from openpyxl import load_workbook
+        from openpyxl.formatting.rule import ColorScaleRule
+        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.utils import get_column_letter
+        from openpyxl.worksheet.table import Table, TableStyleInfo
+    except ImportError:
+        return None
+
+    results_path = Path(results_path)
+    if not results_path.is_file():
+        return None
+    max_rows = max(1, int(max_rows))
+    ranked = None
+    for chunk in pd.read_csv(results_path, chunksize=50_000):
+        if chunk.empty:
+            continue
+        score_column = "objective_score" if "objective_score" in chunk else "score"
+        chunk = chunk.sort_values(score_column, ascending=False, na_position="last").head(max_rows)
+        ranked = chunk if ranked is None else pd.concat([ranked, chunk], ignore_index=True)
+        ranked = ranked.sort_values(
+            score_column, ascending=False, na_position="last"
+        ).head(max_rows)
+    if ranked is None or ranked.empty:
+        return None
+
+    def existing(columns):
+        return [column for column in columns if column in ranked.columns]
+
+    identity = existing(["test_index", "score", "objective_score", "duration_s"])
+    sheets = {
+        "Rankings": ranked,
+        "Parameters": ranked[identity + existing(parameter_keys)],
+        "RSI Metrics": ranked[identity + [
+            column for column in ranked.columns if column.startswith("rsi_")
+        ]],
+        "Scale Metrics": ranked[identity + [
+            column for column in ranked.columns if column.startswith("scale_")
+        ]],
+    }
+    core_columns = existing([
+        "test_index", "score", "objective_score", "final_balance",
+        "final_balance_without_fee", "total_profit", "realized_profit",
+        "unrealized_profit", "open_positions", "total_fees", "saved_money",
+        "liquidations", "long_trades", "short_trades",
+        "total_profit_percent", "closed_trades", "wins", "losses", "win_rate",
+        "maximum_drawdown", "profit_factor", "expectancy_percent", "calmar_ratio",
+        "profit_per_trade", "duration_s",
+    ])
+    sheets["Core Metrics"] = ranked[core_columns]
+
+    output_path = Path(output_path)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for sheet_name, sheet_frame in sheets.items():
+            sheet_frame.to_excel(writer, sheet_name=sheet_name, index=False)
+
+    workbook = load_workbook(output_path)
+    header_fill = PatternFill("solid", fgColor="17365D")
+    header_font = Font(color="FFFFFF", bold=True)
+    for table_index, worksheet in enumerate(workbook.worksheets, start=1):
+        worksheet.freeze_panes = "A2"
+        worksheet.auto_filter.ref = worksheet.dimensions
+        worksheet.sheet_view.showGridLines = False
+        for cell in worksheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        worksheet.row_dimensions[1].height = 24
+        for column_index, cells in enumerate(worksheet.columns, start=1):
+            values = [str(cell.value or "") for cell in cells[:200]]
+            width = min(42, max(10, max(map(len, values), default=10) + 2))
+            worksheet.column_dimensions[get_column_letter(column_index)].width = width
+        if worksheet.max_row >= 2 and worksheet.max_column >= 1:
+            table = Table(
+                displayName=f"OptimizerTable{table_index}", ref=worksheet.dimensions
+            )
+            table.tableStyleInfo = TableStyleInfo(
+                name="TableStyleMedium2", showRowStripes=True, showFirstColumn=False,
+                showLastColumn=False, showColumnStripes=False,
+            )
+            worksheet.add_table(table)
+        headers = {cell.value: cell.column for cell in worksheet[1]}
+        for metric in ("score", "objective_score", "total_profit", "win_rate"):
+            column = headers.get(metric)
+            if column and worksheet.max_row >= 3:
+                letter = get_column_letter(column)
+                worksheet.conditional_formatting.add(
+                    f"{letter}2:{letter}{worksheet.max_row}",
+                    ColorScaleRule(
+                        start_type="min", start_color="F8696B",
+                        mid_type="percentile", mid_value=50, mid_color="FFEB84",
+                        end_type="max", end_color="63BE7B",
+                    ),
+                )
+    workbook.save(output_path)
+    return output_path
+
+
 def _write_best_files(output_dir, best, mode, requested_tests, completed, elapsed, seed,
                       metadata=None):
     if best is None:
@@ -468,10 +649,19 @@ def _write_best_files(output_dir, best, mode, requested_tests, completed, elapse
     _write_json(Path(output_dir) / "optimization_summary.json", summary)
 
 
-def _result_row(keys, index, params, result, duration):
+def _result_row(keys, index, params, result, duration, objective_score=None):
     row = {"test_index": index, "duration_s": round(duration, 4)}
     row.update({key: params[key] for key in keys})
     row.update({key: result.get(key) for key in RESULT_COLUMNS})
+    closed_trades = int(result.get("closed_trades", 0) or 0)
+    realized_profit = result.get("realized_profit")
+    if realized_profit is None:
+        realized_profit = result.get("total_profit", 0)
+    realized_profit = float(realized_profit or 0)
+    row["objective_score"] = objective_score
+    row["profit_per_trade"] = (
+        realized_profit / closed_trades if closed_trades else None
+    )
     return row
 
 
@@ -496,7 +686,9 @@ def _read_resume_records(path, grid, base_tune):
     records = []
     with Path(path).open(newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
-        required = {"test_index", "duration_s", *grid, *RESULT_COLUMNS}
+        # New metric columns are optional so older compatible checkpoints can
+        # still resume after the reporting schema grows.
+        required = {"test_index", "duration_s", "score", *grid}
         missing = required - set(reader.fieldnames or ())
         if missing:
             raise ValueError(
@@ -544,15 +736,19 @@ def _validate_top_candidates(records, args, workers, chunksize):
     end = _parse_bound(validation_end)
     tasks = [(record["index"], record["params"]) for record in candidates]
     if workers > 1:
-        pool = multiprocessing.Pool(workers, initializer=_init_worker, initargs=(start, end))
+        pool = multiprocessing.Pool(
+            workers, initializer=_init_worker, initargs=(start, end, {})
+        )
         try:
             evaluated = list(pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize))
         finally:
             pool.close()
             pool.join()
     else:
-        _init_worker(start, end)
-        evaluated = list(map(_evaluate_task, tasks))
+        evaluated = [
+            _evaluate_candidate(index, params, {}, start, end)
+            for index, params in tasks
+        ]
 
     train_by_index = {record["index"]: record for record in candidates}
     validated = []
@@ -591,7 +787,10 @@ def run_optimization(args, grid=None):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "optimization_results.csv"
-    fieldnames = ["test_index", *keys, *RESULT_COLUMNS, "duration_s"]
+    fieldnames = [
+        "test_index", *keys, *RESULT_COLUMNS,
+        *DERIVED_RESULT_COLUMNS, "duration_s",
+    ]
 
     if args.mode == "grid":
         requested_tests = grid_size(grid)
@@ -667,15 +866,23 @@ def run_optimization(args, grid=None):
 
         pool = None
         if workers > 1:
-            pool = multiprocessing.Pool(workers, initializer=_init_worker, initargs=(start, end))
+            pool = multiprocessing.Pool(
+                workers,
+                initializer=_init_worker,
+                initargs=(start, end, base_tune),
+            )
         else:
-            _init_worker(start, end)
+            # Warm cached market data once in the parent for serial searches.
+            _init_worker(start, end, base_tune)
 
         def evaluate(batch):
             tasks = [(offset, candidate) for offset, candidate in batch]
             if pool is not None:
                 return pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize)
-            return map(_evaluate_task, tasks)
+            return (
+                _evaluate_candidate(index, params, base_tune, start, end)
+                for index, params in tasks
+            )
 
         def consume(batch):
             nonlocal completed, failed, best, ranked
@@ -685,8 +892,18 @@ def run_optimization(args, grid=None):
                     failed += 1
                     print(f"[{completed}/{requested_tests}] test {index} failed: {error}")
                     continue
-                writer.writerow(_result_row(keys, index, params, result, duration))
-                record = {"index": index, "params": params, "result": result, "duration": duration}
+                effective_params = {**base_tune, **params}
+                result_objective = objective(result)
+                writer.writerow(_result_row(
+                    keys, index, effective_params, result, duration,
+                    objective_score=(result_objective if math.isfinite(result_objective) else None),
+                ))
+                record = {
+                    "index": index,
+                    "params": effective_params,
+                    "result": result,
+                    "duration": duration,
+                }
                 ranked.append(record)
                 ranked.sort(key=lambda item: objective(item["result"]), reverse=True)
                 del ranked[max(
@@ -713,8 +930,7 @@ def run_optimization(args, grid=None):
                     candidates = list(itertools.islice(candidate_source, batch_size))
                     if not candidates:
                         break
-                    effective = [{**base_tune, **candidate} for candidate in candidates]
-                    batch = list(enumerate(effective, start=next_index))
+                    batch = list(enumerate(candidates, start=next_index))
                     next_index += len(batch)
                     consume(batch)
             else:
@@ -732,8 +948,7 @@ def run_optimization(args, grid=None):
                     candidates = generator.generate(count, elites=elites, progress=progress)
                     if not candidates:
                         break
-                    effective = [{**base_tune, **candidate} for candidate in candidates]
-                    batch = list(enumerate(effective, start=next_index))
+                    batch = list(enumerate(candidates, start=next_index))
                     next_index += len(batch)
                     consume(batch)
         finally:
@@ -774,6 +989,18 @@ def run_optimization(args, grid=None):
             run_metadata["validation_warning"] = "no finalist passed validation constraints"
             print("Validation warning: no finalist passed the requested constraints")
     elapsed = time.perf_counter() - started
+    excel_top = max(0, int(getattr(args, "excel_top", 5000)))
+    workbook_path = (
+        _save_optimizer_workbook(
+            results_path,
+            output_dir / "optimization_results.xlsx",
+            keys,
+            max_rows=excel_top,
+        )
+        if excel_top else None
+    )
+    if workbook_path is not None:
+        run_metadata["excel_report"] = str(workbook_path)
     _write_best_files(
         output_dir, best, args.mode, requested_tests, completed, elapsed,
         args.seed, run_metadata,
@@ -785,6 +1012,8 @@ def run_optimization(args, grid=None):
     ])
     print(f"Finished {completed:,} tests ({failed} failed) in {elapsed:.1f}s")
     print(f"Results: {results_path}")
+    if workbook_path is not None:
+        print(f"Excel report: {workbook_path}")
     if best:
         print(f"Best score: {_score(best['result']):.4f}")
         print(f"Best params: {output_dir / 'best_params.json'}")
@@ -837,6 +1066,10 @@ def build_parser():
                         help="print progress every N completed tests (0=silent)")
     parser.add_argument("--top-n", type=int, default=20,
                         help="number of ranked candidates saved to top_results.json")
+    parser.add_argument(
+        "--excel-top", type=int, default=5000,
+        help="top candidates included in XLSX (0 disables it; default: 5000)",
+    )
     parser.add_argument("--list-profiles", action="store_true",
                         help="show optimization profiles and exit")
     parser.add_argument("--dry-run", action="store_true",
@@ -864,6 +1097,8 @@ def main(argv=None):
         raise SystemExit("--overfit-penalty cannot be negative")
     if args.top_n <= 0:
         raise SystemExit("--top-n must be greater than zero")
+    if args.excel_top < 0:
+        raise SystemExit("--excel-top cannot be negative")
     if bool(args.validation_start) != bool(args.validation_end):
         raise SystemExit("--validation-start and --validation-end must be used together")
     if args.dry_run:
