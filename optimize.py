@@ -1282,6 +1282,50 @@ def _read_auto_stage_records(path, candidates):
     ]
 
 
+def _auto_stage_best(records):
+    records = list(records)
+
+    def rank(record):
+        objective = _finite_number(record.get("objective_score"))
+        if objective is not None:
+            return 1, objective
+        score = _finite_number((record.get("result") or {}).get("score"))
+        return 0, score if score is not None else -math.inf
+
+    return max(records, key=rank) if records else None
+
+
+def _write_auto_stage_checkpoint(
+    cycle_dir, stage, records, base_tune, completed, total, state
+):
+    """Keep a best_params file beside every resumable auto-stage checkpoint."""
+    best = _auto_stage_best(records)
+    if best is None:
+        return None
+    effective_params = {**base_tune, **best["params"]}
+    checkpoint_dir = Path(cycle_dir) / "checkpoints" / stage
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(checkpoint_dir / "best_params.json", effective_params)
+    _write_json(Path(cycle_dir) / "best_params.json", effective_params)
+    checkpoint = {
+        "cycle": state["cycle"],
+        "stage": stage,
+        "completed": completed,
+        "total": total,
+        "best_candidate_id": best["candidate_id"],
+        "best_objective_score": best.get("objective_score"),
+        "best_params": effective_params,
+        "updated_at": _timestamp_now(),
+    }
+    _write_json(checkpoint_dir / "checkpoint.json", checkpoint)
+    state.update({
+        "checkpoint_best_stage": stage,
+        "checkpoint_best_candidate_id": best["candidate_id"],
+        "checkpoint_best_params": effective_params,
+    })
+    return best
+
+
 def _run_auto_stage(
     args,
     cycle,
@@ -1309,6 +1353,9 @@ def _run_auto_stage(
         f"range {range_start} -> {range_end}"
     )
     if not pending:
+        _write_auto_stage_checkpoint(
+            cycle_dir, stage, existing, base_tune, len(existing), total, state
+        )
         return existing, False
 
     fieldnames = _auto_stage_fieldnames(keys)
@@ -1383,6 +1430,12 @@ def _run_auto_stage(
                 }
                 state["total_evaluations"] += 1
                 state["stage_completed"] = len(records)
+                current_best = _auto_stage_best(records.values())
+                if current_best and current_best["candidate_id"] == candidate_id:
+                    _write_auto_stage_checkpoint(
+                        cycle_dir, stage, records.values(), base_tune,
+                        len(records), total, state,
+                    )
                 if args.log_every and (
                     len(records) % args.log_every == 0 or len(records) == total
                 ):
@@ -1398,6 +1451,10 @@ def _run_auto_stage(
                         f"elapsed={elapsed:.1f}s"
                     )
                 if len(records) % max(1, min(25, args.log_every or 25)) == 0:
+                    _write_auto_stage_checkpoint(
+                        cycle_dir, stage, records.values(), base_tune,
+                        len(records), total, state,
+                    )
                     state["updated_at"] = _timestamp_now()
                     _write_json(state_path, state)
         except KeyboardInterrupt:
@@ -1408,6 +1465,10 @@ def _run_auto_stage(
                 "stage_completed": len(records),
                 "updated_at": _timestamp_now(),
             })
+            _write_auto_stage_checkpoint(
+                cycle_dir, stage, records.values(), base_tune,
+                len(records), total, state,
+            )
             _write_json(state_path, state)
             if pool is not None:
                 pool.terminate()
@@ -1427,6 +1488,9 @@ def _run_auto_stage(
         for candidate in candidates
         if candidate["candidate_id"] in records
     ]
+    _write_auto_stage_checkpoint(
+        cycle_dir, stage, ordered, base_tune, len(ordered), total, state
+    )
     return ordered, interrupted
 
 
@@ -1525,6 +1589,10 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
     _write_json(output_dir / "parameter_importance.json", importance)
     if ranked_hall:
         _write_json(output_dir / "best_params.json", ranked_hall[0]["effective_params"])
+    elif state.get("checkpoint_best_params"):
+        # Before the first full finalist exists, expose the best provisional
+        # checkpoint so even an early interruption has a usable best_params.json.
+        _write_json(output_dir / "best_params.json", state["checkpoint_best_params"])
     hall_rows = [
         _flatten_hall_record(record, keys, rank)
         for rank, record in enumerate(ranked_hall, start=1)
@@ -1587,7 +1655,7 @@ def _merge_hall_of_fame(hall, finalists, cycle, keys, base_tune, limit):
 
 def run_auto_optimization(args, grid=None):
     """Run an unlimited, staged, importance-guided optimization campaign."""
-    profile = getattr(args, "profile", "focused")
+    profile = getattr(args, "profile", None) or "full"
     grid = PARAMETER_PROFILES[profile] if grid is None else grid
     keys = tuple(grid)
     base_tune, base_description = _load_base_tune(args)
@@ -1667,6 +1735,23 @@ def run_auto_optimization(args, grid=None):
             cycle = int(state["cycle"])
             cycle_dir = output_dir / "cycles" / f"cycle_{cycle:06d}"
             cycle_dir.mkdir(parents=True, exist_ok=True)
+            continuation_parent = hall[0] if hall else None
+            continuation_base = (
+                continuation_parent.get("effective_params", continuation_parent["params"])
+                if continuation_parent else base_tune
+            )
+            training_parent = {
+                "source": "hall_of_fame" if continuation_parent else "base_configuration",
+                "candidate_id": (
+                    continuation_parent.get("candidate_id") if continuation_parent else None
+                ),
+                "robust_score": (
+                    continuation_parent.get("robust_score") if continuation_parent else None
+                ),
+                "params": continuation_base,
+            }
+            state["training_parent"] = training_parent
+            _write_json(cycle_dir / "training_parent.json", training_parent)
             discovery_plan_path = cycle_dir / "discovery_candidates.json"
             if discovery_plan_path.is_file():
                 discovery_candidates = _read_candidate_plan(discovery_plan_path)
@@ -1682,7 +1767,7 @@ def run_auto_optimization(args, grid=None):
                 generator = SmartCandidateGenerator(
                     grid,
                     seed=args.seed + cycle - 1,
-                    baseline_params=base_tune,
+                    baseline_params=continuation_base,
                     continuous_refinement=bool(elite_records),
                     parameter_importance={
                         key: item.get("weight", 1.0) for key, item in importance.items()
@@ -1828,7 +1913,7 @@ def run_auto_optimization(args, grid=None):
 
 
 def run_optimization(args, grid=None):
-    profile = getattr(args, "profile", "focused")
+    profile = getattr(args, "profile", None) or "focused"
     grid = PARAMETER_PROFILES[profile] if grid is None else grid
     keys = tuple(grid)
     base_tune, base_description = _load_base_tune(args)
@@ -2102,8 +2187,8 @@ def build_parser():
     parser.add_argument("--tests", type=int, default=5000,
                         help="number of candidates in smart mode (default: 5000)")
     parser.add_argument(
-        "--profile", choices=tuple(PARAMETER_PROFILES), default="focused",
-        help="parameter group to optimize (focused is the fast default)",
+        "--profile", choices=tuple(PARAMETER_PROFILES), default=None,
+        help="parameter group (default: full in auto mode, focused otherwise)",
     )
     parser.add_argument(
         "--base-source", choices=("config", "best", "file"), default="config",
@@ -2200,6 +2285,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    args.profile = args.profile or ("full" if args.auto else "focused")
     if args.list_profiles:
         for name, grid in PARAMETER_PROFILES.items():
             print(f"{name}: {len(grid)} parameters | {grid_size(grid):,} grid combinations")

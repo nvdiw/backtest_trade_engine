@@ -161,13 +161,63 @@ class OptimizerSearchTests(unittest.TestCase):
             )
             auto_sheets = workbook.sheetnames
             workbook.close()
+            checkpoint_files_exist = all(
+                (
+                    Path(temp_dir) / "cycles" / "cycle_000001" / "checkpoints"
+                    / stage / "best_params.json"
+                ).is_file()
+                for stage in ("discovery", "validation", "stress", "final")
+            )
 
         self.assertEqual(strategy.call_count, 10)
         self.assertEqual(state["cycles_completed"], 1)
         self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["config"]["profile"], "full")
         self.assertEqual(saved, {"x": 4})
         self.assertEqual(best["params"], {"x": 4})
         self.assertEqual(auto_sheets, ["Hall of Fame", "Parameter Importance"])
+        self.assertTrue(checkpoint_files_exist)
+
+    def test_next_auto_cycle_continues_from_hall_of_fame_winner(self):
+        args = build_parser().parse_args([
+            "--auto", "--auto-tests", "4", "--auto-validation-top", "1",
+            "--auto-stress-top", "1", "--auto-final-top", "1",
+            "--auto-cycles", "2", "--auto-stress-start", "0",
+            "--auto-validation-start", "20", "--auto-discovery-start", "30",
+            "--auto-end", "40", "--workers", "1", "--log-every", "0",
+            "--excel-top", "0",
+        ])
+
+        def fake_strategy(tune, start, end):
+            value = tune["x"]
+            score = 100 - abs(value - 20)
+            return {
+                "score": score,
+                "total_profit": score,
+                "closed_trades": 2,
+                "maximum_drawdown": -1,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=fake_strategy
+            ):
+                run_auto_optimization(args, grid={"x": [0, 10, 20, 30]})
+            parent = json.loads((
+                Path(temp_dir) / "cycles" / "cycle_000002" / "training_parent.json"
+            ).read_text(encoding="utf-8"))
+            second_plan = json.loads((
+                Path(temp_dir) / "cycles" / "cycle_000002"
+                / "discovery_candidates.json"
+            ).read_text(encoding="utf-8"))
+
+        refined_values = {
+            candidate["params"]["x"] for candidate in second_plan["candidates"]
+        }
+        self.assertEqual(parent["source"], "hall_of_fame")
+        self.assertEqual(parent["params"]["x"], 20)
+        self.assertTrue(refined_values & {19, 21})
 
     def test_auto_resume_continues_the_interrupted_stage(self):
         args = build_parser().parse_args([
@@ -206,6 +256,12 @@ class OptimizerSearchTests(unittest.TestCase):
             interrupted_state = json.loads(
                 (Path(temp_dir) / "auto_state.json").read_text(encoding="utf-8")
             )
+            interrupted_best_exists = (
+                Path(temp_dir) / "best_params.json"
+            ).is_file() and (
+                Path(temp_dir) / "cycles" / "cycle_000001" / "checkpoints"
+                / "discovery" / "best_params.json"
+            ).is_file()
 
             args.resume = True
             with patch("optimize._init_worker"), patch(
@@ -223,6 +279,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertIsNone(first)
         self.assertEqual(interrupted_state["status"], "interrupted")
         self.assertEqual(interrupted_state["stage_completed"], 1)
+        self.assertTrue(interrupted_best_exists)
         self.assertEqual(completed_state["status"], "completed")
         self.assertEqual(completed_state["cycles_completed"], 1)
         self.assertEqual(completed_state["total_evaluations"], 6)

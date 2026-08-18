@@ -3,6 +3,7 @@ python optimize.py --mode smart --profile focused --base-source config --tests 5
 
 CONTINUOUS AUTO SEARCH (STOP WITH CTRL+C):
 python optimize.py --auto -w 16
+Auto mode uses the main full parameter grid by default and continues future cycles from the Hall-of-Fame winner.
 
 RESUME CONTINUOUS AUTO SEARCH:
 python optimize.py --auto --resume -w 16

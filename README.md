@@ -212,7 +212,7 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `-h`, `--help` | — | Show built-in help. |
 | `--mode smart\|grid` | `smart` | Adaptive budget or full Cartesian grid. |
 | `--tests N` | `5000` | Smart-mode candidate budget; not a grid-mode limit. |
-| `--profile NAME` | `focused` | `focused`, `signal`, `exit`, `risk`, `rsi`, or `full`. |
+| `--profile NAME` | mode-dependent | `full` in Auto mode, `focused` otherwise; explicit choices are `focused`, `signal`, `exit`, `risk`, `rsi`, or `full`. |
 | `--base-source config\|best\|file` | `config` | Baseline outside the selected profile. |
 | `--base-params FILE` | `outputs/optimize/best_params.json` | JSON for `best` or `file`. |
 | `-w N`, `--workers N` | up to `8` | Worker processes; use `1` for easiest debugging. |
@@ -310,7 +310,7 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 
 ### Continuous Auto mode
 
-`--auto` runs a resumable campaign until `Ctrl+C`. Every cycle uses a non-overlapping robustness funnel: 2,000 recent discovery tests, 30 validation finalists, 10 older stress finalists, and 3 full-history finalists. The default ranges are:
+`--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. Every cycle uses a non-overlapping robustness funnel: 2,000 recent discovery tests, 30 validation finalists, 10 older stress finalists, and 3 full-history finalists. The default ranges are:
 
 ```text
 Discovery    2025-01-01 -> latest candle
@@ -341,6 +341,8 @@ After the first cycle, Auto mode can create numeric values not present in the co
 
 Auto mode learns parameter importance from completed discovery results. Approximately 60% of each later cycle searches locally around Hall-of-Fame winners, 25% remains random exploration, and 15% crosses strong candidates. High-effect parameters receive more mutations and neighbor tests, while every parameter retains an exploration floor. The safe default target is `objective_score`, which includes profit and risk; use `--auto-importance-target total_profit` only when raw profit is intentionally preferred.
 
+Every new cycle records its parent in `training_parent.json`. After the first complete cycle, the best Hall-of-Fame parameters become the next cycle's baseline and mutation parent, so training continues along the strongest known path while retaining random exploration.
+
 | Auto option | Default | Meaning |
 |---|---:|---|
 | `--auto` | off | Start the continuous staged campaign. |
@@ -366,6 +368,9 @@ parameter_importance.json/.csv learned mutation priorities
 auto_summary.json            campaign status and best result
 auto_report.xlsx             Hall of Fame and Parameter Importance sheets
 cycles/cycle_*/              plans and result CSVs for every stage
+cycles/cycle_*/training_parent.json  baseline winner used by that cycle
+cycles/cycle_*/best_params.json      latest stage winner in that cycle
+cycles/cycle_*/checkpoints/*/best_params.json  best parameters at every checkpoint
 ```
 
 ## Testing

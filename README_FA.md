@@ -226,7 +226,7 @@ optimizer هنگام ارزیابی کاندیدها چارت، پیام‌ها�
 | `-h`, `--help` | — | نمایش راهنمای داخلی. |
 | `--mode smart\|grid` | `smart` | جستجوی هوشمند بودجه‌ای یا grid کامل. |
 | `--tests N` | `5000` | بودجه کاندیدها در smart؛ محدودکننده grid نیست. |
-| `--profile NAME` | `focused` | یکی از `focused`، `signal`، `exit`، `risk`، `rsi` یا `full`. |
+| `--profile NAME` | وابسته به حالت | در Auto مقدار `full` و در حالت عادی `focused`؛ انتخاب‌های صریح: `focused`، `signal`، `exit`، `risk`، `rsi` یا `full`. |
 | `--base-source config\|best\|file` | `config` | منبع پارامترهای خارج از profile انتخاب‌شده. |
 | `--base-params FILE` | `outputs/optimize/best_params.json` | فایل JSON برای `best` یا `file`. |
 | `-w N`, `--workers N` | حداکثر `8` | تعداد process؛ برای دیباگ ساده‌تر `1` بگذارید. |
@@ -324,7 +324,7 @@ validation_results.json       جزئیات finalistهای خارج از نمون
 
 ### حالت پیوسته Auto
 
-گزینه `--auto` یک کمپین قابل‌ادامه را تا زمان زدن `Ctrl+C` اجرا می‌کند. هر چرخه دارای قیف پایداری با بازه‌های مستقل است: ۲۰۰۰ تست روی داده جدید، ۳۰ finalist برای validation، سپس ۱۰ مورد برای stress و در پایان ۳ مورد روی کل تاریخچه. بازه‌های پیش‌فرض عبارت‌اند از:
+گزینه `--auto` یک کمپین قابل‌ادامه را تا زمان زدن `Ctrl+C` اجرا می‌کند. این حالت به‌صورت پیش‌فرض از grid اصلی `full` استفاده می‌کند؛ فقط برای جست‌وجوی عمداً کوچک‌تر `--profile focused` بدهید. هر چرخه دارای قیف پایداری با بازه‌های مستقل است: ۲۰۰۰ تست روی داده جدید، ۳۰ finalist برای validation، سپس ۱۰ مورد برای stress و در پایان ۳ مورد روی کل تاریخچه. بازه‌های پیش‌فرض عبارت‌اند از:
 
 ```text
 Discovery    2025-01-01 -> آخرین کندل
@@ -354,6 +354,8 @@ python .\optimize.py --auto --auto-cycles 2 -w 16 `
 
 Auto از نتایج Discovery یاد می‌گیرد کدام پارامترها اثر بیشتری دارند. تقریباً ۶۰٪ چرخه بعد جست‌وجوی محلی اطراف برندگان Hall of Fame، حدود ۲۵٪ exploration تصادفی و ۱۵٪ crossover است. پارامترهای اثرگذار mutation و تست همسایه بیشتری می‌گیرند، اما برای جلوگیری از قفل‌شدن زودهنگام همه متغیرها حداقل شانس جست‌وجو دارند. معیار امن پیش‌فرض `objective_score` است که سود و ریسک را با هم می‌سنجد؛ برای اولویت‌دادن عمدی به سود خام می‌توان `--auto-importance-target total_profit` را استفاده کرد.
 
+هر چرخه والد خود را در `training_parent.json` ثبت می‌کند. پس از تکمیل چرخه اول، بهترین پارامتر Hall of Fame به baseline و والد mutation چرخه بعد تبدیل می‌شود؛ بنابراین train از بهترین مسیر شناخته‌شده ادامه پیدا می‌کند و هم‌زمان exploration تصادفی نیز حفظ می‌شود.
+
 | گزینه Auto | پیش‌فرض | کاربرد |
 |---|---:|---|
 | `--auto` | خاموش | شروع کمپین پیوسته و مرحله‌ای. |
@@ -379,6 +381,9 @@ parameter_importance.json/.csv اولویت یادگرفته‌شده پارام
 auto_summary.json            خلاصه وضعیت و بهترین نتیجه
 auto_report.xlsx             برگه‌های Hall of Fame و اهمیت پارامترها
 cycles/cycle_*/              برنامه و CSV نتیجه هر مرحله
+cycles/cycle_*/training_parent.json  پارامتر برنده‌ای که چرخه از آن ادامه یافته است
+cycles/cycle_*/best_params.json      بهترین پارامتر آخرین مرحله همان چرخه
+cycles/cycle_*/checkpoints/*/best_params.json  بهترین پارامتر در هر checkpoint
 ```
 
 ## اجرای تست‌ها
