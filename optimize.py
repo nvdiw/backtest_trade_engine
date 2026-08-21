@@ -858,13 +858,27 @@ def _json_safe(value):
     return value
 
 
+def _replace_with_retry(temporary, path, attempts=20):
+    """Replace a file atomically, tolerating short-lived Windows file locks."""
+    for attempt in range(attempts):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt + 1 >= attempts:
+                raise
+            # Editors, indexers, antivirus, and sync clients can briefly open a
+            # destination without FILE_SHARE_DELETE, which makes os.replace fail.
+            time.sleep(min(0.05 * (2 ** attempt), 1.0))
+
+
 def _write_json(path, payload):
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as file:
         json.dump(_json_safe(payload), file, indent=2, ensure_ascii=False)
         file.write("\n")
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
 
 
 def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows=5000):
@@ -1501,7 +1515,7 @@ def _write_rows_atomic(path, fieldnames, rows):
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
-    os.replace(temporary, path)
+    _replace_with_retry(temporary, path)
 
 
 def _flatten_hall_record(record, keys, rank):
