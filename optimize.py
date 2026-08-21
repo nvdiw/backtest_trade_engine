@@ -237,6 +237,8 @@ RESULT_COLUMNS = [
 ]
 
 DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
+AUTO_TIME_COLUMNS = ["time_normalized_score", "range_candles"]
+CANDLES_PER_YEAR_15M = 365.25 * 24 * 4
 
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
@@ -635,24 +637,57 @@ def _objective_score(result, min_trades=0, max_drawdown=None):
     return value
 
 
-def _robust_validation_score(train_result, validation_result, overfit_penalty=0.25):
+def _robust_validation_score(
+    train_result,
+    validation_result,
+    overfit_penalty=0.25,
+    train_candles=None,
+    validation_candles=None,
+):
     """Prefer strong validation performance and penalize train-only excess."""
     train_score = _score(train_result)
     validation_score = _score(validation_result)
+    if train_candles is not None and validation_candles is not None:
+        normalized_train = _time_normalized_score(train_score, train_candles)
+        normalized_validation = _time_normalized_score(
+            validation_score, validation_candles
+        )
+        if normalized_train is not None:
+            train_score = normalized_train
+        if normalized_validation is not None:
+            validation_score = normalized_validation
     if not math.isfinite(validation_score):
         return -math.inf
     optimistic_gap = max(0.0, train_score - validation_score)
     return validation_score - overfit_penalty * optimistic_gap
 
 
-AUTO_STAGE_ORDER = ("discovery", "validation", "stress", "final")
+def _time_normalized_score(score, range_candles):
+    """Convert a raw optimizer score to a comparable 15-minute annual rate."""
+    numeric_score = _finite_number(score)
+    try:
+        candles = int(range_candles)
+    except (TypeError, ValueError):
+        return None
+    if numeric_score is None or candles <= 0:
+        return None
+    return numeric_score * CANDLES_PER_YEAR_15M / candles
+
+
+def _range_candle_count(range_start, range_end):
+    return max(1, _bound_index(range_end) - _bound_index(range_start))
+
+
+AUTO_STAGE_ORDER = ("discovery", "validation", "stress", "walk_forward", "final")
 AUTO_STAGE_WEIGHTS = {
-    "discovery": 0.40,
-    "validation": 0.30,
-    "stress": 0.20,
+    "discovery": 0.25,
+    "validation": 0.20,
+    "stress": 0.15,
+    "walk_forward": 0.30,
     "final": 0.10,
 }
-AUTO_STATE_VERSION = 1
+AUTO_STATE_VERSION = 2
+LEGACY_AUTO_STATE_VERSIONS = {1, AUTO_STATE_VERSION}
 
 
 def _finite_number(value):
@@ -661,6 +696,13 @@ def _finite_number(value):
     except (TypeError, ValueError):
         return None
     return number if math.isfinite(number) else None
+
+
+def _record_comparable_score(record):
+    normalized = _finite_number(record.get("time_normalized_score"))
+    return normalized if normalized is not None else _finite_number(
+        record.get("objective_score")
+    )
 
 
 def _importance_target(record, target):
@@ -749,12 +791,117 @@ def _smooth_parameter_importance(previous, learned, previous_weight=0.65):
     return blended
 
 
+class ExtraTreesSurrogate:
+    """Small dependency-free extremely-randomized tree ensemble.
+
+    It is intentionally limited to the numeric/boolean parameter spaces used by
+    this optimizer.  The ensemble predicts both a mean score and disagreement
+    between trees, which lets auto mode balance exploitation and exploration.
+    """
+
+    def __init__(
+        self, n_trees=32, max_depth=10, min_leaf=4, max_features=None, seed=42,
+    ):
+        self.n_trees = max(1, int(n_trees))
+        self.max_depth = max(1, int(max_depth))
+        self.min_leaf = max(1, int(min_leaf))
+        self.max_features = max_features
+        self.seed = int(seed)
+        self.trees = []
+
+    @staticmethod
+    def _leaf(targets, indices):
+        return ("leaf", statistics.fmean(targets[index] for index in indices))
+
+    def _build_tree(self, features, targets, indices, depth, randomizer):
+        if depth >= self.max_depth or len(indices) < self.min_leaf * 2:
+            return self._leaf(targets, indices)
+        node_targets = [targets[index] for index in indices]
+        if max(node_targets) - min(node_targets) <= 1e-12:
+            return self._leaf(targets, indices)
+
+        feature_count = len(features[0])
+        requested = self.max_features or max(1, round(math.sqrt(feature_count)))
+        selected_features = randomizer.sample(
+            range(feature_count), min(feature_count, requested)
+        )
+        best = None
+        for feature_index in selected_features:
+            values = [features[index][feature_index] for index in indices]
+            lower, upper = min(values), max(values)
+            if lower == upper:
+                continue
+            for _ in range(3):
+                threshold = randomizer.uniform(lower, upper)
+                left = [
+                    index for index in indices
+                    if features[index][feature_index] <= threshold
+                ]
+                if len(left) < self.min_leaf or len(indices) - len(left) < self.min_leaf:
+                    continue
+                left_set = set(left)
+                right = [index for index in indices if index not in left_set]
+                left_mean = statistics.fmean(targets[index] for index in left)
+                right_mean = statistics.fmean(targets[index] for index in right)
+                loss = sum((targets[index] - left_mean) ** 2 for index in left)
+                loss += sum((targets[index] - right_mean) ** 2 for index in right)
+                if best is None or loss < best[0]:
+                    best = (loss, feature_index, threshold, left, right)
+        if best is None:
+            return self._leaf(targets, indices)
+        _, feature_index, threshold, left, right = best
+        return (
+            "node", feature_index, threshold,
+            self._build_tree(features, targets, left, depth + 1, randomizer),
+            self._build_tree(features, targets, right, depth + 1, randomizer),
+        )
+
+    def fit(self, features, targets):
+        if not features or len(features) != len(targets):
+            raise ValueError("surrogate training features and targets must be non-empty")
+        sample_count = len(features)
+        self.trees = []
+        for tree_index in range(self.n_trees):
+            randomizer = random.Random(self.seed + tree_index * 104729)
+            # Random subsampling gives useful model disagreement without letting
+            # duplicate bootstrap rows dominate small optimization histories.
+            subset_size = max(self.min_leaf * 2, round(sample_count * 0.80))
+            subset_size = min(sample_count, subset_size)
+            indices = randomizer.sample(range(sample_count), subset_size)
+            self.trees.append(
+                self._build_tree(features, targets, indices, 0, randomizer)
+            )
+        return self
+
+    @staticmethod
+    def _predict_tree(tree, features):
+        while tree[0] == "node":
+            _, feature_index, threshold, left, right = tree
+            tree = left if features[feature_index] <= threshold else right
+        return tree[1]
+
+    def predict_mean_std(self, feature_rows):
+        if not self.trees:
+            raise ValueError("surrogate must be fitted before prediction")
+        output = []
+        for row in feature_rows:
+            predictions = [self._predict_tree(tree, row) for tree in self.trees]
+            output.append((
+                statistics.fmean(predictions),
+                statistics.pstdev(predictions) if len(predictions) > 1 else 0.0,
+            ))
+        return output
+
+
 def _record_percentiles(records):
     valid = [
         record for record in records
-        if _finite_number(record.get("objective_score")) is not None
+        if _record_comparable_score(record) is not None
     ]
-    valid.sort(key=lambda record: float(record["objective_score"]), reverse=True)
+    valid.sort(
+        key=lambda record: _record_comparable_score(record),
+        reverse=True,
+    )
     denominator = max(1, len(valid) - 1)
     return {
         record["candidate_id"]: 1.0 - rank / denominator
@@ -775,6 +922,14 @@ def _combine_auto_stage_records(stage_records):
     percentiles = {
         stage: _record_percentiles(records) for stage, records in stage_records.items()
     }
+    stage_weights = AUTO_STAGE_WEIGHTS
+    if "walk_forward" not in completed_stages:
+        # Preserve the ranking contract used by version-1 campaigns while an
+        # interrupted legacy cycle is being finished.
+        stage_weights = {
+            "discovery": 0.40, "validation": 0.30,
+            "stress": 0.20, "final": 0.10,
+        }
     combined = []
     for latest in stage_records[final_stage]:
         candidate_id = latest["candidate_id"]
@@ -789,24 +944,31 @@ def _combine_auto_stage_records(stage_records):
         for stage in completed_stages:
             record = record_maps[stage][candidate_id]
             score = _finite_number(record.get("objective_score"))
+            normalized_score = _record_comparable_score(record)
             percentile = percentiles[stage].get(candidate_id)
-            if score is None or percentile is None:
+            if score is None or normalized_score is None or percentile is None:
                 qualified = False
                 break
-            weight = AUTO_STAGE_WEIGHTS[stage]
+            weight = stage_weights[stage]
             ranks.append(percentile)
             weighted_total += weight * percentile
             weight_total += weight
             stage_scores[stage] = score
-            stage_metrics[stage] = record["result"]
+            stage_metrics[stage] = {
+                **record["result"],
+                "time_normalized_score": normalized_score,
+            }
         if not qualified:
             robust_score = -math.inf
         else:
             weighted_rank = weighted_total / weight_total
             dispersion = statistics.pstdev(ranks) if len(ranks) > 1 else 0.0
             transformed_quality = sum(
-                AUTO_STAGE_WEIGHTS[stage]
-                * math.copysign(math.log1p(abs(stage_scores[stage])), stage_scores[stage])
+                stage_weights[stage]
+                * math.copysign(
+                    math.log1p(abs(stage_metrics[stage]["time_normalized_score"])),
+                    stage_metrics[stage]["time_normalized_score"],
+                )
                 for stage in completed_stages
             ) / weight_total
             robust_score = (
@@ -1088,6 +1250,8 @@ def _validate_top_candidates(records, args, workers, chunksize):
     candidates = records[:top_count]
     start = _parse_bound(validation_start)
     end = _parse_bound(validation_end)
+    train_candles = _range_candle_count(args.start, args.end)
+    validation_candles = _range_candle_count(validation_start, validation_end)
     tasks = [(record["index"], record["params"]) for record in candidates]
     if workers > 1:
         pool = multiprocessing.Pool(
@@ -1121,7 +1285,9 @@ def _validate_top_candidates(records, args, workers, chunksize):
         )
         robust_score = (
             -math.inf if not validation_qualified else _robust_validation_score(
-                train["result"], result, getattr(args, "overfit_penalty", 0.25)
+                train["result"], result, getattr(args, "overfit_penalty", 0.25),
+                train_candles=train_candles,
+                validation_candles=validation_candles,
             )
         )
         validated.append({
@@ -1131,6 +1297,12 @@ def _validate_top_candidates(records, args, workers, chunksize):
             "duration": duration,
             "error": error,
             "training_result": train["result"],
+            "training_time_normalized_score": _time_normalized_score(
+                _score(train["result"]), train_candles
+            ),
+            "validation_time_normalized_score": _time_normalized_score(
+                _score(result), validation_candles
+            ),
             "robust_score": robust_score,
         })
     validated.sort(key=lambda item: item["robust_score"], reverse=True)
@@ -1153,6 +1325,37 @@ def _bound_index(value):
     from get_candle_index import get_candle_index
 
     return int(get_candle_index(parsed))
+
+
+def _format_range_bound(value):
+    """Return a human-readable market timestamp for a date or candle bound."""
+    parsed = _parse_bound(value)
+    if not isinstance(parsed, int):
+        try:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        except (AttributeError, ValueError):
+            return str(value)
+
+    try:
+        from get_candle_index import _open_times
+
+        open_times = _open_times().dropna()
+        if open_times.empty:
+            return str(value)
+        if 0 <= parsed < len(open_times):
+            timestamp = open_times.iloc[parsed]
+        elif parsed == len(open_times):
+            recent = open_times.tail(100).sort_values()
+            deltas = recent.diff().dropna()
+            candle_delta = deltas.median() if not deltas.empty else timedelta(minutes=15)
+            if candle_delta <= timedelta(0):
+                candle_delta = timedelta(minutes=15)
+            timestamp = open_times.iloc[-1] + candle_delta
+        else:
+            return str(value)
+        return timestamp.strftime("%Y-%m-%d %H:%M")
+    except (IndexError, OSError, TypeError, ValueError):
+        return str(value)
 
 
 def _validate_auto_ranges(ranges):
@@ -1188,6 +1391,41 @@ def _auto_configuration(args, profile, grid, base_tune, base_description, resolv
     }
 
 
+def _auto_feature_configuration(args):
+    """Settings for the version-2 search engine, stored outside legacy config."""
+    return {
+        "advanced_min_candidates": int(args.auto_advanced_min_candidates),
+        "halving_rungs": int(args.auto_halving_rungs),
+        "halving_keep": float(args.auto_halving_keep),
+        "surrogate_min_samples": int(args.auto_surrogate_min_samples),
+        "surrogate_pool_multiplier": int(args.auto_surrogate_pool),
+        "surrogate_trees": int(args.auto_surrogate_trees),
+        "walk_forward_folds": int(args.auto_walk_forward_folds),
+        "walk_forward_top": int(args.auto_walk_forward_top),
+        "walk_forward_stability_penalty": float(
+            args.auto_walk_forward_stability_penalty
+        ),
+    }
+
+
+def _auto_bootstrap(args, grid):
+    """Use an existing standard-optimizer winner to warm-start a new campaign."""
+    if getattr(args, "base_source", "config") != "config":
+        return None
+    path = Path(getattr(args, "base_params", "outputs/optimize/best_params.json"))
+    if not path.is_file():
+        return None
+    saved = load_ma_strategy_tune(path)
+    compatible = {key: saved[key] for key in grid if key in saved}
+    if not compatible:
+        return None
+    return {
+        "source": str(path),
+        "compatible_parameter_count": len(compatible),
+        "params": compatible,
+    }
+
+
 def _load_json(path, default=None):
     path = Path(path)
     if not path.is_file():
@@ -1202,13 +1440,162 @@ def _candidate_signature(params, keys):
 
 def _load_auto_seen(output_dir, keys):
     seen = set()
-    for path in sorted((Path(output_dir) / "cycles").glob("cycle_*/discovery_candidates.json")):
-        payload = _load_json(path, {}) or {}
-        for candidate in payload.get("candidates", []):
+    for path in sorted((Path(output_dir) / "cycles").glob("cycle_*/*_candidates.json")):
+        for candidate in _read_candidate_plan(path):
             params = candidate.get("params", {})
             if all(key in params for key in keys):
                 seen.add(_candidate_signature(params, keys))
     return seen
+
+
+def _load_discovery_history(output_dir, keys):
+    """Load comparable full-discovery observations from every previous cycle."""
+    history = []
+    cycles_dir = Path(output_dir) / "cycles"
+    for plan_path in sorted(cycles_dir.glob("cycle_*/discovery_candidates.json")):
+        results_path = plan_path.with_name("discovery_results.csv")
+        candidates = _read_candidate_plan(plan_path)
+        for record in _read_auto_stage_records(results_path, candidates):
+            score = _finite_number(record.get("objective_score"))
+            if score is not None and all(key in record["params"] for key in keys):
+                history.append(record)
+    return history
+
+
+def _surrogate_feature_row(params, keys, grid):
+    row = []
+    for key in keys:
+        value = params[key]
+        if isinstance(value, bool):
+            row.append(float(value))
+        elif isinstance(value, (int, float)):
+            row.append(float(value))
+        else:
+            values = list(grid[key])
+            row.append(float(values.index(value)) if value in values else -1.0)
+    return row
+
+
+def _select_surrogate_candidates(
+    candidates, history, count, keys, grid, features, seed,
+):
+    """Rank a large candidate pool with historical data and retain exploration."""
+    candidates = list(candidates)
+    usable_history = [
+        record for record in history
+        if _finite_number(record.get("objective_score")) is not None
+    ]
+    minimum = features["surrogate_min_samples"]
+    if len(usable_history) < minimum or len(candidates) <= count:
+        return candidates[:count], {
+            "enabled": False,
+            "reason": "insufficient_history" if len(usable_history) < minimum else "small_pool",
+            "history_samples": len(usable_history),
+            "minimum_samples": minimum,
+            "candidate_pool": len(candidates),
+        }
+
+    training_features = [
+        _surrogate_feature_row(record["params"], keys, grid)
+        for record in usable_history
+    ]
+    targets = [float(record["objective_score"]) for record in usable_history]
+    model = ExtraTreesSurrogate(
+        n_trees=features["surrogate_trees"],
+        max_depth=max(6, min(14, round(math.log2(len(usable_history) + 1)) + 2)),
+        min_leaf=max(3, min(12, len(usable_history) // 40)),
+        seed=seed,
+    ).fit(training_features, targets)
+    predictions = model.predict_mean_std([
+        _surrogate_feature_row(candidate, keys, grid) for candidate in candidates
+    ])
+    ranked_mean = sorted(
+        range(len(candidates)), key=lambda index: predictions[index][0], reverse=True
+    )
+    ranked_uncertainty = sorted(
+        range(len(candidates)), key=lambda index: predictions[index][1], reverse=True
+    )
+    selected_indices = []
+    selected_set = set()
+
+    def add(indices, limit):
+        for index in indices:
+            if len(selected_indices) >= limit:
+                break
+            if index not in selected_set:
+                selected_set.add(index)
+                selected_indices.append(index)
+
+    exploit_target = max(1, round(count * 0.55))
+    uncertainty_target = min(count, exploit_target + round(count * 0.20))
+    add(ranked_mean, exploit_target)
+    add(ranked_uncertainty, uncertainty_target)
+    remaining = [index for index in range(len(candidates)) if index not in selected_set]
+    random.Random(seed + 7919).shuffle(remaining)
+    add(remaining, count)
+    selected = [candidates[index] for index in selected_indices[:count]]
+    selected_predictions = [predictions[index] for index in selected_indices[:count]]
+    return selected, {
+        "enabled": True,
+        "model": "dependency_free_extra_trees",
+        "history_samples": len(usable_history),
+        "candidate_pool": len(candidates),
+        "selected_candidates": len(selected),
+        "trees": features["surrogate_trees"],
+        "predicted_score_min": min(item[0] for item in selected_predictions),
+        "predicted_score_max": max(item[0] for item in selected_predictions),
+        "mean_uncertainty": statistics.fmean(item[1] for item in selected_predictions),
+        "selection_mix": {"exploitation": 0.55, "uncertainty": 0.20, "random": 0.25},
+    }
+
+
+def _promote_candidates(records, keep_count):
+    ranked = sorted(
+        records,
+        key=lambda record: (
+            _finite_number(record.get("objective_score"))
+            if _finite_number(record.get("objective_score")) is not None
+            else -math.inf
+        ),
+        reverse=True,
+    )
+    return [
+        {"candidate_id": record["candidate_id"], "params": record["params"]}
+        for record in ranked[:keep_count]
+        if _finite_number(record.get("objective_score")) is not None
+    ]
+
+
+def _expanding_discovery_ranges(range_start, range_end, rung_count):
+    start_index = _bound_index(range_start)
+    end_index = _bound_index(range_end)
+    width = end_index - start_index
+    if width <= rung_count + 1:
+        return []
+    ranges = []
+    for rung in range(1, rung_count + 1):
+        fraction = rung / (rung_count + 1)
+        rung_start = end_index - max(1, round(width * fraction))
+        ranges.append((rung_start, end_index))
+    return ranges
+
+
+def _walk_forward_ranges(ranges, fold_count):
+    start_index = _bound_index(ranges["stress"][0])
+    end_index = _bound_index(ranges["discovery"][0])
+    width = end_index - start_index
+    fold_count = min(max(0, fold_count), max(0, width))
+    if fold_count < 2:
+        return []
+    boundaries = [
+        start_index + round(width * index / fold_count)
+        for index in range(fold_count + 1)
+    ]
+    return [
+        (boundaries[index], boundaries[index + 1])
+        for index in range(fold_count)
+        if boundaries[index] < boundaries[index + 1]
+    ]
 
 
 def _count_auto_evaluations(output_dir):
@@ -1220,29 +1607,157 @@ def _count_auto_evaluations(output_dir):
     return completed
 
 
-def _write_candidate_plan(path, cycle, stage, candidates):
-    _write_json(path, {
-        "cycle": cycle,
-        "stage": stage,
-        "candidate_count": len(candidates),
-        "candidates": candidates,
-    })
+def _write_candidate_plan(path, cycle, stage, candidates, source=None):
+    """Write a compact, backwards-compatible candidate plan.
+
+    Parameter names are stored once instead of once per candidate.  A stage that
+    reuses an unchanged plan can point at its source rather than duplicating it.
+    """
+    path = Path(path)
+    if source is not None:
+        payload = {
+            "version": 2,
+            "cycle": cycle,
+            "stage": stage,
+            "candidate_count": len(candidates),
+            "source": os.path.relpath(Path(source), path.parent),
+        }
+    else:
+        parameter_keys = list(candidates[0].get("params", {})) if candidates else []
+        payload = {
+            "version": 2,
+            "cycle": cycle,
+            "stage": stage,
+            "candidate_count": len(candidates),
+            "parameter_keys": parameter_keys,
+            "candidate_rows": [
+                [candidate["candidate_id"], *(
+                    candidate.get("params", {}).get(key) for key in parameter_keys
+                )]
+                for candidate in candidates
+            ],
+        }
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as file:
+        json.dump(_json_safe(payload), file, separators=(",", ":"), ensure_ascii=False)
+        file.write("\n")
+    os.replace(temporary, path)
 
 
 def _read_candidate_plan(path):
     payload = _load_json(path, {}) or {}
+    if payload.get("source"):
+        source_path = Path(path).parent / payload["source"]
+        return _read_candidate_plan(source_path.resolve())
+    if "candidate_rows" in payload:
+        keys = payload.get("parameter_keys", [])
+        return [
+            {
+                "candidate_id": row[0],
+                "params": dict(zip(keys, row[1:])),
+            }
+            for row in payload["candidate_rows"]
+        ]
     return payload.get("candidates", [])
+
+
+def _compact_auto_candidate_plans(output_dir):
+    """Upgrade verbose legacy plans and replace exact rung-1 copies in place."""
+    rewritten = 0
+    bytes_before = 0
+    bytes_after = 0
+    cycles_dir = Path(output_dir) / "cycles"
+    for path in sorted(cycles_dir.glob("cycle_*/*_candidates.json")):
+        payload = _load_json(path, {}) or {}
+        needs_upgrade = payload.get("version") != 2
+        source_path = path.parent / "discovery_pool_candidates.json"
+        use_source = path.name == "discovery_rung_01_candidates.json" and source_path.is_file()
+        if not needs_upgrade and (not use_source or payload.get("source")):
+            continue
+        candidates = _read_candidate_plan(path)
+        if use_source and candidates != _read_candidate_plan(source_path):
+            use_source = False
+        old_size = path.stat().st_size
+        _write_candidate_plan(
+            path,
+            payload.get("cycle"),
+            payload.get("stage", path.stem.removesuffix("_candidates")),
+            candidates,
+            source=source_path if use_source else None,
+        )
+        rewritten += 1
+        bytes_before += old_size
+        bytes_after += path.stat().st_size
+    return rewritten, max(0, bytes_before - bytes_after)
+
+
+def _cleanup_completed_auto_cycles(output_dir, current_cycle):
+    """Drop redundant plans and temporary checkpoints from completed cycles."""
+    removed = 0
+    reclaimed = 0
+    cycles_dir = Path(output_dir) / "cycles"
+    for cycle_dir in sorted(cycles_dir.glob("cycle_*")):
+        try:
+            cycle_number = int(cycle_dir.name.removeprefix("cycle_"))
+        except ValueError:
+            continue
+        if cycle_number >= int(current_cycle):
+            continue
+        keep = {"discovery_candidates.json", "discovery_pool_candidates.json"}
+        for path in cycle_dir.glob("*_candidates.json"):
+            if path.name not in keep:
+                reclaimed += path.stat().st_size
+                path.unlink()
+                removed += 1
+        checkpoints_dir = cycle_dir / "checkpoints"
+        if checkpoints_dir.is_dir():
+            for checkpoint_dir in checkpoints_dir.iterdir():
+                if not checkpoint_dir.is_dir():
+                    continue
+                for name in ("best_params.json", "checkpoint.json"):
+                    path = checkpoint_dir / name
+                    if path.is_file():
+                        reclaimed += path.stat().st_size
+                        path.unlink()
+                        removed += 1
+                if not any(checkpoint_dir.iterdir()):
+                    checkpoint_dir.rmdir()
+            if not any(checkpoints_dir.iterdir()):
+                checkpoints_dir.rmdir()
+    return removed, reclaimed
 
 
 def _auto_stage_fieldnames(keys):
     return [
         "candidate_id", "cycle", "stage", "range_start", "range_end",
-        *keys, *RESULT_COLUMNS, *DERIVED_RESULT_COLUMNS, "duration_s", "error",
+        *keys, *RESULT_COLUMNS, *DERIVED_RESULT_COLUMNS, *AUTO_TIME_COLUMNS,
+        "duration_s", "error",
     ]
 
 
+def _upgrade_auto_stage_csv(path, keys):
+    """Add time-normalized columns before appending to a version-1 checkpoint."""
+    path = Path(path)
+    if not path.is_file() or path.stat().st_size == 0:
+        return
+    with path.open(newline="", encoding="utf-8") as csv_file:
+        reader = csv.DictReader(csv_file)
+        existing_fields = reader.fieldnames or []
+        if all(column in existing_fields for column in AUTO_TIME_COLUMNS):
+            return
+        rows = list(reader)
+    for row in rows:
+        range_candles = _range_candle_count(row["range_start"], row["range_end"])
+        row["range_candles"] = range_candles
+        row["time_normalized_score"] = _time_normalized_score(
+            row.get("objective_score"), range_candles
+        )
+    _write_rows_atomic(path, _auto_stage_fieldnames(keys), rows)
+
+
 def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
-                     params, result, duration, objective_score, error):
+                     params, result, duration, objective_score, error,
+                     time_normalized_score=None, range_candles=None):
     row = {
         "candidate_id": candidate_id,
         "cycle": cycle,
@@ -1251,6 +1766,8 @@ def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
         "range_end": range_end,
         "duration_s": round(duration, 4),
         "objective_score": objective_score,
+        "time_normalized_score": time_normalized_score,
+        "range_candles": range_candles,
         "error": error,
     }
     row.update({key: params[key] for key in keys})
@@ -1281,11 +1798,25 @@ def _read_auto_stage_records(path, candidates):
             if candidate is None:
                 continue
             result = {key: _parse_metric(row.get(key)) for key in RESULT_COLUMNS}
+            raw_score = _parse_metric(row.get("objective_score"))
+            range_candles = _parse_metric(row.get("range_candles"))
+            if range_candles is None:
+                try:
+                    range_candles = _range_candle_count(
+                        row.get("range_start"), row.get("range_end")
+                    )
+                except (TypeError, ValueError):
+                    range_candles = None
+            normalized_score = _parse_metric(row.get("time_normalized_score"))
+            if normalized_score is None:
+                normalized_score = _time_normalized_score(raw_score, range_candles)
             records[row["candidate_id"]] = {
                 "candidate_id": row["candidate_id"],
                 "params": candidate["params"],
                 "result": result,
-                "objective_score": _parse_metric(row.get("objective_score")),
+                "objective_score": raw_score,
+                "time_normalized_score": normalized_score,
+                "range_candles": range_candles,
                 "duration": float(row.get("duration_s") or 0),
                 "error": row.get("error") or None,
             }
@@ -1300,7 +1831,7 @@ def _auto_stage_best(records):
     records = list(records)
 
     def rank(record):
-        objective = _finite_number(record.get("objective_score"))
+        objective = _record_comparable_score(record)
         if objective is not None:
             return 1, objective
         score = _finite_number((record.get("result") or {}).get("score"))
@@ -1328,6 +1859,7 @@ def _write_auto_stage_checkpoint(
         "total": total,
         "best_candidate_id": best["candidate_id"],
         "best_objective_score": best.get("objective_score"),
+        "best_time_normalized_score": best.get("time_normalized_score"),
         "best_params": effective_params,
         "updated_at": _timestamp_now(),
     }
@@ -1338,6 +1870,20 @@ def _write_auto_stage_checkpoint(
         "checkpoint_best_params": effective_params,
     })
     return best
+
+
+def _clear_auto_stage_checkpoint(cycle_dir, stage):
+    """Remove an ephemeral stage checkpoint after its result CSV is complete."""
+    checkpoint_dir = Path(cycle_dir) / "checkpoints" / stage
+    for name in ("best_params.json", "checkpoint.json"):
+        path = checkpoint_dir / name
+        if path.is_file():
+            path.unlink()
+    if checkpoint_dir.is_dir() and not any(checkpoint_dir.iterdir()):
+        checkpoint_dir.rmdir()
+    parent = checkpoint_dir.parent
+    if parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
 
 
 def _run_auto_stage(
@@ -1351,10 +1897,12 @@ def _run_auto_stage(
     cycle_dir,
     state,
     state_path,
+    min_trades_override=None,
 ):
     """Evaluate one auto stage and persist every yielded result for exact resume."""
     keys = tuple(state["config"]["parameter_grid"])
     results_path = Path(cycle_dir) / f"{stage}_results.csv"
+    _upgrade_auto_stage_csv(results_path, keys)
     existing = _read_auto_stage_records(results_path, candidates)
     records = {record["candidate_id"]: record for record in existing}
     pending = [
@@ -1364,12 +1912,14 @@ def _run_auto_stage(
     total = len(candidates)
     print(
         f"Cycle {cycle} | {stage}: {len(existing):,}/{total:,} complete | "
-        f"range {range_start} -> {range_end}"
+        f"range {_format_range_bound(range_start)} -> "
+        f"{_format_range_bound(range_end)}"
     )
     if not pending:
         _write_auto_stage_checkpoint(
             cycle_dir, stage, existing, base_tune, len(existing), total, state
         )
+        _clear_auto_stage_checkpoint(cycle_dir, stage)
         return existing, False
 
     fieldnames = _auto_stage_fieldnames(keys)
@@ -1381,6 +1931,10 @@ def _run_auto_stage(
     pool = None
     pool_terminated = False
     interrupted = False
+    effective_min_trades = (
+        args.min_trades if min_trades_override is None else min_trades_override
+    )
+    range_candles = _range_candle_count(range_start, range_end)
 
     with results_path.open("a" if append else "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -1420,18 +1974,24 @@ def _run_auto_stage(
         try:
             for candidate_id, params, result, duration, error in evaluated:
                 objective_score = None
+                normalized_score = None
                 if not error:
                     closed_trades = int(result.get("closed_trades", 0) or 0)
                     if closed_trades > 0:
                         value = _objective_score(
                             result,
-                            min_trades=args.min_trades,
+                            min_trades=effective_min_trades,
                             max_drawdown=args.max_drawdown,
                         )
                         objective_score = value if math.isfinite(value) else None
+                        normalized_score = _time_normalized_score(
+                            objective_score, range_candles
+                        )
                 writer.writerow(_auto_result_row(
                     keys, candidate_id, cycle, stage, range_start, range_end,
                     params, result, duration, objective_score, error,
+                    time_normalized_score=normalized_score,
+                    range_candles=range_candles,
                 ))
                 csv_file.flush()
                 records[candidate_id] = {
@@ -1439,6 +1999,8 @@ def _run_auto_stage(
                     "params": params,
                     "result": result or {},
                     "objective_score": objective_score,
+                    "time_normalized_score": normalized_score,
+                    "range_candles": range_candles,
                     "duration": duration,
                     "error": error,
                 }
@@ -1460,9 +2022,12 @@ def _run_auto_stage(
                     )
                     elapsed = time.perf_counter() - started
                     shown = "n/a" if best_score is None else f"{best_score:.4f}"
+                    current_shown = (
+                        "n/a" if objective_score is None else f"{objective_score:.4f}"
+                    )
                     print(
                         f"  [{len(records):,}/{total:,}] best={shown} "
-                        f"elapsed={elapsed:.1f}s"
+                        f"score={current_shown} elapsed={elapsed:.1f}s"
                     )
                 if len(records) % max(1, min(25, args.log_every or 25)) == 0:
                     _write_auto_stage_checkpoint(
@@ -1505,7 +2070,140 @@ def _run_auto_stage(
     _write_auto_stage_checkpoint(
         cycle_dir, stage, ordered, base_tune, len(ordered), total, state
     )
+    if not interrupted:
+        _clear_auto_stage_checkpoint(cycle_dir, stage)
     return ordered, interrupted
+
+
+def _aggregate_walk_forward_records(fold_records, candidates, stability_penalty):
+    record_maps = {
+        fold_name: {record["candidate_id"]: record for record in records}
+        for fold_name, records in fold_records.items()
+    }
+    aggregated = []
+    for candidate in candidates:
+        candidate_id = candidate["candidate_id"]
+        records = [
+            record_maps[fold_name].get(candidate_id)
+            for fold_name in sorted(record_maps)
+        ]
+        if not records or any(record is None for record in records):
+            continue
+        raw_scores = [_finite_number(record.get("objective_score")) for record in records]
+        scores = [_record_comparable_score(record) for record in records]
+        qualified = all(score is not None for score in scores)
+        valid_scores = [score for score in scores if score is not None]
+        if qualified:
+            mean_score = statistics.fmean(valid_scores)
+            median_score = statistics.median(valid_scores)
+            worst_score = min(valid_scores)
+            score_std = statistics.pstdev(valid_scores) if len(valid_scores) > 1 else 0.0
+            composite = (
+                0.50 * median_score
+                + 0.25 * mean_score
+                + 0.25 * worst_score
+                - stability_penalty * score_std
+            )
+        else:
+            mean_score = median_score = worst_score = score_std = None
+            composite = -math.inf
+
+        result = {}
+        for metric in RESULT_COLUMNS:
+            values = [
+                _finite_number((record.get("result") or {}).get(metric))
+                for record in records
+            ]
+            numeric = [value for value in values if value is not None]
+            if not numeric:
+                result[metric] = None
+            elif metric in ("closed_trades", "wins", "losses", "liquidations"):
+                result[metric] = sum(numeric)
+            elif metric == "maximum_drawdown":
+                result[metric] = max(numeric, key=abs)
+            else:
+                result[metric] = statistics.median(numeric)
+        result["score"] = composite if math.isfinite(composite) else None
+        aggregated.append({
+            "candidate_id": candidate_id,
+            "params": candidate["params"],
+            "result": result,
+            "objective_score": composite if math.isfinite(composite) else None,
+            "time_normalized_score": composite if math.isfinite(composite) else None,
+            "range_candles": sum(record.get("range_candles", 0) or 0 for record in records),
+            "duration": sum(record.get("duration", 0) for record in records),
+            "error": None if qualified else "candidate failed one or more walk-forward folds",
+            "walk_forward": {
+                "fold_raw_scores": raw_scores,
+                "fold_time_normalized_scores": scores,
+                "mean_score": mean_score,
+                "median_score": median_score,
+                "worst_score": worst_score,
+                "score_std": score_std,
+                "stability_penalty": stability_penalty,
+            },
+        })
+    return aggregated
+
+
+def _run_walk_forward_stage(
+    args, cycle, candidates, folds, base_tune, cycle_dir, state, state_path,
+):
+    """Evaluate fixed candidates on disjoint chronological folds with exact resume."""
+    fold_records = {}
+    for fold_index, (range_start, range_end) in enumerate(folds, start=1):
+        fold_name = f"walk_forward_fold_{fold_index:02d}"
+        state.update({
+            "stage": fold_name,
+            "stage_completed": 0,
+            "updated_at": _timestamp_now(),
+        })
+        _write_json(state_path, state)
+        records, interrupted = _run_auto_stage(
+            args, cycle, fold_name, candidates, range_start, range_end,
+            base_tune, cycle_dir, state, state_path,
+            min_trades_override=(
+                0 if not args.min_trades else max(
+                    1, math.ceil(args.min_trades / max(1, len(folds)))
+                )
+            ),
+        )
+        fold_records[fold_name] = records
+        if interrupted:
+            return [], True
+
+    aggregated = _aggregate_walk_forward_records(
+        fold_records,
+        candidates,
+        state["optimizer_features"]["walk_forward_stability_penalty"],
+    )
+    summary = {
+        "cycle": cycle,
+        "stage": "walk_forward",
+        "folds": [
+            {"fold": index, "start": start, "end": end}
+            for index, (start, end) in enumerate(folds, start=1)
+        ],
+        "candidate_count": len(candidates),
+        "ranking_formula": (
+            "0.50*median + 0.25*mean + 0.25*worst "
+            "- stability_penalty*population_stddev"
+        ),
+        "records": aggregated,
+    }
+    _write_json(Path(cycle_dir) / "walk_forward_summary.json", summary)
+    state.update({
+        "stage": "walk_forward",
+        "stage_completed": len(aggregated),
+        "updated_at": _timestamp_now(),
+    })
+    _write_auto_stage_checkpoint(
+        cycle_dir, "walk_forward", aggregated, base_tune,
+        len(aggregated), len(candidates), state,
+    )
+    _clear_auto_stage_checkpoint(cycle_dir, "walk_forward")
+    _write_json(state_path, state)
+    return aggregated, False
 
 
 def _write_rows_atomic(path, fieldnames, rows):
@@ -1528,7 +2226,7 @@ def _flatten_hall_record(record, keys, rank):
     }
     row.update({key: record["params"].get(key) for key in keys})
     metric_names = (
-        "score", "total_profit", "total_profit_percent", "closed_trades",
+        "score", "time_normalized_score", "total_profit", "total_profit_percent", "closed_trades",
         "win_rate", "maximum_drawdown", "profit_factor", "expectancy_percent",
         "calmar_ratio", "liquidations",
     )
@@ -1632,6 +2330,7 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
     )
     summary = {
         "mode": "auto",
+        "optimizer_version": state.get("version", 1),
         "status": state["status"],
         "cycles_completed": state["cycles_completed"],
         "current_cycle": state["cycle"],
@@ -1640,6 +2339,9 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "hall_of_fame_size": len(ranked_hall),
         "best_robust_score": ranked_hall[0]["robust_score"] if ranked_hall else None,
         "best_params": ranked_hall[0]["effective_params"] if ranked_hall else None,
+        "optimizer_features": state.get("optimizer_features"),
+        "advanced_from_cycle": state.get("advanced_from_cycle"),
+        "bootstrap": state.get("bootstrap"),
         "excel_report": str(workbook) if workbook else None,
         "updated_at": state["updated_at"],
     }
@@ -1680,20 +2382,41 @@ def run_auto_optimization(args, grid=None):
     config = _auto_configuration(
         args, profile, grid, base_tune, base_description, resolved_end
     )
+    optimizer_features = _auto_feature_configuration(args)
+    bootstrap = _auto_bootstrap(args, grid)
+    resume_existing = bool(args.resume or state_path.is_file())
 
-    if args.resume:
+    if resume_existing:
         state = _load_json(state_path)
         if state is None:
             raise FileNotFoundError(
                 f"auto checkpoint not found: {state_path}. Start without --resume first."
             )
-        if state.get("version") != AUTO_STATE_VERSION:
+        if state.get("version", 1) not in LEGACY_AUTO_STATE_VERSIONS:
             raise ValueError("auto checkpoint version is not compatible")
         if state.get("config") != config:
             raise ValueError(
                 "auto checkpoint settings differ from this command; use the original "
                 "profile, ranges, test counts, base parameters, and constraints"
             )
+        saved_features = state.get("optimizer_features")
+        if saved_features is not None and saved_features != optimizer_features:
+            raise ValueError(
+                "auto search-engine settings differ from this checkpoint; use the "
+                "original halving, surrogate, and walk-forward options"
+            )
+        if saved_features is None:
+            # Version-1 campaigns may already be halfway through a stage. Finish
+            # that exact plan first and activate the new engine next cycle.
+            current_cycle_dir = (
+                output_dir / "cycles" / f"cycle_{int(state['cycle']):06d}"
+            )
+            state["optimizer_features"] = optimizer_features
+            state["advanced_from_cycle"] = int(state["cycle"]) + int(
+                current_cycle_dir.exists()
+            )
+            state["migrated_from_version"] = state.get("version", 1)
+            state["version"] = AUTO_STATE_VERSION
         hall = _load_json(output_dir / "hall_of_fame.json", []) or []
         importance = _load_json(output_dir / "parameter_importance.json", {}) or {}
         state.update({
@@ -1705,6 +2428,8 @@ def run_auto_optimization(args, grid=None):
             f"Resuming auto cycle {state['cycle']} at {state['stage']} | "
             f"{state['total_evaluations']:,} total evaluations"
         )
+        if not args.resume:
+            print("Existing auto checkpoint detected; resume was selected automatically.")
     else:
         if state_path.exists():
             raise FileExistsError(
@@ -1729,7 +2454,21 @@ def run_auto_optimization(args, grid=None):
             "created_at": _timestamp_now(),
             "updated_at": _timestamp_now(),
             "config": config,
+            "optimizer_features": optimizer_features,
+            "advanced_from_cycle": 1,
+            "bootstrap": bootstrap,
         }
+    removed_files, removed_bytes = _cleanup_completed_auto_cycles(
+        output_dir, state["cycle"]
+    )
+    compacted_plans, compacted_bytes = _compact_auto_candidate_plans(output_dir)
+    reclaimed_bytes = removed_bytes + compacted_bytes
+    if removed_files or compacted_plans:
+        print(
+            f"Storage cleanup: removed {removed_files:,} redundant files, "
+            f"compacted {compacted_plans:,} candidate plans | "
+            f"reclaimed {reclaimed_bytes / (1024 * 1024):.1f} MiB"
+        )
     _write_json(state_path, state)
 
     ranges = config["ranges"]
@@ -1737,11 +2476,24 @@ def run_auto_optimization(args, grid=None):
         f"Mode: auto | {args.auto_tests:,} discovery tests/cycle | "
         f"workers: {max(1, args.workers)}"
     )
-    print(
-        f"Funnel: {args.auto_tests:,} -> {args.auto_validation_top} -> "
-        f"{args.auto_stress_top} -> {args.auto_final_top} | profile: {profile}"
-    )
+    if args.auto_tests >= optimizer_features["advanced_min_candidates"]:
+        print(
+            f"Funnel: {args.auto_tests:,} -> {args.auto_validation_top} -> "
+            f"{args.auto_stress_top} -> WF {args.auto_walk_forward_top} -> "
+            f"{args.auto_final_top} | profile: {profile}"
+        )
+    else:
+        print(
+            f"Funnel (legacy-small-run): {args.auto_tests:,} -> "
+            f"{args.auto_validation_top} -> {args.auto_stress_top} -> "
+            f"{args.auto_final_top} | profile: {profile}"
+        )
     print(f"Latest market end: {resolved_end}")
+    if not resume_existing and bootstrap:
+        print(
+            f"Warm start: {bootstrap['compatible_parameter_count']} compatible "
+            f"parameters loaded from {bootstrap['source']}"
+        )
 
     cycle_limit = max(0, int(args.auto_cycles))
     try:
@@ -1752,7 +2504,8 @@ def run_auto_optimization(args, grid=None):
             continuation_parent = hall[0] if hall else None
             continuation_base = (
                 continuation_parent.get("effective_params", continuation_parent["params"])
-                if continuation_parent else base_tune
+                if continuation_parent
+                else (state.get("bootstrap") or {}).get("params", base_tune)
             )
             training_parent = {
                 "source": "hall_of_fame" if continuation_parent else "base_configuration",
@@ -1766,9 +2519,16 @@ def run_auto_optimization(args, grid=None):
             }
             state["training_parent"] = training_parent
             _write_json(cycle_dir / "training_parent.json", training_parent)
-            discovery_plan_path = cycle_dir / "discovery_candidates.json"
-            if discovery_plan_path.is_file():
-                discovery_candidates = _read_candidate_plan(discovery_plan_path)
+            advanced = (
+                args.auto_tests >= optimizer_features["advanced_min_candidates"]
+                and cycle >= int(state.get("advanced_from_cycle", 1))
+            )
+            source_plan_path = cycle_dir / (
+                "discovery_pool_candidates.json" if advanced
+                else "discovery_candidates.json"
+            )
+            if source_plan_path.is_file():
+                discovery_pool = _read_candidate_plan(source_plan_path)
             else:
                 seen = _load_auto_seen(output_dir, keys)
                 elite_records = [
@@ -1789,11 +2549,28 @@ def run_auto_optimization(args, grid=None):
                     refinement_round=max(1, cycle - 1),
                 )
                 generator.seen.update(seen)
-                generated = (
-                    generator.generate_auto(args.auto_tests, elites=elite_records)
-                    if elite_records else generator.generate(args.auto_tests)
+                history = _load_discovery_history(output_dir, keys) if advanced else []
+                surrogate_ready = (
+                    len(history) >= optimizer_features["surrogate_min_samples"]
                 )
-                discovery_candidates = [
+                pool_target = args.auto_tests * (
+                    optimizer_features["surrogate_pool_multiplier"]
+                    if advanced and surrogate_ready else 1
+                )
+                generated_pool = (
+                    generator.generate_auto(pool_target, elites=elite_records)
+                    if elite_records else generator.generate(pool_target)
+                )
+                generated, surrogate_metadata = _select_surrogate_candidates(
+                    generated_pool,
+                    history,
+                    args.auto_tests,
+                    keys,
+                    grid,
+                    optimizer_features,
+                    args.seed + cycle - 1,
+                )
+                discovery_pool = [
                     {
                         "candidate_id": f"c{cycle:06d}-{index:06d}",
                         "params": params,
@@ -1801,15 +2578,111 @@ def run_auto_optimization(args, grid=None):
                     for index, params in enumerate(generated, start=1)
                 ]
                 _write_candidate_plan(
-                    discovery_plan_path, cycle, "discovery", discovery_candidates
+                    source_plan_path,
+                    cycle,
+                    "discovery_pool" if advanced else "discovery",
+                    discovery_pool,
                 )
-            if not discovery_candidates:
+                if advanced:
+                    surrogate_metadata.update({
+                        "cycle": cycle,
+                        "created_at": _timestamp_now(),
+                        "uses_previous_discovery_results": True,
+                    })
+                    _write_json(cycle_dir / "surrogate_search.json", surrogate_metadata)
+            if not discovery_pool:
                 state.update({"status": "exhausted", "updated_at": _timestamp_now()})
                 _write_json(state_path, state)
                 print("Auto search space is exhausted; no unique discovery candidates remain.")
                 break
 
             stage_results = {}
+            discovery_candidates = discovery_pool
+            if advanced and optimizer_features["halving_rungs"]:
+                rung_ranges = _expanding_discovery_ranges(
+                    *ranges["discovery"], optimizer_features["halving_rungs"]
+                )
+                previous_records = None
+                for rung_index, rung_range in enumerate(rung_ranges, start=1):
+                    rung_stage = f"discovery_rung_{rung_index:02d}"
+                    rung_plan_path = cycle_dir / f"{rung_stage}_candidates.json"
+                    if rung_plan_path.is_file():
+                        rung_candidates = _read_candidate_plan(rung_plan_path)
+                    elif rung_index == 1:
+                        rung_candidates = discovery_pool
+                        _write_candidate_plan(
+                            rung_plan_path, cycle, rung_stage, rung_candidates,
+                            source=source_plan_path,
+                        )
+                    else:
+                        keep_count = max(
+                            args.auto_validation_top,
+                            math.ceil(
+                                len(discovery_candidates)
+                                * optimizer_features["halving_keep"]
+                            ),
+                        )
+                        rung_candidates = _promote_candidates(
+                            previous_records, keep_count
+                        )
+                        _write_candidate_plan(
+                            rung_plan_path, cycle, rung_stage, rung_candidates
+                        )
+                    discovery_candidates = rung_candidates
+                    state.update({
+                        "status": "running", "stage": rung_stage,
+                        "stage_completed": 0, "updated_at": _timestamp_now(),
+                    })
+                    _write_json(state_path, state)
+                    previous_records, interrupted = _run_auto_stage(
+                        args, cycle, rung_stage, rung_candidates,
+                        *rung_range, base_tune, cycle_dir, state, state_path,
+                        min_trades_override=(
+                            0 if not args.min_trades else max(
+                                1,
+                                math.ceil(
+                                    args.min_trades
+                                    * (rung_range[1] - rung_range[0])
+                                    / max(
+                                        1,
+                                        _bound_index(ranges["discovery"][1])
+                                        - _bound_index(ranges["discovery"][0]),
+                                    )
+                                ),
+                            )
+                        ),
+                    )
+                    if interrupted:
+                        _write_auto_reports(
+                            output_dir, hall, importance, state, keys,
+                            excel_enabled=bool(args.excel_top),
+                        )
+                        return hall[0] if hall else None
+
+                discovery_plan_path = cycle_dir / "discovery_candidates.json"
+                if discovery_plan_path.is_file():
+                    discovery_candidates = _read_candidate_plan(discovery_plan_path)
+                else:
+                    keep_count = max(
+                        args.auto_validation_top,
+                        math.ceil(
+                            len(discovery_candidates)
+                            * optimizer_features["halving_keep"]
+                        ),
+                    )
+                    discovery_candidates = _promote_candidates(
+                        previous_records, keep_count
+                    )
+                    _write_candidate_plan(
+                        discovery_plan_path, cycle, "discovery", discovery_candidates
+                    )
+
+            discovery_plan_path = cycle_dir / "discovery_candidates.json"
+            if advanced and not discovery_plan_path.is_file():
+                _write_candidate_plan(
+                    discovery_plan_path, cycle, "discovery", discovery_candidates
+                )
+
             state.update({
                 "status": "running", "stage": "discovery", "stage_completed": 0,
                 "updated_at": _timestamp_now(),
@@ -1837,11 +2710,12 @@ def run_auto_optimization(args, grid=None):
                 _write_json(output_dir / "parameter_importance.json", importance)
                 _write_json(state_path, state)
 
-            stage_plan = (
+            stage_plan = [
                 ("validation", args.auto_validation_top),
                 ("stress", args.auto_stress_top),
-                ("final", args.auto_final_top),
-            )
+            ]
+            if not advanced:
+                stage_plan.append(("final", args.auto_final_top))
             for stage, keep_count in stage_plan:
                 plan_path = cycle_dir / f"{stage}_candidates.json"
                 if plan_path.is_file():
@@ -1873,6 +2747,74 @@ def run_auto_optimization(args, grid=None):
                     )
                     return hall[0] if hall else None
 
+            if advanced:
+                walk_folds = _walk_forward_ranges(
+                    ranges, optimizer_features["walk_forward_folds"]
+                )
+                if walk_folds:
+                    walk_plan_path = cycle_dir / "walk_forward_candidates.json"
+                    if walk_plan_path.is_file():
+                        walk_candidates = _read_candidate_plan(walk_plan_path)
+                    else:
+                        ranked = _combine_auto_stage_records(stage_results)
+                        walk_candidates = [
+                            {
+                                "candidate_id": record["candidate_id"],
+                                "params": record["params"],
+                            }
+                            for record in ranked[
+                                :optimizer_features["walk_forward_top"]
+                            ]
+                            if math.isfinite(record["robust_score"])
+                        ]
+                        _write_candidate_plan(
+                            walk_plan_path, cycle, "walk_forward", walk_candidates
+                        )
+                    walk_records, interrupted = _run_walk_forward_stage(
+                        args, cycle, walk_candidates, walk_folds, base_tune,
+                        cycle_dir, state, state_path,
+                    )
+                    stage_results["walk_forward"] = walk_records
+                    if interrupted:
+                        _write_auto_reports(
+                            output_dir, hall, importance, state, keys,
+                            excel_enabled=bool(args.excel_top),
+                        )
+                        return hall[0] if hall else None
+
+                final_plan_path = cycle_dir / "final_candidates.json"
+                if final_plan_path.is_file():
+                    final_candidates = _read_candidate_plan(final_plan_path)
+                else:
+                    ranked = _combine_auto_stage_records(stage_results)
+                    final_candidates = [
+                        {
+                            "candidate_id": record["candidate_id"],
+                            "params": record["params"],
+                        }
+                        for record in ranked[:args.auto_final_top]
+                        if math.isfinite(record["robust_score"])
+                    ]
+                    _write_candidate_plan(
+                        final_plan_path, cycle, "final", final_candidates
+                    )
+                state.update({
+                    "stage": "final", "stage_completed": 0,
+                    "updated_at": _timestamp_now(),
+                })
+                _write_json(state_path, state)
+                final_records, interrupted = _run_auto_stage(
+                    args, cycle, "final", final_candidates, *ranges["final"],
+                    base_tune, cycle_dir, state, state_path,
+                )
+                stage_results["final"] = final_records
+                if interrupted:
+                    _write_auto_reports(
+                        output_dir, hall, importance, state, keys,
+                        excel_enabled=bool(args.excel_top),
+                    )
+                    return hall[0] if hall else None
+
             finalists = _combine_auto_stage_records(stage_results)
             hall = _merge_hall_of_fame(
                 hall, finalists, cycle, keys, base_tune, args.auto_hall_size
@@ -1890,6 +2832,7 @@ def run_auto_optimization(args, grid=None):
                 output_dir, hall, importance, state, keys,
                 excel_enabled=bool(args.excel_top),
             )
+            _cleanup_completed_auto_cycles(output_dir, state["cycle"])
             best_text = (
                 f"{hall[0]['robust_score']:.4f}" if hall else "no qualified finalist"
             )
@@ -2063,8 +3006,12 @@ def run_optimization(args, grid=None):
                     best = record
                 if args.log_every and (completed % args.log_every == 0 or completed == requested_tests):
                     best_score = _score(best["result"]) if best else -math.inf
+                    current_score = _score(result)
                     elapsed = time.perf_counter() - started
-                    print(f"[{completed:,}/{requested_tests:,}] best_score={best_score:.4f} elapsed={elapsed:.1f}s")
+                    print(
+                        f"[{completed:,}/{requested_tests:,}] best_score={best_score:.4f} "
+                        f"score={current_score:.4f} elapsed={elapsed:.1f}s"
+                    )
             csv_file.flush()
             _write_best_files(
                 output_dir, best, args.mode, requested_tests, completed,
@@ -2188,111 +3135,273 @@ def run_optimization(args, grid=None):
     return best
 
 
+class _OptimizerHelpFormatter(
+    argparse.ArgumentDefaultsHelpFormatter,
+    argparse.RawDescriptionHelpFormatter,
+):
+    """Keep command examples readable while still showing option defaults."""
+
+    def _get_help_string(self, action):
+        help_text = action.help
+        if (
+            "%(default)" not in help_text
+            and action.default not in (None, False, argparse.SUPPRESS)
+        ):
+            help_text += " (default: %(default)s)"
+        return help_text
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Optimize ma_strategy in grid, smart, or continuous auto mode."
+        prog="optimize.py",
+        formatter_class=_OptimizerHelpFormatter,
+        description="""Search for robust ma_strategy parameters.
+
+Choose one search path:
+  smart  Budgeted adaptive search (recommended for normal experiments).
+  grid   Every combination in a profile; usually only practical for tiny grids.
+  auto   Continuous model-guided search with successive halving, walk-forward
+         validation, stress tests, and full-history finalists. Existing state is
+         resumed automatically. It runs until Ctrl+C unless --auto-cycles is set.
+
+Dates are inclusive at START and exclusive at END. A candle index may be used
+instead of a YYYY-MM-DD date.""",
+        epilog="""recommended examples:
+  Inspect profiles and estimate a run without starting it:
+    python optimize.py --list-profiles
+    python optimize.py --mode smart --profile focused --tests 5000 --dry-run
+
+  Start a fast adaptive search from strategy_config.py:
+    python optimize.py --mode smart --profile focused --base-source config `
+      --tests 5000 -w 8 --output-dir outputs/optimize/focused_run
+
+  Train on one period and validate the best 30 candidates on unseen data:
+    python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+      --start 2023-01-01 --end 2025-01-01 `
+      --validation-start 2025-01-01 --validation-end 2026-01-01 `
+      --validation-top 30 --min-trades 50 --max-drawdown 35 `
+      --output-dir outputs/optimize/validated_signal
+
+  Refine an existing winner, then resume the same interrupted run:
+    python optimize.py --mode smart --profile exit --base-source best `
+      --base-params outputs/optimize/best_params.json --tests 5000 -w 8 `
+      --output-dir outputs/optimize/refine_exit
+    python optimize.py --mode smart --profile exit --base-source best `
+      --base-params outputs/optimize/best_params.json --tests 5000 -w 8 `
+      --output-dir outputs/optimize/refine_exit --resume
+
+  Run two auto cycles (omit --auto-cycles to run until Ctrl+C):
+    python optimize.py --auto --auto-cycles 2 -w 16 `
+      --output-dir outputs/optimize/auto_two_cycles
+
+  Resume the auto campaign with exactly the same settings (--resume is optional
+  when the checkpoint already exists):
+    python optimize.py --auto --auto-cycles 2 -w 16 `
+      --output-dir outputs/optimize/auto_two_cycles --resume
+
+Tips:
+  * Start with --dry-run. Full built-in grids can contain enormous combinations.
+  * Use a new --output-dir for a new experiment; use --resume only for the same run.
+  * Plain --auto detects and resumes a compatible checkpoint in --output-dir.
+  * A new campaign warm-starts from a compatible existing --base-params winner.
+  * For trustworthy selection, keep validation/stress data outside the search range.
+  * Raw score is preserved; cross-range comparisons use a candle-count annualized score.
+  * Auto mode defaults to profile=full; non-auto mode defaults to profile=focused.""",
     )
-    parser.add_argument(
+
+    search = parser.add_argument_group("search mode and parameter scope")
+    search.add_argument(
         "--auto", action="store_true",
-        help="run endless staged discovery/validation/stress/final optimization",
+        help="use the resumable staged auto campaign (overrides --mode)",
     )
-    parser.add_argument("--mode", choices=("smart", "grid"), default="smart",
-                        help="smart uses a test budget; grid evaluates the full Cartesian product")
-    parser.add_argument("--tests", type=int, default=5000,
-                        help="number of candidates in smart mode (default: 5000)")
-    parser.add_argument(
+    search.add_argument(
+        "--mode", choices=("smart", "grid"), default="smart",
+        help="non-auto search algorithm",
+    )
+    search.add_argument(
+        "--tests", type=int, default=5000, metavar="N",
+        help="candidate budget in smart mode; ignored by grid and auto",
+    )
+    search.add_argument(
         "--profile", choices=tuple(PARAMETER_PROFILES), default=None,
         help="parameter group (default: full in auto mode, focused otherwise)",
     )
-    parser.add_argument(
+    search.add_argument(
         "--base-source", choices=("config", "best", "file"), default="config",
-        help="start from strategy_config.py or an existing parameter JSON",
+        help="fixed/base values come from strategy_config.py or --base-params JSON",
     )
-    parser.add_argument(
+    search.add_argument(
         "--base-params", default=os.path.join("outputs", "optimize", "best_params.json"),
-        help="JSON used when --base-source is best/file",
+        metavar="PATH", help="JSON read when --base-source is best or file",
     )
-    parser.add_argument("-w", "--workers", type=int, default=min(8, os.cpu_count() or 1))
-    parser.add_argument("--batch-size", type=int, default=0,
-                        help="adaptive batch size (0=auto)")
-    parser.add_argument("--chunksize", type=int, default=0,
-                        help="multiprocessing task chunksize (0=auto)")
-    parser.add_argument("--elite-size", type=int, default=20,
-                        help="top candidates used to guide smart search")
-    parser.add_argument("--seed", type=int, default=42,
-                        help="random seed for reproducible smart searches")
-    parser.add_argument("--start", default="2025-01-01", help="inclusive date or candle index")
-    parser.add_argument("--end", default="2026-02-23", help="exclusive date or candle index")
-    parser.add_argument("--validation-start", help="optional out-of-sample start")
-    parser.add_argument("--validation-end", help="optional out-of-sample end")
-    parser.add_argument("--validation-top", type=int, default=20,
-                        help="number of training finalists tested out-of-sample")
-    parser.add_argument("--overfit-penalty", type=float, default=0.25,
-                        help="penalty applied when training score exceeds validation score")
-    parser.add_argument("--min-trades", type=int, default=0,
-                        help="disqualify candidates with fewer closed trades")
-    parser.add_argument("--max-drawdown", type=float,
-                        help="disqualify candidates whose absolute drawdown exceeds this percent")
-    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
-    parser.add_argument("--resume", action="store_true",
-                        help="continue a compatible CSV checkpoint in output-dir")
-    parser.add_argument("--log-every", type=int, default=10,
-                        help="print progress every N completed tests (0=silent)")
-    parser.add_argument("--top-n", type=int, default=20,
-                        help="number of ranked candidates saved to top_results.json")
-    parser.add_argument(
+
+    execution = parser.add_argument_group("execution and reproducibility")
+    execution.add_argument(
+        "-w", "--workers", type=int, default=min(8, os.cpu_count() or 1), metavar="N",
+        help="parallel worker processes",
+    )
+    execution.add_argument(
+        "--batch-size", type=int, default=0, metavar="N",
+        help="candidates evaluated before adapting/checkpointing; 0 selects automatically",
+    )
+    execution.add_argument(
+        "--chunksize", type=int, default=0, metavar="N",
+        help="tasks sent to each worker at once; 0 selects automatically",
+    )
+    execution.add_argument(
+        "--elite-size", type=int, default=20, metavar="N",
+        help="top candidates that guide smart search",
+    )
+    execution.add_argument(
+        "--seed", type=int, default=42, metavar="N",
+        help="random seed for reproducible smart/auto candidate generation",
+    )
+
+    ranges = parser.add_argument_group("standard search ranges and robustness")
+    ranges.add_argument(
+        "--start", default="2025-01-01", metavar="DATE|INDEX",
+        help="inclusive training start",
+    )
+    ranges.add_argument(
+        "--end", default="2026-02-23", metavar="DATE|INDEX",
+        help="exclusive training end",
+    )
+    ranges.add_argument(
+        "--validation-start", metavar="DATE|INDEX",
+        help="inclusive out-of-sample start; requires --validation-end",
+    )
+    ranges.add_argument(
+        "--validation-end", metavar="DATE|INDEX",
+        help="exclusive out-of-sample end; requires --validation-start",
+    )
+    ranges.add_argument(
+        "--validation-top", type=int, default=20, metavar="N",
+        help="training finalists re-tested out-of-sample",
+    )
+    ranges.add_argument(
+        "--overfit-penalty", type=float, default=0.25, metavar="FLOAT",
+        help="penalty when training score exceeds validation score",
+    )
+    ranges.add_argument(
+        "--min-trades", type=int, default=0, metavar="N",
+        help="disqualify candidates with fewer closed trades (0 disables)",
+    )
+    ranges.add_argument(
+        "--max-drawdown", type=float, metavar="PERCENT",
+        help="disqualify candidates above this absolute drawdown percentage",
+    )
+
+    output = parser.add_argument_group("output, checkpoints, and planning")
+    output.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, metavar="PATH",
+                        help="directory for CSV, JSON, checkpoints, and reports")
+    output.add_argument("--resume", action="store_true",
+                        help="require a compatible checkpoint; auto detects one without this flag")
+    output.add_argument("--log-every", type=int, default=10, metavar="N",
+                        help="print progress every N completed tests (0 is silent)")
+    output.add_argument("--top-n", type=int, default=20, metavar="N",
+                        help="ranked candidates saved to top_results.json")
+    output.add_argument(
         "--excel-top", type=int, default=5000,
-        help="top candidates included in XLSX (0 disables it; default: 5000)",
+        metavar="N", help="top candidates included in XLSX (0 disables XLSX)",
     )
-    parser.add_argument("--list-profiles", action="store_true",
-                        help="show optimization profiles and exit")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="print the planned search size without evaluating candidates")
-    parser.add_argument(
+    output.add_argument("--list-profiles", action="store_true",
+                        help="show profile parameter counts/grid sizes and exit")
+    output.add_argument("--dry-run", action="store_true",
+                        help="print the resolved plan without running backtests")
+
+    auto = parser.add_argument_group("auto campaign (used only with --auto)")
+    auto.add_argument(
         "--auto-tests", type=int, default=2000,
-        help="new discovery candidates generated in every auto cycle (default: 2000)",
+        metavar="N",
+        help="new discovery candidates generated in every auto cycle",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-validation-top", type=int, default=30,
+        metavar="N",
         help="discovery finalists sent to the independent validation range",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-stress-top", type=int, default=10,
+        metavar="N",
         help="validation finalists sent to the older stress range",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-final-top", type=int, default=3,
+        metavar="N",
         help="stress finalists tested on the complete market range",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-hall-size", type=int, default=20,
+        metavar="N",
         help="maximum robust winners retained across all auto cycles",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-cycles", type=int, default=0,
+        metavar="N",
         help="stop after N completed cycles (0 runs until Ctrl+C)",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-discovery-start", default="2025-01-01",
+        metavar="DATE|INDEX",
         help="start of the recent discovery range",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-validation-start", default="2023-01-01",
+        metavar="DATE|INDEX",
         help="start of validation; it ends at auto-discovery-start",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-stress-start", default="2019-01-01",
+        metavar="DATE|INDEX",
         help="start of stress testing and the complete final range",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-end", default="latest",
+        metavar="DATE|INDEX|latest",
         help="exclusive campaign end or 'latest' to detect the final candle",
     )
-    parser.add_argument(
+    auto.add_argument(
         "--auto-importance-target",
         choices=("objective_score", "total_profit", "total_profit_percent"),
         default="objective_score",
         help="metric used to learn which parameters deserve more mutations",
+    )
+    auto.add_argument(
+        "--auto-advanced-min-candidates", type=int, default=64, metavar="N",
+        help="minimum cycle size that activates halving/surrogate/walk-forward",
+    )
+    auto.add_argument(
+        "--auto-halving-rungs", type=int, default=2, metavar="N",
+        help="cheap expanding Discovery rungs before full Discovery (0 disables)",
+    )
+    auto.add_argument(
+        "--auto-halving-keep", type=float, default=0.25, metavar="RATIO",
+        help="fraction promoted after each cheap Discovery rung",
+    )
+    auto.add_argument(
+        "--auto-surrogate-min-samples", type=int, default=64, metavar="N",
+        help="historical full-Discovery samples required before Extra Trees is used",
+    )
+    auto.add_argument(
+        "--auto-surrogate-pool", type=int, default=8, metavar="MULTIPLIER",
+        help="unevaluated candidate-pool size relative to --auto-tests",
+    )
+    auto.add_argument(
+        "--auto-surrogate-trees", type=int, default=32, metavar="N",
+        help="randomized regression trees in the internal surrogate model",
+    )
+    auto.add_argument(
+        "--auto-walk-forward-folds", type=int, default=3, metavar="N",
+        help="disjoint pre-Discovery time folds (0 disables; minimum enabled value is 2)",
+    )
+    auto.add_argument(
+        "--auto-walk-forward-top", type=int, default=10, metavar="N",
+        help="Stress finalists evaluated on every walk-forward fold",
+    )
+    auto.add_argument(
+        "--auto-walk-forward-stability-penalty", type=float, default=0.15,
+        metavar="FLOAT",
+        help="penalty multiplier applied to score variation across folds",
     )
     return parser
 
@@ -2337,6 +3446,30 @@ def main(argv=None):
         )
     if args.auto_cycles < 0:
         raise SystemExit("--auto-cycles cannot be negative")
+    if args.auto_advanced_min_candidates <= 0:
+        raise SystemExit("--auto-advanced-min-candidates must be greater than zero")
+    if not 0 <= args.auto_halving_rungs <= 4:
+        raise SystemExit("--auto-halving-rungs must be between 0 and 4")
+    if not 0 < args.auto_halving_keep <= 1:
+        raise SystemExit("--auto-halving-keep must be greater than 0 and at most 1")
+    if args.auto_surrogate_min_samples < 4:
+        raise SystemExit("--auto-surrogate-min-samples must be at least 4")
+    if args.auto_surrogate_pool <= 0 or args.auto_surrogate_trees <= 0:
+        raise SystemExit("auto surrogate pool and tree counts must be greater than zero")
+    if args.auto_walk_forward_folds == 1 or args.auto_walk_forward_folds < 0:
+        raise SystemExit("--auto-walk-forward-folds must be 0 or at least 2")
+    if args.auto_walk_forward_top <= 0:
+        raise SystemExit("--auto-walk-forward-top must be greater than zero")
+    if (
+        args.auto_tests >= args.auto_advanced_min_candidates
+        and not args.auto_stress_top >= args.auto_walk_forward_top >= args.auto_final_top
+    ):
+        raise SystemExit(
+            "advanced auto funnel must satisfy: auto-stress-top >= "
+            "auto-walk-forward-top >= auto-final-top"
+        )
+    if args.auto_walk_forward_stability_penalty < 0:
+        raise SystemExit("--auto-walk-forward-stability-penalty cannot be negative")
     if bool(args.validation_start) != bool(args.validation_end):
         raise SystemExit("--validation-start and --validation-end must be used together")
     if args.dry_run:
@@ -2350,12 +3483,25 @@ def main(argv=None):
             print(
                 f"Funnel per cycle: {args.auto_tests:,} -> "
                 f"{args.auto_validation_top} -> {args.auto_stress_top} -> "
+                f"WF {args.auto_walk_forward_top} x {args.auto_walk_forward_folds} -> "
                 f"{args.auto_final_top}"
+            )
+            print(
+                f"Discovery halving: {args.auto_halving_rungs} rung(s), "
+                f"keep {args.auto_halving_keep:.0%} per rung"
+            )
+            print(
+                f"Surrogate: {args.auto_surrogate_trees} Extra Trees after "
+                f"{args.auto_surrogate_min_samples} historical samples"
             )
             print(f"Cycles: {'unlimited' if args.auto_cycles == 0 else args.auto_cycles}")
             print(f"Workers: {args.workers}")
-            for stage in AUTO_STAGE_ORDER:
+            for stage in ("discovery", "validation", "stress", "final"):
                 print(f"{stage.title()}: {ranges[stage][0]} -> {ranges[stage][1]}")
+            for index, fold in enumerate(
+                _walk_forward_ranges(ranges, args.auto_walk_forward_folds), start=1
+            ):
+                print(f"Walk-forward fold {index}: {fold[0]} -> {fold[1]}")
             return
         planned = (
             min(args.tests, grid_size(selected_grid))

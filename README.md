@@ -310,12 +310,15 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 
 ### Continuous Auto mode
 
-`--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. Every cycle uses a non-overlapping robustness funnel: 2,000 recent discovery tests, 30 validation finalists, 10 older stress finalists, and 3 full-history finalists. The default ranges are:
+`--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. An existing compatible checkpoint in the output directory is resumed automatically, even when `--resume` is omitted. A new campaign also warm-starts from compatible values in `--base-params` when that file exists.
+
+The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final full-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 30 reach Validation, 10 reach Stress/walk-forward, and 3 reach Final. The default ranges are:
 
 ```text
 Discovery    2025-01-01 -> latest candle
 Validation   2023-01-01 -> 2025-01-01
 Stress       2019-01-01 -> 2023-01-01
+Walk-forward three disjoint folds between 2019-01-01 and 2025-01-01
 Final        2019-01-01 -> latest candle
 ```
 
@@ -326,7 +329,7 @@ python .\optimize.py --auto -w 16
 # Stop safely
 # Press Ctrl+C once
 
-# Continue the exact cycle and stage
+# Continue the exact cycle and stage (--resume is optional when state exists)
 python .\optimize.py --auto --resume -w 16
 
 # Inspect the plan without running backtests
@@ -339,7 +342,13 @@ python .\optimize.py --auto --auto-cycles 2 -w 16 `
 
 After the first cycle, Auto mode can create numeric values not present in the coarse grid. For example, an elite value of `20` in `[10, 20, 30]` produces local tests such as `19` and `21`. Float gaps become finer across cycles. Values remain inside the original numeric bounds, boolean/enum parameters remain discrete, invalid relationships are rejected, and previously planned discovery combinations are not repeated.
 
-Auto mode learns parameter importance from completed discovery results. Approximately 60% of each later cycle searches locally around Hall-of-Fame winners, 25% remains random exploration, and 15% crosses strong candidates. High-effect parameters receive more mutations and neighbor tests, while every parameter retains an exploration floor. The safe default target is `objective_score`, which includes profit and risk; use `--auto-importance-target total_profit` only when raw profit is intentionally preferred.
+Auto mode learns parameter importance from completed Discovery results. Once enough full-Discovery history exists, an internal dependency-free Extra Trees ensemble learns nonlinear parameter interactions. It scores a larger unevaluated pool and selects 55% for predicted quality, 20% for model uncertainty, and 25% for random exploration. Local Hall-of-Fame mutations and crossover still feed that pool, so the model guides the existing search instead of replacing it.
+
+Successive halving evaluates every selected candidate on a short recent range, promotes the best fraction to a larger range, and only then runs full Discovery. Minimum-trade constraints are scaled to rung length. Walk-forward evaluates fixed finalists on disjoint chronological folds; its score combines median, mean, worst-fold performance, and a variation penalty. Every fold has its own resumable CSV checkpoint.
+
+Cross-range ranking never compares raw scores directly. Auto preserves `objective_score`, records the exact `range_candles`, and calculates `time_normalized_score = objective_score × 35,064 / range_candles` (the annual 15-minute-candle rate). Thus a score of 100 over 30 days is approximately 1,217.5/year and does not incorrectly beat a score of 2,000 over a year. Stage percentiles remain duration-neutral, while transformed-quality, walk-forward stability, and normal train/validation comparisons use the normalized rate. Version-1 stage CSV files receive these columns atomically before resume.
+
+The optimization hot path skips allocation for non-triggered liquidation checks, uses direct slotted position access, caches cross-window calculations, and avoids repeated empty-position work. On the included 2025-01-01 to 2026-02-23 range, a warm single-process backtest dropped to roughly 0.15 seconds while all 59 saved winner metrics remained bit-for-bit/numerically identical. Multi-worker throughput can be substantially higher; 0.01-second single-test latency is not promised because every candle still has to be simulated.
 
 Every new cycle records its parent in `training_parent.json`. After the first complete cycle, the best Hall-of-Fame parameters become the next cycle's baseline and mutation parent, so training continues along the strongest known path while retaining random exploration.
 
@@ -349,6 +358,7 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-tests N` | `2000` | New discovery candidates per cycle. |
 | `--auto-validation-top N` | `30` | Discovery finalists sent to validation. |
 | `--auto-stress-top N` | `10` | Validation finalists sent to stress testing. |
+| `--auto-walk-forward-top N` | `10` | Stress finalists evaluated on every time fold. |
 | `--auto-final-top N` | `3` | Stress finalists sent to the full-range test. |
 | `--auto-hall-size N` | `20` | Winners retained across cycles. |
 | `--auto-cycles N` | `0` | Completed-cycle limit; `0` means until `Ctrl+C`. |
@@ -357,8 +367,15 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-stress-start VALUE` | `2019-01-01` | Stress and complete-history start. |
 | `--auto-end VALUE` | `latest` | Exclusive end; `latest` detects the dataset automatically. |
 | `--auto-importance-target METRIC` | `objective_score` | Importance target: objective score, profit, or profit %. |
+| `--auto-halving-rungs N` | `2` | Cheap expanding Discovery rungs; `0` disables them. |
+| `--auto-halving-keep RATIO` | `0.25` | Fraction promoted after every cheap rung. |
+| `--auto-surrogate-min-samples N` | `64` | Full-Discovery history required before Extra Trees activates. |
+| `--auto-surrogate-pool N` | `8` | Candidate-pool multiplier scored by the surrogate. |
+| `--auto-surrogate-trees N` | `32` | Number of randomized regression trees. |
+| `--auto-walk-forward-folds N` | `3` | Disjoint chronological folds; `0` disables them. |
+| `--auto-walk-forward-stability-penalty FLOAT` | `0.15` | Penalty for performance variation between folds. |
 
-Auto checkpoints are flushed per result and stored per cycle/stage. Resume requires the same profile, grid, base parameters, ranges, funnel sizes, and risk constraints. Worker count and logging frequency may change.
+Auto checkpoints are flushed per result and stored per cycle/stage. Version-1 state is migrated in place: an interrupted legacy cycle finishes from its existing plans, and the new engine activates on the next unplanned cycle. Resume requires the same profile, grid, base parameters, ranges, funnel sizes, risk constraints, and version-2 engine settings. Worker count and logging frequency may change.
 
 ```text
 auto_state.json              exact campaign/cycle/stage checkpoint
@@ -368,6 +385,8 @@ parameter_importance.json/.csv learned mutation priorities
 auto_summary.json            campaign status and best result
 auto_report.xlsx             Hall of Fame and Parameter Importance sheets
 cycles/cycle_*/              plans and result CSVs for every stage
+cycles/cycle_*/surrogate_search.json  model history and selection diagnostics
+cycles/cycle_*/walk_forward_summary.json fold scores and stability ranking
 cycles/cycle_*/training_parent.json  baseline winner used by that cycle
 cycles/cycle_*/best_params.json      latest stage winner in that cycle
 cycles/cycle_*/checkpoints/*/best_params.json  best parameters at every checkpoint

@@ -3,10 +3,18 @@ python optimize.py --mode smart --profile focused --base-source config --tests 5
 
 CONTINUOUS AUTO SEARCH (STOP WITH CTRL+C):
 python optimize.py --auto -w 16
-Auto mode uses the main full parameter grid by default and continues future cycles from the Hall-of-Fame winner.
+Auto mode uses the full profile, successive halving, Extra Trees guidance, and walk-forward validation.
+It warm-starts from outputs/optimize/best_params.json when compatible.
+If outputs/optimize/auto/auto_state.json already exists, this same command resumes it automatically.
+Raw objective_score is preserved. Cross-range comparisons use time_normalized_score,
+annualized from the exact number of 15-minute candles in each range.
 
 RESUME CONTINUOUS AUTO SEARCH:
 python optimize.py --auto --resume -w 16
+--resume is optional when the checkpoint exists; it is useful when you want a missing checkpoint to be treated as an error.
+
+INSPECT THE COMPLETE AUTO PLAN WITHOUT RUNNING IT:
+python optimize.py --auto --dry-run -w 16
 
 REFINE THE CURRENT BEST PARAMETERS:
 python optimize.py --mode smart --profile exit --base-source best --base-params outputs/optimize/best_params.json --tests 5000 -w 8 --output-dir outputs/optimize/refine_exit

@@ -20,6 +20,8 @@ from trade_csv_logger import TradeCSVLogger
 class _DataclassMapping:
     """Small compatibility layer for existing reason/strategy helpers."""
 
+    __slots__ = ()
+
     def __getitem__(self, key):
         return getattr(self, key)
 
@@ -37,7 +39,7 @@ class _DataclassMapping:
         return {item.name: getattr(self, item.name) for item in fields(self)}
 
 
-@dataclass
+@dataclass(slots=True)
 class Position(_DataclassMapping):
     trade_id: str
     side: str
@@ -91,7 +93,7 @@ class Position(_DataclassMapping):
         )
 
 
-@dataclass
+@dataclass(slots=True)
 class AccountState:
     balance: float
     balance_without_fee: Optional[float] = None
@@ -124,9 +126,12 @@ class AccountState:
         """Apply calculator output fields in one controlled place."""
         if result is None:
             return
-        for item in fields(self):
-            if item.name in result:
-                setattr(self, item.name, result[item.name])
+        for name in _ACCOUNT_STATE_FIELD_NAMES:
+            if name in result:
+                setattr(self, name, result[name])
+
+
+_ACCOUNT_STATE_FIELD_NAMES = tuple(item.name for item in fields(AccountState))
 
 
 # Calculate Trade Duration
@@ -314,22 +319,22 @@ class TradeEngine:
 
     @staticmethod
     def position_equity(position, price):
-        if position["side"] == "long":
-            pnl_percent = (price - position["entry_price"]) / position["entry_price"] * 100
+        if position.side == "long":
+            pnl_percent = (price - position.entry_price) / position.entry_price * 100
         else:
-            pnl_percent = (position["entry_price"] - price) / position["entry_price"] * 100
-        return position["margin"] + position["margin"] * pnl_percent * position["leverage"] / 100
+            pnl_percent = (position.entry_price - price) / position.entry_price * 100
+        return position.margin + position.margin * pnl_percent * position.leverage / 100
 
     @staticmethod
     def position_equity_no_fee(position, price):
         """Mark one position using its fee-free size and margin fields."""
-        direction = 1.0 if position["side"] == "long" else -1.0
+        direction = 1.0 if position.side == "long" else -1.0
         pnl = (
-            position["position_size_no_fee"]
-            * (price - position["entry_price"])
+            position.position_size_no_fee
+            * (price - position.entry_price)
             * direction
         )
-        return position["margin_no_fee"] + pnl
+        return position.margin_no_fee + pnl
 
     @classmethod
     def open_positions_equity(cls, positions, price, exclude_position=None):
@@ -417,17 +422,17 @@ class TradeEngine:
         """Close the full supplied long and mutate AccountState atomically."""
         result = self._calculate_close_long(
             i, prices, times,
-            position["entry_price"], position["position_size"], position["position_size_no_fee"],
-            fee_rate, position["margin"], position["margin_no_fee"],
+            position.entry_price, position.position_size, position.position_size_no_fee,
+            fee_rate, position.margin, position.margin_no_fee,
             account.balance, account.balance_without_fee,
             account.deducting_fee_total, account.profits_lst, account.total_profit_percent,
             account.count_closed_orders, account.equity_curve,
             account.max_drawdown, account.total_wins, account.total_wins_long, account.total_losses,
-            account.total_long, cooldown_after_big_pnl, position["leverage"],
-            account.cooldown_until_index, position["open_time_value"], position["trade_amount_percent"],
+            account.total_long, cooldown_after_big_pnl, position.leverage,
+            account.cooldown_until_index, position.open_time_value, position.trade_amount_percent,
             account.profit_percent_per_month, account.save_money, account.trade_power,
-            position["trade_id"], remaining_open_margin, remaining_open_margin_no_fee,
-            account.tactical_balance, position["reason"] if reason_to_close is None else reason_to_close,
+            position.trade_id, remaining_open_margin, remaining_open_margin_no_fee,
+            account.tactical_balance, position.reason if reason_to_close is None else reason_to_close,
             balance_before_close_snapshot, balance_before_close_no_fee_snapshot,
             balance_before_log_override, balance_before_log_override_no_fee,
             remaining_open_equity,
@@ -457,17 +462,17 @@ class TradeEngine:
         """Close the full supplied short and mutate AccountState atomically."""
         result = self._calculate_close_short(
             i, prices, times,
-            position["entry_price"], position["position_size"], position["position_size_no_fee"],
-            fee_rate, position["margin"], position["margin_no_fee"],
+            position.entry_price, position.position_size, position.position_size_no_fee,
+            fee_rate, position.margin, position.margin_no_fee,
             account.balance, account.balance_without_fee,
             account.deducting_fee_total, account.profits_lst, account.total_profit_percent,
             account.count_closed_orders, account.equity_curve,
             account.max_drawdown, account.total_wins, account.total_wins_short, account.total_losses,
-            account.total_short, cooldown_after_big_pnl, position["leverage"],
-            account.cooldown_until_index, position["open_time_value"], position["trade_amount_percent"],
+            account.total_short, cooldown_after_big_pnl, position.leverage,
+            account.cooldown_until_index, position.open_time_value, position.trade_amount_percent,
             account.profit_percent_per_month, account.save_money, account.trade_power,
-            position["trade_id"], remaining_open_margin, remaining_open_margin_no_fee,
-            account.tactical_balance, position["reason"] if reason_to_close is None else reason_to_close,
+            position.trade_id, remaining_open_margin, remaining_open_margin_no_fee,
+            account.tactical_balance, position.reason if reason_to_close is None else reason_to_close,
             balance_before_close_snapshot, balance_before_close_no_fee_snapshot,
             balance_before_log_override, balance_before_log_override_no_fee,
             remaining_open_equity,
@@ -494,14 +499,14 @@ class TradeEngine:
     ):
         result = self._calculate_liquidation_long(
             i, low_prices, close_times,
-            position["entry_price"], position["leverage"], position["margin"],
+            position.entry_price, position.leverage, position.margin,
             account.balance, account.balance_without_fee,
             account.deducting_fee_total, account.profits_lst, account.count_closed_orders,
             account.total_losses, account.total_long, account.equity_curve,
-            account.save_money, account.max_drawdown, position["open_time_value"],
-            position["trade_amount_percent"], account.total_liquids, position["trade_id"],
+            account.save_money, account.max_drawdown, position.open_time_value,
+            position.trade_amount_percent, account.total_liquids, position.trade_id,
             remaining_open_margin, remaining_open_margin_no_fee,
-            account.tactical_balance, position["reason"] if reason_to_close is None else reason_to_close,
+            account.tactical_balance, position.reason if reason_to_close is None else reason_to_close,
             balance_before_close_snapshot, balance_before_close_no_fee_snapshot,
             balance_before_log_override, balance_before_log_override_no_fee,
             remaining_open_equity,
@@ -528,14 +533,14 @@ class TradeEngine:
     ):
         result = self._calculate_liquidation_short(
             i, high_prices, close_times,
-            position["entry_price"], position["leverage"], position["margin"],
+            position.entry_price, position.leverage, position.margin,
             account.balance, account.balance_without_fee,
             account.deducting_fee_total, account.profits_lst, account.count_closed_orders,
             account.total_losses, account.total_short, account.equity_curve,
-            account.save_money, account.max_drawdown, position["open_time_value"],
-            position["trade_amount_percent"], account.total_liquids, position["trade_id"],
+            account.save_money, account.max_drawdown, position.open_time_value,
+            position.trade_amount_percent, account.total_liquids, position.trade_id,
             remaining_open_margin, remaining_open_margin_no_fee,
-            account.tactical_balance, position["reason"] if reason_to_close is None else reason_to_close,
+            account.tactical_balance, position.reason if reason_to_close is None else reason_to_close,
             balance_before_close_snapshot, balance_before_close_no_fee_snapshot,
             balance_before_log_override, balance_before_log_override_no_fee,
             remaining_open_equity,
@@ -1338,7 +1343,7 @@ class TradeEngine:
             marked_equity = self.open_positions_equity(
                 open_positions, ending_mark_price
             )
-            open_margin = sum(position["margin"] for position in open_positions)
+            open_margin = sum(position.margin for position in open_positions)
             unrealized_profit = marked_equity - open_margin
             balance += marked_equity
             balance_without_fee += sum(
