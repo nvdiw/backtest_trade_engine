@@ -1,4 +1,5 @@
 import csv
+import gzip
 import json
 import re
 import tempfile
@@ -12,9 +13,12 @@ from openpyxl import load_workbook
 from optimize import (
     ExtraTreesSurrogate, SmartCandidateGenerator,
     _aggregate_walk_forward_records, _auto_bootstrap, _compact_auto_candidate_plans,
-    _learn_parameter_importance, _open_csv_text, _resolve_csv_path,
+    _annotate_discovery_learning_scores, _apply_funnel_learning_scores,
+    _learn_mutation_guidance, _learn_parameter_importance, _open_csv_text,
+    _resolve_csv_path,
     _read_candidate_plan, _read_surrogate_history_cache,
-    _representative_surrogate_history, _write_surrogate_history_cache,
+    _representative_surrogate_history, _select_surrogate_candidates,
+    _write_surrogate_history_cache,
     _robust_validation_score, _time_normalized_score,
     build_parser, grid_size,
     iter_grid_candidates,
@@ -26,6 +30,103 @@ from trade_engine import TradeEngine
 
 
 class OptimizerSearchTests(unittest.TestCase):
+    def test_legacy_surrogate_cache_migrates_raw_scores_to_comparable_ranks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "surrogate_history_cache.json.gz"
+            payload = {
+                "version": 1,
+                "latest_cycle": 12,
+                "parameter_keys": ["x"],
+                "rows": [["low", 100, 1], ["high", 2000, 2]],
+            }
+            with gzip.open(cache_path, "wt", encoding="utf-8") as cache_file:
+                json.dump(payload, cache_file)
+
+            loaded, latest_cycle = _read_surrogate_history_cache(cache_path, ("x",))
+
+        targets = {row["candidate_id"]: row["learning_score"] for row in loaded}
+        self.assertEqual(latest_cycle, 12)
+        self.assertEqual(targets, {"low": 0.0, "high": 1.0})
+
+    def test_funnel_learning_replaces_raw_scale_with_later_stage_evidence(self):
+        discovery = [
+            {
+                "candidate_id": "lucky", "params": {"x": 1},
+                "objective_score": 1000, "time_normalized_score": 1000,
+            },
+            {
+                "candidate_id": "stable", "params": {"x": 2},
+                "objective_score": 900, "time_normalized_score": 900,
+            },
+        ]
+        _annotate_discovery_learning_scores(discovery)
+        stages = {
+            "discovery": discovery,
+            "validation": [
+                {"candidate_id": "lucky", "time_normalized_score": -50},
+                {"candidate_id": "stable", "time_normalized_score": 80},
+            ],
+            "stress": [
+                {"candidate_id": "stable", "time_normalized_score": 70},
+            ],
+            "walk_forward": [
+                {"candidate_id": "stable", "time_normalized_score": 60},
+            ],
+            "final": [
+                {"candidate_id": "stable", "time_normalized_score": 65},
+            ],
+        }
+
+        _apply_funnel_learning_scores(discovery, stages)
+        targets = {row["candidate_id"]: row["learning_score"] for row in discovery}
+
+        self.assertGreater(targets["stable"], targets["lucky"])
+        self.assertTrue(all(row["learning_source"] == "robust_funnel_rank" for row in discovery))
+
+    def test_mutation_guidance_learns_direction_and_step_size(self):
+        history = [
+            {
+                "candidate_id": str(value), "params": {"x": value},
+                "learning_score": value / 20,
+            }
+            for value in range(21)
+        ]
+
+        guidance = _learn_mutation_guidance(history, ("x",), {"x": [0, 10, 20]})
+        generator = SmartCandidateGenerator(
+            {"x": [0.0, 10.0, 20.0]}, seed=2,
+            continuous_refinement=True, mutation_guidance=guidance,
+        )
+
+        self.assertEqual(guidance["x"]["direction"], 1)
+        self.assertEqual(guidance["x"]["step_multiplier"], 3)
+        self.assertEqual(generator._refined_neighbors("x", 10.0)[0], 20.0)
+
+    def test_surrogate_selection_reports_quality_uncertainty_and_diversity(self):
+        grid = {"x": list(range(16)), "y": list(range(16))}
+        history = [
+            {
+                "candidate_id": f"h-{x}-{y}", "params": {"x": x, "y": y},
+                "learning_score": (x + y) / 30,
+            }
+            for x in range(8) for y in range(8)
+        ]
+        candidates = [
+            {"x": x, "y": y} for x in range(16) for y in range(16)
+            if x >= 8 or y >= 8
+        ]
+        features = {"surrogate_min_samples": 4, "surrogate_trees": 8}
+
+        selected, metadata = _select_surrogate_candidates(
+            candidates, history, 64, ("x", "y"), grid, features, seed=7,
+            parameter_importance={"x": {"weight": 0.6}, "y": {"weight": 0.4}},
+        )
+
+        self.assertEqual(len(selected), 64)
+        self.assertEqual(metadata["training_target"], "normalized_and_robust_funnel_rank")
+        self.assertEqual(metadata["selection_mix"]["diversity_novelty"], 0.20)
+        self.assertGreater(metadata["diversity_buckets"], 10)
+
     def test_compact_surrogate_cache_round_trips_legacy_history(self):
         history = [
             {

@@ -242,7 +242,7 @@ AUTO_TIME_COLUMNS = ["time_normalized_score", "range_candles"]
 CANDLES_PER_YEAR_15M = 365.25 * 24 * 4
 SURROGATE_MAX_TRAINING_SAMPLES = 1024
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
-SURROGATE_CACHE_VERSION = 1
+SURROGATE_CACHE_VERSION = 2
 
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
@@ -305,6 +305,7 @@ class SmartCandidateGenerator:
         baseline_params=None,
         continuous_refinement=False,
         parameter_importance=None,
+        mutation_guidance=None,
         refinement_round=1,
     ):
         if not grid or any(not values for values in grid.values()):
@@ -319,6 +320,10 @@ class SmartCandidateGenerator:
         self.parameter_importance = {
             key: max(0.01, float(supplied_importance.get(key, 1.0)))
             for key in self.mutable_keys
+        }
+        supplied_guidance = mutation_guidance or {}
+        self.mutation_guidance = {
+            key: dict(supplied_guidance.get(key, {})) for key in self.mutable_keys
         }
         self.seen = set()
         self.local_queue = []
@@ -435,8 +440,14 @@ class SmartCandidateGenerator:
             return []
         precision = self._float_precision(values, step)
         neighbors = []
-        for direction in (-1, 1):
-            value = current + direction * step
+        guidance = self.mutation_guidance.get(key, {})
+        preferred_direction = int(guidance.get("direction", 0) or 0)
+        directions = [-1, 1]
+        if preferred_direction in (-1, 1):
+            directions.sort(key=lambda item: item != preferred_direction)
+        step_multiplier = max(1, min(3, int(guidance.get("step_multiplier", 1) or 1)))
+        for direction in directions:
+            value = current + direction * step * step_multiplier
             value = max(lower, min(upper, value))
             if all(isinstance(item, int) and not isinstance(item, bool) for item in values):
                 value = int(round(value))
@@ -460,7 +471,17 @@ class SmartCandidateGenerator:
         values = self.grid[key]
         neighbors = self._refined_neighbors(key, candidate[key])
         if prefer_local and neighbors and self.random.random() < 0.85:
-            candidate[key] = self.random.choice(neighbors)
+            guidance = self.mutation_guidance.get(key, {})
+            confidence = max(0.0, min(1.0, float(guidance.get("confidence", 0.0))))
+            preferred_direction = int(guidance.get("direction", 0) or 0)
+            preferred = [
+                value for value in neighbors
+                if preferred_direction and (value - candidate[key]) * preferred_direction > 0
+            ]
+            if preferred and self.random.random() < 0.50 + 0.45 * confidence:
+                candidate[key] = self.random.choice(preferred)
+            else:
+                candidate[key] = self.random.choice(neighbors)
         else:
             candidate[key] = self.random.choice(values)
 
@@ -719,9 +740,83 @@ def _record_comparable_score(record):
     )
 
 
+def _surrogate_target(record):
+    """Return a range-comparable learning label, preferring funnel feedback."""
+    for key in ("learning_score", "robust_score", "time_normalized_score"):
+        value = _finite_number(record.get(key))
+        if value is not None:
+            return value
+    return _finite_number(record.get("objective_score"))
+
+
+def _score_percentiles(records, score_getter=_record_comparable_score):
+    """Return tie-aware [0, 1] percentiles without assuming score scale."""
+    ranked = sorted(
+        (
+            (float(score), record.get("candidate_id"))
+            for record in records
+            for score in [score_getter(record)]
+            if score is not None and record.get("candidate_id") is not None
+        ),
+        key=lambda item: item[0],
+    )
+    if not ranked:
+        return {}
+    if len(ranked) == 1:
+        return {ranked[0][1]: 1.0}
+    denominator = max(1, len(ranked) - 1)
+    output = {}
+    index = 0
+    while index < len(ranked):
+        end = index + 1
+        while end < len(ranked) and ranked[end][0] == ranked[index][0]:
+            end += 1
+        percentile = ((index + end - 1) / 2) / denominator
+        for _, candidate_id in ranked[index:end]:
+            output[candidate_id] = percentile
+        index = end
+    return output
+
+
+def _annotate_discovery_learning_scores(records):
+    """Use within-range ranks so cycles with different durations remain comparable."""
+    percentiles = _score_percentiles(records)
+    for record in records:
+        candidate_id = record.get("candidate_id")
+        if candidate_id in percentiles:
+            record["learning_score"] = percentiles[candidate_id]
+            record["learning_source"] = "normalized_discovery_rank"
+    return records
+
+
+def _apply_funnel_learning_scores(history, stage_records):
+    """Teach the surrogate which Discovery candidates survive robust later stages."""
+    if not stage_records or "discovery" not in stage_records:
+        return history
+    weights = AUTO_STAGE_WEIGHTS
+    stage_percentiles = {
+        stage: _score_percentiles(records)
+        for stage, records in stage_records.items()
+        if stage in weights and records
+    }
+    discovery_ids = set(stage_percentiles.get("discovery", {}))
+    targets = {}
+    for candidate_id in discovery_ids:
+        targets[candidate_id] = sum(
+            weights[stage] * percentiles.get(candidate_id, 0.0)
+            for stage, percentiles in stage_percentiles.items()
+        )
+    for record in history:
+        candidate_id = record.get("candidate_id")
+        if candidate_id in targets:
+            record["learning_score"] = targets[candidate_id]
+            record["learning_source"] = "robust_funnel_rank"
+    return history
+
+
 def _importance_target(record, target):
     if target == "objective_score":
-        return _finite_number(record.get("objective_score"))
+        return _surrogate_target(record)
     return _finite_number((record.get("result") or {}).get(target))
 
 
@@ -803,6 +898,74 @@ def _smooth_parameter_importance(previous, learned, previous_weight=0.65):
     for item in blended.values():
         item["weight"] /= total
     return blended
+
+
+def _learn_mutation_guidance(records, parameter_keys, grid):
+    """Learn promising numeric directions and safe local step sizes in O(rows*keys)."""
+    usable = [
+        record for record in records
+        if _surrogate_target(record) is not None
+    ]
+    guidance = {}
+    if len(usable) < 8:
+        return guidance
+    targets = [_surrogate_target(record) for record in usable]
+    target_mean = statistics.fmean(targets)
+    target_variance = statistics.fmean(
+        (value - target_mean) ** 2 for value in targets
+    )
+    top_count = max(2, math.ceil(len(usable) * 0.20))
+    top_records = sorted(
+        usable, key=lambda record: _surrogate_target(record), reverse=True
+    )[:top_count]
+    for key in parameter_keys:
+        values = [record.get("params", {}).get(key) for record in usable]
+        if not values or not all(
+            isinstance(value, (int, float)) and not isinstance(value, bool)
+            for value in values
+        ):
+            continue
+        lower, upper = min(values), max(values)
+        if lower == upper or target_variance <= 1e-15:
+            continue
+        value_mean = statistics.fmean(values)
+        value_variance = statistics.fmean(
+            (value - value_mean) ** 2 for value in values
+        )
+        if value_variance <= 1e-15:
+            continue
+        covariance = statistics.fmean(
+            (value - value_mean) * (target - target_mean)
+            for value, target in zip(values, targets)
+        )
+        correlation = covariance / math.sqrt(value_variance * target_variance)
+        confidence = min(1.0, abs(correlation))
+        direction = 1 if correlation > 0.05 else -1 if correlation < -0.05 else 0
+        ordered_grid = sorted({
+            value for value in grid.get(key, ())
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        })
+        hard_lower = ordered_grid[0] if ordered_grid else lower
+        hard_upper = ordered_grid[-1] if ordered_grid else upper
+        span = hard_upper - hard_lower
+        top_values = [record["params"][key] for record in top_records]
+        top_mean = statistics.fmean(top_values)
+        boundary_pressure = 0
+        if span > 0 and top_mean >= hard_upper - 0.10 * span:
+            boundary_pressure = 1
+        elif span > 0 and top_mean <= hard_lower + 0.10 * span:
+            boundary_pressure = -1
+        if boundary_pressure and (direction == 0 or confidence < 0.20):
+            direction = boundary_pressure
+        step_multiplier = 3 if confidence >= 0.65 else 2 if confidence >= 0.30 else 1
+        guidance[key] = {
+            "direction": direction,
+            "confidence": confidence,
+            "step_multiplier": step_multiplier,
+            "boundary_pressure": boundary_pressure,
+            "samples": len(usable),
+        }
+    return guidance
 
 
 class ExtraTreesSurrogate:
@@ -1531,8 +1694,10 @@ def _load_discovery_history(output_dir, keys):
     for index, plan_path in enumerate(selected_paths, start=1):
         results_path = _resolve_csv_path(plan_path.with_name("discovery_results.csv"))
         candidates = _read_candidate_plan(plan_path)
-        for record in _read_auto_stage_records(results_path, candidates):
-            score = _finite_number(record.get("objective_score"))
+        cycle_records = _read_auto_stage_records(results_path, candidates)
+        _annotate_discovery_learning_scores(cycle_records)
+        for record in cycle_records:
+            score = _surrogate_target(record)
             if score is not None and all(key in record["params"] for key in keys):
                 history.append(record)
         _show_loading_progress("Loading surrogate history", index, len(selected_paths))
@@ -1591,44 +1756,70 @@ def _read_surrogate_history_cache(path, keys):
     try:
         with gzip.open(path, "rt", encoding="utf-8") as cache_file:
             payload = json.load(cache_file)
-        if (
-            payload.get("version") != SURROGATE_CACHE_VERSION
-            or tuple(payload.get("parameter_keys", ())) != tuple(keys)
-        ):
+        version = int(payload.get("version", 1) or 1)
+        if version not in (1, SURROGATE_CACHE_VERSION) or tuple(
+            payload.get("parameter_keys", ())
+        ) != tuple(keys):
             return None, 0
         rows = payload.get("rows", [])
-        history = [
-            {
-                "candidate_id": row[0],
-                "objective_score": row[1],
-                "params": dict(zip(keys, row[2:])),
-            }
-            for row in rows
-        ]
+        if version == 1:
+            history = [
+                {
+                    "candidate_id": row[0],
+                    "objective_score": row[1],
+                    "params": dict(zip(keys, row[2:])),
+                }
+                for row in rows
+            ]
+            # Legacy caches stored incomparable raw scores. Preserve every sample
+            # but migrate its target to a bounded rank without reopening cycles.
+            _annotate_discovery_learning_scores(history)
+        else:
+            history = [
+                {
+                    "candidate_id": row[0],
+                    "learning_score": row[1],
+                    "learning_source": row[2],
+                    "params": dict(zip(keys, row[3:])),
+                }
+                for row in rows
+            ]
         return history, int(payload.get("latest_cycle", 0) or 0)
-    except (OSError, EOFError, UnicodeError, ValueError, json.JSONDecodeError):
+    except (
+        OSError, EOFError, UnicodeError, ValueError, TypeError, IndexError,
+        json.JSONDecodeError,
+    ):
         return None, 0
 
 
 def _write_surrogate_history_cache(path, history, keys, latest_cycle):
     usable = [
         record for record in history
-        if _finite_number(record.get("objective_score")) is not None
+        if _surrogate_target(record) is not None
         and all(key in record.get("params", {}) for key in keys)
     ]
-    selected = _representative_surrogate_history(
-        usable, SURROGATE_MAX_TRAINING_SAMPLES
-    )
+    selected = [
+        {
+            "candidate_id": record.get("candidate_id"),
+            "learning_score": _surrogate_target(record),
+            "learning_source": record.get("learning_source", "legacy_fallback"),
+            "params": {key: record["params"][key] for key in keys},
+        }
+        for record in _representative_surrogate_history(
+            usable, SURROGATE_MAX_TRAINING_SAMPLES
+        )
+    ]
     payload = {
         "version": SURROGATE_CACHE_VERSION,
         "latest_cycle": int(latest_cycle),
         "parameter_keys": list(keys),
         "sample_count": len(selected),
-        "sample_method": "deterministic_score_quantiles",
+        "sample_method": "deterministic_learning_quantiles",
         "rows": [
             [
                 record.get("candidate_id"),
-                record["objective_score"],
+                record["learning_score"],
+                record["learning_source"],
                 *(record["params"][key] for key in keys),
             ]
             for record in selected
@@ -1647,6 +1838,20 @@ def _write_surrogate_history_cache(path, history, keys, latest_cycle):
             temporary.unlink()
         raise
     return selected
+
+
+def _merge_surrogate_history(history, new_records):
+    """Merge resumable history by candidate id; newer robust labels win."""
+    merged = {
+        record.get("candidate_id"): record
+        for record in history
+        if record.get("candidate_id") is not None
+    }
+    for record in new_records:
+        candidate_id = record.get("candidate_id")
+        if candidate_id is not None:
+            merged[candidate_id] = record
+    return list(merged.values())
 
 
 def _surrogate_feature_row(params, keys, grid):
@@ -1669,7 +1874,7 @@ def _representative_surrogate_history(history, limit):
     limit = max(2, int(limit))
     if len(history) <= limit:
         return history
-    ranked = sorted(history, key=lambda record: float(record["objective_score"]))
+    ranked = sorted(history, key=lambda record: float(_surrogate_target(record)))
     indices = {
         round(position * (len(ranked) - 1) / (limit - 1))
         for position in range(limit)
@@ -1677,14 +1882,48 @@ def _representative_surrogate_history(history, limit):
     return [ranked[index] for index in sorted(indices)]
 
 
+def _diversity_fingerprint(params, keys, grid, bins=8):
+    fingerprint = []
+    for key in keys:
+        value = params[key]
+        values = list(grid[key])
+        if isinstance(value, bool):
+            bucket = int(value)
+        elif isinstance(value, (int, float)) and values:
+            lower, upper = min(values), max(values)
+            ratio = 0.0 if upper == lower else (value - lower) / (upper - lower)
+            bucket = min(bins - 1, max(0, int(ratio * bins)))
+        else:
+            index = values.index(value) if value in values else 0
+            bucket = round(index * (bins - 1) / max(1, len(values) - 1))
+        fingerprint.append(bucket)
+    return tuple(fingerprint)
+
+
+def _rank_fractions(values, reverse=False):
+    order = sorted(range(len(values)), key=values.__getitem__, reverse=reverse)
+    denominator = max(1, len(values) - 1)
+    output = [0.0] * len(values)
+    rank = 0
+    while rank < len(order):
+        end = rank + 1
+        while end < len(order) and values[order[end]] == values[order[rank]]:
+            end += 1
+        fraction = 1.0 - ((rank + end - 1) / 2) / denominator
+        for index in order[rank:end]:
+            output[index] = fraction
+        rank = end
+    return output
+
+
 def _select_surrogate_candidates(
-    candidates, history, count, keys, grid, features, seed,
+    candidates, history, count, keys, grid, features, seed, parameter_importance=None,
 ):
-    """Rank a large candidate pool with historical data and retain exploration."""
+    """Use quality, uncertainty, novelty and bounded diversity to select a pool."""
     candidates = list(candidates)
     usable_history = [
         record for record in history
-        if _finite_number(record.get("objective_score")) is not None
+        if _surrogate_target(record) is not None
     ]
     minimum = features["surrogate_min_samples"]
     if len(usable_history) < minimum or len(candidates) <= count:
@@ -1708,7 +1947,7 @@ def _select_surrogate_candidates(
         _surrogate_feature_row(record["params"], keys, grid)
         for record in training_history
     ]
-    targets = [float(record["objective_score"]) for record in training_history]
+    targets = [float(_surrogate_target(record)) for record in training_history]
     model = ExtraTreesSurrogate(
         n_trees=features["surrogate_trees"],
         max_depth=max(6, min(12, round(math.log2(len(training_history) + 1)) + 1)),
@@ -1719,30 +1958,78 @@ def _select_surrogate_candidates(
         [_surrogate_feature_row(candidate, keys, grid) for candidate in candidates],
         progress_label="Scoring candidate pool",
     )
-    ranked_mean = sorted(
-        range(len(candidates)), key=lambda index: predictions[index][0], reverse=True
+    mean_ranks = _rank_fractions([item[0] for item in predictions], reverse=True)
+    uncertainty_ranks = _rank_fractions(
+        [item[1] for item in predictions], reverse=True
+    )
+    acquisition = [
+        0.82 * mean_ranks[index] + 0.18 * uncertainty_ranks[index]
+        for index in range(len(candidates))
+    ]
+    ranked_quality = sorted(
+        range(len(candidates)), key=acquisition.__getitem__, reverse=True
     )
     ranked_uncertainty = sorted(
         range(len(candidates)), key=lambda index: predictions[index][1], reverse=True
     )
+    supplied_importance = parameter_importance or {}
+    diversity_keys = sorted(
+        keys,
+        key=lambda key: float(supplied_importance.get(key, {}).get("weight", 0.0)),
+        reverse=True,
+    )[:min(8, len(keys))]
+    history_buckets = {}
+    for record in training_history:
+        fingerprint = _diversity_fingerprint(
+            record["params"], diversity_keys, grid
+        )
+        history_buckets[fingerprint] = history_buckets.get(fingerprint, 0) + 1
+    fingerprints = [
+        _diversity_fingerprint(candidate, diversity_keys, grid)
+        for candidate in candidates
+    ]
+    novelty = [
+        1.0 / math.sqrt(1.0 + history_buckets.get(fingerprint, 0))
+        for fingerprint in fingerprints
+    ]
+    diversity_value = [
+        0.65 * acquisition[index] + 0.35 * novelty[index]
+        for index in range(len(candidates))
+    ]
+    ranked_diverse = sorted(
+        range(len(candidates)), key=diversity_value.__getitem__, reverse=True
+    )
     selected_indices = []
     selected_set = set()
+    selected_buckets = {}
+    bucket_limit = max(2, math.ceil(count * 0.01))
 
-    def add(indices, limit):
+    def add(indices, limit, enforce_bucket_limit=True):
         for index in indices:
             if len(selected_indices) >= limit:
                 break
             if index not in selected_set:
+                fingerprint = fingerprints[index]
+                if (
+                    enforce_bucket_limit
+                    and selected_buckets.get(fingerprint, 0) >= bucket_limit
+                ):
+                    continue
                 selected_set.add(index)
                 selected_indices.append(index)
+                selected_buckets[fingerprint] = selected_buckets.get(fingerprint, 0) + 1
 
-    exploit_target = max(1, round(count * 0.55))
-    uncertainty_target = min(count, exploit_target + round(count * 0.20))
-    add(ranked_mean, exploit_target)
+    quality_target = max(1, round(count * 0.50))
+    uncertainty_target = min(count, quality_target + round(count * 0.20))
+    diversity_target = min(count, uncertainty_target + round(count * 0.20))
+    add(ranked_quality, quality_target)
     add(ranked_uncertainty, uncertainty_target)
+    add(ranked_diverse, diversity_target)
     remaining = [index for index in range(len(candidates)) if index not in selected_set]
     random.Random(seed + 7919).shuffle(remaining)
     add(remaining, count)
+    if len(selected_indices) < count:
+        add(ranked_quality, count, enforce_bucket_limit=False)
     selected = [candidates[index] for index in selected_indices[:count]]
     selected_predictions = [predictions[index] for index in selected_indices[:count]]
     return selected, {
@@ -1750,14 +2037,20 @@ def _select_surrogate_candidates(
         "model": "dependency_free_extra_trees",
         "history_samples": len(usable_history),
         "training_samples": len(training_history),
-        "training_sample_method": "deterministic_score_quantiles",
+        "training_target": "normalized_and_robust_funnel_rank",
+        "training_sample_method": "deterministic_learning_quantiles",
         "candidate_pool": len(candidates),
         "selected_candidates": len(selected),
         "trees": features["surrogate_trees"],
         "predicted_score_min": min(item[0] for item in selected_predictions),
         "predicted_score_max": max(item[0] for item in selected_predictions),
         "mean_uncertainty": statistics.fmean(item[1] for item in selected_predictions),
-        "selection_mix": {"exploitation": 0.55, "uncertainty": 0.20, "random": 0.25},
+        "diversity_keys": diversity_keys,
+        "diversity_buckets": len(set(fingerprints[index] for index in selected_indices)),
+        "selection_mix": {
+            "quality_acquisition": 0.50, "uncertainty": 0.20,
+            "diversity_novelty": 0.20, "random": 0.10,
+        },
     }
 
 
@@ -2301,6 +2594,7 @@ def _run_auto_stage(
         args.min_trades if min_trades_override is None else min_trades_override
     )
     range_candles = _range_candle_count(range_start, range_end)
+    current_best = _auto_stage_best(records.values())
 
     with results_path.open("a" if append else "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -2372,8 +2666,17 @@ def _run_auto_stage(
                 }
                 state["total_evaluations"] += 1
                 state["stage_completed"] = len(records)
-                current_best = _auto_stage_best(records.values())
-                if current_best and current_best["candidate_id"] == candidate_id:
+                new_record = records[candidate_id]
+                previous_best_score = (
+                    _record_comparable_score(current_best)
+                    if current_best is not None else None
+                )
+                new_score = _record_comparable_score(new_record)
+                is_new_best = new_score is not None and (
+                    previous_best_score is None or new_score > previous_best_score
+                )
+                if is_new_best:
+                    current_best = new_record
                     _write_auto_stage_checkpoint(
                         cycle_dir, stage, records.values(), base_tune,
                         len(records), total, state,
@@ -2381,19 +2684,26 @@ def _run_auto_stage(
                 if args.log_every and (
                     len(records) % args.log_every == 0 or len(records) == total
                 ):
-                    best_score = max(
-                        (_finite_number(record["objective_score"]) for record in records.values()),
-                        default=None,
-                        key=lambda value: -math.inf if value is None else value,
-                    )
                     elapsed = time.perf_counter() - started
+                    processed = len(records) - len(existing)
+                    speed = processed / elapsed if elapsed > 0 else 0.0
+                    remaining = len(pending) - processed
+                    eta = remaining / speed if speed > 0 else 0.0
+                    best_score = (
+                        _finite_number(current_best.get("objective_score"))
+                        if current_best else None
+                    )
                     shown = "n/a" if best_score is None else f"{best_score:.4f}"
                     current_shown = (
                         "n/a" if objective_score is None else f"{objective_score:.4f}"
                     )
+                    rate_shown = (
+                        "n/a" if normalized_score is None else f"{normalized_score:.4f}"
+                    )
                     print(
                         f"  [{len(records):,}/{total:,}] best={shown} "
-                        f"score={current_shown} elapsed={elapsed:.1f}s"
+                        f"score={current_shown} rate={rate_shown} | "
+                        f"{speed:.2f} tests/s | elapsed={elapsed:.1f}s eta={eta:.1f}s"
                     )
                 if len(records) % max(1, min(25, args.log_every or 25)) == 0:
                     _write_auto_stage_checkpoint(
@@ -2785,6 +3095,9 @@ def run_auto_optimization(args, grid=None):
             state["version"] = AUTO_STATE_VERSION
         hall = _load_json(output_dir / "hall_of_fame.json", []) or []
         importance = _load_json(output_dir / "parameter_importance.json", {}) or {}
+        mutation_guidance = _load_json(
+            output_dir / "mutation_guidance.json", {}
+        ) or {}
         state.update({
             "status": "running",
             "total_evaluations": _reconcile_auto_evaluations(output_dir, state),
@@ -2808,6 +3121,7 @@ def run_auto_optimization(args, grid=None):
             for key in keys
         }
         hall = []
+        mutation_guidance = {}
         state = {
             "version": AUTO_STATE_VERSION,
             "status": "running",
@@ -2862,6 +3176,10 @@ def run_auto_optimization(args, grid=None):
             f"{args.auto_final_top} | profile: {profile}"
         )
     print(f"Latest market end: {resolved_end}")
+    print(
+        "Search intelligence: normalized funnel learning | "
+        "quality + uncertainty + diversity selection | directed mutation"
+    )
     if not resume_existing and bootstrap:
         print(
             f"Warm start: {bootstrap['compatible_parameter_count']} compatible "
@@ -2921,17 +3239,6 @@ def run_auto_optimization(args, grid=None):
                     }
                     for record in hall
                 ]
-                generator = SmartCandidateGenerator(
-                    grid,
-                    seed=args.seed + cycle - 1,
-                    baseline_params=continuation_base,
-                    continuous_refinement=bool(elite_records),
-                    parameter_importance={
-                        key: item.get("weight", 1.0) for key, item in importance.items()
-                    },
-                    refinement_round=max(1, cycle - 1),
-                )
-                generator.seen.update(seen_cache)
                 if advanced:
                     if history_cache is None:
                         history_cache = _load_discovery_history(output_dir, keys)
@@ -2941,8 +3248,24 @@ def run_auto_optimization(args, grid=None):
                             f"{len(history_cache):,} stored results."
                         )
                     history = history_cache
+                    if not mutation_guidance and history:
+                        mutation_guidance = _learn_mutation_guidance(
+                            history, keys, grid
+                        )
                 else:
                     history = []
+                generator = SmartCandidateGenerator(
+                    grid,
+                    seed=args.seed + cycle - 1,
+                    baseline_params=continuation_base,
+                    continuous_refinement=bool(elite_records),
+                    parameter_importance={
+                        key: item.get("weight", 1.0) for key, item in importance.items()
+                    },
+                    mutation_guidance=mutation_guidance,
+                    refinement_round=max(1, cycle - 1),
+                )
+                generator.seen.update(seen_cache)
                 surrogate_ready = (
                     len(history) >= optimizer_features["surrogate_min_samples"]
                 )
@@ -2973,6 +3296,7 @@ def run_auto_optimization(args, grid=None):
                     grid,
                     optimizer_features,
                     args.seed + cycle - 1,
+                    parameter_importance=importance,
                 )
                 seen_cache.update(
                     _candidate_signature(params, keys) for params in generated
@@ -2997,6 +3321,16 @@ def run_auto_optimization(args, grid=None):
                         "uses_previous_discovery_results": True,
                     })
                     _write_json(cycle_dir / "surrogate_search.json", surrogate_metadata)
+                    if surrogate_metadata.get("enabled"):
+                        mix = surrogate_metadata["selection_mix"]
+                        print(
+                            "Candidate selection: "
+                            f"quality {mix['quality_acquisition']:.0%} | "
+                            f"uncertainty {mix['uncertainty']:.0%} | "
+                            f"diversity {mix['diversity_novelty']:.0%} | "
+                            f"random {mix['random']:.0%} | "
+                            f"{surrogate_metadata['diversity_buckets']:,} diversity buckets"
+                        )
             if not discovery_pool:
                 state.update({"status": "exhausted", "updated_at": _timestamp_now()})
                 _write_json(state_path, state)
@@ -3106,13 +3440,31 @@ def run_auto_optimization(args, grid=None):
                     excel_enabled=bool(args.excel_top),
                 )
                 return hall[0] if hall else None
+            _annotate_discovery_learning_scores(discovery_records)
+            if advanced and history_cache is None:
+                history_cache = _load_discovery_history(output_dir, keys)
             if history_cache is not None:
-                history_cache.extend(discovery_records)
+                history_cache = _merge_surrogate_history(
+                    history_cache, discovery_records
+                )
                 history_cache = _write_surrogate_history_cache(
                     output_dir / "surrogate_history_cache.json.gz",
                     history_cache,
                     keys,
                     cycle,
+                )
+                mutation_guidance = _learn_mutation_guidance(
+                    history_cache, keys, grid
+                )
+                _write_json(
+                    output_dir / "mutation_guidance.json", mutation_guidance
+                )
+            else:
+                mutation_guidance = _learn_mutation_guidance(
+                    discovery_records, keys, grid
+                )
+                _write_json(
+                    output_dir / "mutation_guidance.json", mutation_guidance
                 )
 
             if int(state.get("importance_cycle", 0)) < cycle:
@@ -3231,6 +3583,20 @@ def run_auto_optimization(args, grid=None):
                     return hall[0] if hall else None
 
             finalists = _combine_auto_stage_records(stage_results)
+            if history_cache is not None:
+                _apply_funnel_learning_scores(history_cache, stage_results)
+                history_cache = _write_surrogate_history_cache(
+                    output_dir / "surrogate_history_cache.json.gz",
+                    history_cache,
+                    keys,
+                    cycle,
+                )
+                mutation_guidance = _learn_mutation_guidance(
+                    history_cache, keys, grid
+                )
+                _write_json(
+                    output_dir / "mutation_guidance.json", mutation_guidance
+                )
             hall = _merge_hall_of_fame(
                 hall, finalists, cycle, keys, base_tune, args.auto_hall_size
             )
@@ -3261,6 +3627,23 @@ def run_auto_optimization(args, grid=None):
                 "Most influential parameters: "
                 + ", ".join(f"{key} ({item['weight']:.1%})" for key, item in important)
             )
+            directed = sorted(
+                (
+                    (key, item) for key, item in mutation_guidance.items()
+                    if item.get("direction") in (-1, 1)
+                ),
+                key=lambda pair: pair[1].get("confidence", 0.0),
+                reverse=True,
+            )[:5]
+            if directed:
+                print(
+                    "Mutation guidance: "
+                    + ", ".join(
+                        f"{key} {'up' if item['direction'] > 0 else 'down'} "
+                        f"x{item['step_multiplier']} ({item['confidence']:.0%})"
+                        for key, item in directed
+                    )
+                )
     except KeyboardInterrupt:
         state.update({"status": "interrupted", "updated_at": _timestamp_now()})
         _write_json(state_path, state)
@@ -3618,6 +4001,9 @@ Tips:
   * A new campaign warm-starts from a compatible existing --base-params winner.
   * For trustworthy selection, keep validation/stress data outside the search range.
   * Raw score is preserved; cross-range comparisons use a candle-count annualized score.
+  * Auto learns from normalized Discovery ranks and later funnel outcomes, not raw scale.
+  * Candidate selection balances predicted quality, uncertainty, diversity, and randomness.
+  * Numeric mutations learn a preferred direction and local step inside the configured bounds.
   * Auto mode defaults to profile=full; non-auto mode defaults to profile=focused.""",
     )
 
@@ -3796,11 +4182,11 @@ Tips:
     )
     auto.add_argument(
         "--auto-surrogate-pool", type=int, default=8, metavar="MULTIPLIER",
-        help="unevaluated candidate-pool size relative to --auto-tests",
+        help="unevaluated quality/uncertainty/diversity pool relative to --auto-tests",
     )
     auto.add_argument(
         "--auto-surrogate-trees", type=int, default=32, metavar="N",
-        help="randomized regression trees in the internal surrogate model",
+        help="trees learning normalized ranks and robust funnel outcomes",
     )
     auto.add_argument(
         "--auto-walk-forward-folds", type=int, default=3, metavar="N",
