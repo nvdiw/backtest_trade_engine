@@ -13,7 +13,8 @@ from optimize import (
     ExtraTreesSurrogate, SmartCandidateGenerator,
     _aggregate_walk_forward_records, _auto_bootstrap, _compact_auto_candidate_plans,
     _learn_parameter_importance, _open_csv_text, _resolve_csv_path,
-    _read_candidate_plan, _representative_surrogate_history,
+    _read_candidate_plan, _read_surrogate_history_cache,
+    _representative_surrogate_history, _write_surrogate_history_cache,
     _robust_validation_score, _time_normalized_score,
     build_parser, grid_size,
     iter_grid_candidates,
@@ -25,6 +26,28 @@ from trade_engine import TradeEngine
 
 
 class OptimizerSearchTests(unittest.TestCase):
+    def test_compact_surrogate_cache_round_trips_legacy_history(self):
+        history = [
+            {
+                "candidate_id": f"c1-{score}",
+                "objective_score": score,
+                "params": {"x": score, "y": score % 3},
+            }
+            for score in range(10_000)
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_path = Path(temp_dir) / "surrogate_history_cache.json.gz"
+            selected = _write_surrogate_history_cache(
+                cache_path, history, ("x", "y"), 159
+            )
+            loaded, latest_cycle = _read_surrogate_history_cache(
+                cache_path, ("x", "y")
+            )
+
+        self.assertEqual(len(selected), 1024)
+        self.assertEqual(loaded, selected)
+        self.assertEqual(latest_cycle, 159)
+
     def test_large_surrogate_history_is_representative_and_bounded(self):
         history = [
             {"objective_score": score, "params": {"x": score}}

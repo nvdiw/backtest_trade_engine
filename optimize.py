@@ -241,6 +241,8 @@ DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
 AUTO_TIME_COLUMNS = ["time_normalized_score", "range_candles"]
 CANDLES_PER_YEAR_15M = 365.25 * 24 * 4
 SURROGATE_MAX_TRAINING_SAMPLES = 1024
+SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
+SURROGATE_CACHE_VERSION = 1
 
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
@@ -1498,19 +1500,153 @@ def _load_auto_seen(output_dir, keys):
 
 
 def _load_discovery_history(output_dir, keys):
-    """Load comparable full-discovery observations from every previous cycle."""
-    history = []
+    """Load a compact persistent surrogate history and increment it as needed."""
+    output_dir = Path(output_dir)
+    cache_path = output_dir / "surrogate_history_cache.json.gz"
     cycles_dir = Path(output_dir) / "cycles"
     plan_paths = sorted(cycles_dir.glob("cycle_*/discovery_candidates.json"))
-    for index, plan_path in enumerate(plan_paths, start=1):
+    cached_history, cached_cycle = _read_surrogate_history_cache(cache_path, keys)
+    if cached_history is None:
+        history = []
+        cached_cycle = 0
+        selected_paths = _surrogate_bootstrap_paths(
+            plan_paths, SURROGATE_CACHE_BOOTSTRAP_CYCLES
+        )
+        if len(selected_paths) < len(plan_paths):
+            print(
+                f"Building compact surrogate cache from {len(selected_paths):,}/"
+                f"{len(plan_paths):,} time-balanced/recent cycles."
+            )
+    else:
+        history = cached_history
+        selected_paths = [
+            path for path in plan_paths
+            if _cycle_number_from_path(path) > cached_cycle
+        ]
+        print(
+            f"Loaded compact surrogate cache: {len(history):,} samples through "
+            f"cycle {cached_cycle:,}."
+        )
+
+    for index, plan_path in enumerate(selected_paths, start=1):
         results_path = _resolve_csv_path(plan_path.with_name("discovery_results.csv"))
         candidates = _read_candidate_plan(plan_path)
         for record in _read_auto_stage_records(results_path, candidates):
             score = _finite_number(record.get("objective_score"))
             if score is not None and all(key in record["params"] for key in keys):
                 history.append(record)
-        _show_loading_progress("Loading surrogate history", index, len(plan_paths))
+        _show_loading_progress("Loading surrogate history", index, len(selected_paths))
+
+    latest_cycle = max(
+        [cached_cycle] + [_cycle_number_from_path(path) for path in selected_paths]
+    )
+    if selected_paths or cached_history is None:
+        history = _write_surrogate_history_cache(
+            cache_path, history, keys, latest_cycle
+        )
     return history
+
+
+def _cycle_number_from_path(path):
+    try:
+        return int(Path(path).parent.name.removeprefix("cycle_"))
+    except ValueError:
+        return 0
+
+
+def _evenly_spaced_items(items, limit):
+    items = list(items)
+    limit = max(1, int(limit))
+    if len(items) <= limit:
+        return items
+    if limit == 1:
+        return [items[-1]]
+    indices = {
+        round(position * (len(items) - 1) / (limit - 1))
+        for position in range(limit)
+    }
+    return [items[index] for index in sorted(indices)]
+
+
+def _surrogate_bootstrap_paths(paths, limit):
+    """Blend whole-history coverage with extra weight on recent refinements."""
+    paths = list(paths)
+    limit = max(1, int(limit))
+    if len(paths) <= limit:
+        return paths
+    broad_count = max(1, limit // 2)
+    broad = _evenly_spaced_items(paths, broad_count)
+    selected = {path: None for path in broad}
+    for path in reversed(paths):
+        selected[path] = None
+        if len(selected) >= limit:
+            break
+    return sorted(selected)
+
+
+def _read_surrogate_history_cache(path, keys):
+    path = Path(path)
+    if not path.is_file():
+        return None, 0
+    try:
+        with gzip.open(path, "rt", encoding="utf-8") as cache_file:
+            payload = json.load(cache_file)
+        if (
+            payload.get("version") != SURROGATE_CACHE_VERSION
+            or tuple(payload.get("parameter_keys", ())) != tuple(keys)
+        ):
+            return None, 0
+        rows = payload.get("rows", [])
+        history = [
+            {
+                "candidate_id": row[0],
+                "objective_score": row[1],
+                "params": dict(zip(keys, row[2:])),
+            }
+            for row in rows
+        ]
+        return history, int(payload.get("latest_cycle", 0) or 0)
+    except (OSError, EOFError, UnicodeError, ValueError, json.JSONDecodeError):
+        return None, 0
+
+
+def _write_surrogate_history_cache(path, history, keys, latest_cycle):
+    usable = [
+        record for record in history
+        if _finite_number(record.get("objective_score")) is not None
+        and all(key in record.get("params", {}) for key in keys)
+    ]
+    selected = _representative_surrogate_history(
+        usable, SURROGATE_MAX_TRAINING_SAMPLES
+    )
+    payload = {
+        "version": SURROGATE_CACHE_VERSION,
+        "latest_cycle": int(latest_cycle),
+        "parameter_keys": list(keys),
+        "sample_count": len(selected),
+        "sample_method": "deterministic_score_quantiles",
+        "rows": [
+            [
+                record.get("candidate_id"),
+                record["objective_score"],
+                *(record["params"][key] for key in keys),
+            ]
+            for record in selected
+        ],
+    }
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with gzip.open(
+            temporary, "wt", encoding="utf-8", compresslevel=6
+        ) as cache_file:
+            json.dump(_json_safe(payload), cache_file, separators=(",", ":"))
+        os.replace(temporary, path)
+    except BaseException:
+        if temporary.is_file():
+            temporary.unlink()
+        raise
+    return selected
 
 
 def _surrogate_feature_row(params, keys, grid):
@@ -1871,11 +2007,47 @@ def _compress_completed_cycle_results(cycle_dir):
     return compressed_count, reclaimed
 
 
-def _cleanup_completed_auto_cycles(output_dir, current_cycle, show_progress=False):
-    """Drop redundant plans and temporary checkpoints from completed cycles."""
+def _cleanup_completed_cycle(cycle_dir):
+    """Compress and prune exactly one completed cycle."""
     removed = 0
-    compressed = 0
     reclaimed = 0
+    cycle_dir = Path(cycle_dir)
+    try:
+        compressed, cycle_reclaimed = _compress_completed_cycle_results(cycle_dir)
+    except (OSError, UnicodeError, csv.Error) as error:
+        # Storage optimization is optional; a locked or unusual legacy CSV must
+        # not prevent the actual optimization campaign from continuing.
+        print(f"Storage warning: kept legacy files in {cycle_dir.name}: {error}")
+        compressed = 0
+    else:
+        reclaimed += cycle_reclaimed
+    keep = {"discovery_candidates.json", "discovery_pool_candidates.json"}
+    for path in cycle_dir.glob("*_candidates.json"):
+        if path.name not in keep:
+            reclaimed += path.stat().st_size
+            path.unlink()
+            removed += 1
+    checkpoints_dir = cycle_dir / "checkpoints"
+    if checkpoints_dir.is_dir():
+        for checkpoint_dir in checkpoints_dir.iterdir():
+            if not checkpoint_dir.is_dir():
+                continue
+            for name in ("best_params.json", "checkpoint.json"):
+                path = checkpoint_dir / name
+                if path.is_file():
+                    reclaimed += path.stat().st_size
+                    path.unlink()
+                    removed += 1
+            if not any(checkpoint_dir.iterdir()):
+                checkpoint_dir.rmdir()
+        if not any(checkpoints_dir.iterdir()):
+            checkpoints_dir.rmdir()
+    return removed, compressed, reclaimed
+
+
+def _cleanup_completed_auto_cycles(output_dir, current_cycle, show_progress=False):
+    """Upgrade every older cycle once when a campaign process starts."""
+    removed = compressed = reclaimed = 0
     cycles_dir = Path(output_dir) / "cycles"
     cycle_dirs = sorted(cycles_dir.glob("cycle_*"))
     eligible = []
@@ -1888,36 +2060,12 @@ def _cleanup_completed_auto_cycles(output_dir, current_cycle, show_progress=Fals
             continue
         eligible.append(cycle_dir)
     for index, cycle_dir in enumerate(eligible, start=1):
-        try:
-            cycle_compressed, cycle_reclaimed = _compress_completed_cycle_results(cycle_dir)
-        except (OSError, UnicodeError, csv.Error) as error:
-            # Storage optimization is optional; a locked or unusual legacy CSV
-            # must not prevent the actual optimization campaign from resuming.
-            print(f"Storage warning: kept legacy files in {cycle_dir.name}: {error}")
-        else:
-            compressed += cycle_compressed
-            reclaimed += cycle_reclaimed
-        keep = {"discovery_candidates.json", "discovery_pool_candidates.json"}
-        for path in cycle_dir.glob("*_candidates.json"):
-            if path.name not in keep:
-                reclaimed += path.stat().st_size
-                path.unlink()
-                removed += 1
-        checkpoints_dir = cycle_dir / "checkpoints"
-        if checkpoints_dir.is_dir():
-            for checkpoint_dir in checkpoints_dir.iterdir():
-                if not checkpoint_dir.is_dir():
-                    continue
-                for name in ("best_params.json", "checkpoint.json"):
-                    path = checkpoint_dir / name
-                    if path.is_file():
-                        reclaimed += path.stat().st_size
-                        path.unlink()
-                        removed += 1
-                if not any(checkpoint_dir.iterdir()):
-                    checkpoint_dir.rmdir()
-            if not any(checkpoints_dir.iterdir()):
-                checkpoints_dir.rmdir()
+        cycle_removed, cycle_compressed, cycle_reclaimed = _cleanup_completed_cycle(
+            cycle_dir
+        )
+        removed += cycle_removed
+        compressed += cycle_compressed
+        reclaimed += cycle_reclaimed
         if show_progress:
             _show_loading_progress("Preparing stored cycles", index, len(eligible))
     return removed, compressed, reclaimed
@@ -1931,6 +2079,15 @@ def _safe_cleanup_completed_auto_cycles(output_dir, current_cycle, show_progress
         )
     except OSError as error:
         print(f"Storage warning: cleanup was deferred: {error}")
+        return 0, 0, 0
+
+
+def _safe_cleanup_completed_cycle(cycle_dir):
+    """Clean only the cycle that just completed; older gzip files are untouched."""
+    try:
+        return _cleanup_completed_cycle(cycle_dir)
+    except OSError as error:
+        print(f"Storage warning: cleanup was deferred for {Path(cycle_dir).name}: {error}")
         return 0, 0, 0
 
 
@@ -2712,6 +2869,10 @@ def run_auto_optimization(args, grid=None):
         )
 
     cycle_limit = max(0, int(args.auto_cycles))
+    # Disk history is loaded once per process. Subsequent cycles extend these
+    # caches with only their new plans/results instead of rescanning everything.
+    seen_cache = None
+    history_cache = None
     try:
         while cycle_limit == 0 or state["cycles_completed"] < cycle_limit:
             cycle = int(state["cycle"])
@@ -2746,7 +2907,13 @@ def run_auto_optimization(args, grid=None):
             if source_plan_path.is_file():
                 discovery_pool = _read_candidate_plan(source_plan_path)
             else:
-                seen = _load_auto_seen(output_dir, keys)
+                if seen_cache is None:
+                    seen_cache = _load_auto_seen(output_dir, keys)
+                else:
+                    print(
+                        f"Using in-memory candidate history: "
+                        f"{len(seen_cache):,} tested configurations."
+                    )
                 elite_records = [
                     {
                         "params": {key: record["params"][key] for key in keys},
@@ -2764,8 +2931,18 @@ def run_auto_optimization(args, grid=None):
                     },
                     refinement_round=max(1, cycle - 1),
                 )
-                generator.seen.update(seen)
-                history = _load_discovery_history(output_dir, keys) if advanced else []
+                generator.seen.update(seen_cache)
+                if advanced:
+                    if history_cache is None:
+                        history_cache = _load_discovery_history(output_dir, keys)
+                    else:
+                        print(
+                            f"Using in-memory surrogate history: "
+                            f"{len(history_cache):,} stored results."
+                        )
+                    history = history_cache
+                else:
+                    history = []
                 surrogate_ready = (
                     len(history) >= optimizer_features["surrogate_min_samples"]
                 )
@@ -2796,6 +2973,9 @@ def run_auto_optimization(args, grid=None):
                     grid,
                     optimizer_features,
                     args.seed + cycle - 1,
+                )
+                seen_cache.update(
+                    _candidate_signature(params, keys) for params in generated
                 )
                 discovery_pool = [
                     {
@@ -2926,6 +3106,14 @@ def run_auto_optimization(args, grid=None):
                     excel_enabled=bool(args.excel_top),
                 )
                 return hall[0] if hall else None
+            if history_cache is not None:
+                history_cache.extend(discovery_records)
+                history_cache = _write_surrogate_history_cache(
+                    output_dir / "surrogate_history_cache.json.gz",
+                    history_cache,
+                    keys,
+                    cycle,
+                )
 
             if int(state.get("importance_cycle", 0)) < cycle:
                 learned = _learn_parameter_importance(
@@ -3059,7 +3247,7 @@ def run_auto_optimization(args, grid=None):
                 output_dir, hall, importance, state, keys,
                 excel_enabled=bool(args.excel_top),
             )
-            _safe_cleanup_completed_auto_cycles(output_dir, state["cycle"])
+            _safe_cleanup_completed_cycle(cycle_dir)
             best_text = (
                 f"{hall[0]['robust_score']:.4f}" if hall else "no qualified finalist"
             )
