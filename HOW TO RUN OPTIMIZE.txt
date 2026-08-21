@@ -8,6 +8,9 @@ It warm-starts from outputs/optimize/best_params.json when compatible.
 If outputs/optimize/auto/auto_state.json already exists, this same command resumes it automatically.
 Raw objective_score is preserved. Cross-range comparisons use time_normalized_score,
 annualized from the exact number of 15-minute candles in each range.
+Result tables show score, profit/loss, balance, drawdown, and trade metrics before parameters.
+Completed cycle CSVs become lossless .csv.gz files and are read directly during resume.
+For transfer, stop with Ctrl+C and copy the complete outputs/optimize/auto directory.
 
 RESUME CONTINUOUS AUTO SEARCH:
 python optimize.py --auto --resume -w 16

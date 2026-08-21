@@ -12,8 +12,9 @@ from openpyxl import load_workbook
 from optimize import (
     ExtraTreesSurrogate, SmartCandidateGenerator,
     _aggregate_walk_forward_records, _auto_bootstrap, _compact_auto_candidate_plans,
-    _learn_parameter_importance,
-    _read_candidate_plan, _robust_validation_score, _time_normalized_score,
+    _learn_parameter_importance, _open_csv_text, _resolve_csv_path,
+    _read_candidate_plan, _representative_surrogate_history,
+    _robust_validation_score, _time_normalized_score,
     build_parser, grid_size,
     iter_grid_candidates,
     param_grid, run_auto_optimization, run_optimization,
@@ -24,6 +25,19 @@ from trade_engine import TradeEngine
 
 
 class OptimizerSearchTests(unittest.TestCase):
+    def test_large_surrogate_history_is_representative_and_bounded(self):
+        history = [
+            {"objective_score": score, "params": {"x": score}}
+            for score in range(10_000)
+        ]
+
+        selected = _representative_surrogate_history(history, 1024)
+
+        self.assertEqual(len(selected), 1024)
+        self.assertEqual(selected[0]["objective_score"], 0)
+        self.assertEqual(selected[-1]["objective_score"], 9_999)
+        self.assertEqual(selected, _representative_surrogate_history(history, 1024))
+
     def test_legacy_candidate_plans_are_compacted_without_losing_candidates(self):
         candidates = [
             {"candidate_id": f"c1-{index}", "params": {"x": index, "y": index % 2}}
@@ -274,11 +288,15 @@ class OptimizerSearchTests(unittest.TestCase):
                 output / "cycles" / "cycle_000002" / "surrogate_search.json"
             ).read_text(encoding="utf-8"))
             state = json.loads((output / "auto_state.json").read_text(encoding="utf-8"))
-
-            self.assertTrue((
+            compressed_results = (
                 output / "cycles" / "cycle_000001"
-                / "discovery_rung_01_results.csv"
-            ).is_file())
+                / "discovery_rung_01_results.csv.gz"
+            )
+            with _open_csv_text(compressed_results) as results_file:
+                auto_columns = next(csv.reader(results_file))
+
+            self.assertTrue(compressed_results.is_file())
+            self.assertLess(auto_columns.index("total_profit"), auto_columns.index("x"))
             self.assertTrue((
                 output / "cycles" / "cycle_000001" / "walk_forward_summary.json"
             ).is_file())
@@ -451,9 +469,10 @@ class OptimizerSearchTests(unittest.TestCase):
             completed_state = json.loads(
                 (Path(temp_dir) / "auto_state.json").read_text(encoding="utf-8")
             )
-            with (
+            discovery_results = _resolve_csv_path(
                 Path(temp_dir) / "cycles" / "cycle_000001" / "discovery_results.csv"
-            ).open(encoding="utf-8") as results_file:
+            )
+            with _open_csv_text(discovery_results) as results_file:
                 discovery_reader = csv.DictReader(results_file)
                 discovery_rows = list(discovery_reader)
                 discovery_fields = discovery_reader.fieldnames
@@ -467,9 +486,11 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(completed_state["migrated_from_version"], 1)
         self.assertEqual(completed_state["cycles_completed"], 1)
         self.assertEqual(completed_state["total_evaluations"], 6)
+        self.assertEqual(discovery_results.suffixes[-2:], [".csv", ".gz"])
         self.assertEqual(len(discovery_rows), 2)
         self.assertIn("time_normalized_score", discovery_fields)
         self.assertIn("range_candles", discovery_fields)
+        self.assertLess(discovery_fields.index("total_profit"), discovery_fields.index("x"))
         self.assertEqual(len({row["candidate_id"] for row in discovery_rows}), 2)
         self.assertEqual(resumed["params"], {"x": 2})
 
@@ -526,6 +547,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertIn("Scale Metrics", sheet_names)
         self.assertIn("objective_score", columns)
         self.assertIn("profit_per_trade", columns)
+        self.assertLess(columns.index("total_profit"), columns.index("x"))
 
     def test_keyboard_interrupt_stops_cleanly_and_keeps_checkpoint(self):
         args = Namespace(

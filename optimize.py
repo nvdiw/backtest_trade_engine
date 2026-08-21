@@ -9,6 +9,7 @@ Examples:
 
 import argparse
 import csv
+import gzip
 import itertools
 import json
 import math
@@ -239,6 +240,7 @@ RESULT_COLUMNS = [
 DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
 AUTO_TIME_COLUMNS = ["time_normalized_score", "range_candles"]
 CANDLES_PER_YEAR_15M = 365.25 * 24 * 4
+SURROGATE_MAX_TRAINING_SAMPLES = 1024
 
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
@@ -513,7 +515,7 @@ class SmartCandidateGenerator:
                         self.local_queue.append(candidate)
                         self.local_queued.add(signature)
 
-    def generate(self, count, elites=None, progress=0.0):
+    def generate(self, count, elites=None, progress=0.0, progress_label=None):
         candidates = []
         attempts = 0
         max_attempts = max(1000, count * 100)
@@ -537,12 +539,17 @@ class SmartCandidateGenerator:
                 continue
             self.seen.add(signature)
             candidates.append(candidate)
+            if progress_label and (
+                len(candidates) == count
+                or len(candidates) % max(1, math.ceil(count / 20)) == 0
+            ):
+                _show_loading_progress(progress_label, len(candidates), count)
         return candidates
 
-    def generate_auto(self, count, elites=None):
+    def generate_auto(self, count, elites=None, progress_label=None):
         """Generate the 25% exploration / 15% crossover / 60% local mix."""
         if not elites:
-            return self.generate(count)
+            return self.generate(count, progress_label=progress_label)
         self._queue_elite_neighbors(elites)
         candidates = []
         attempts = 0
@@ -567,6 +574,11 @@ class SmartCandidateGenerator:
                 continue
             self.seen.add(signature)
             candidates.append(candidate)
+            if progress_label and (
+                len(candidates) == count
+                or len(candidates) % max(1, math.ceil(count / 20)) == 0
+            ):
+                _show_loading_progress(progress_label, len(candidates), count)
         return candidates
 
 
@@ -833,14 +845,17 @@ class ExtraTreesSurrogate:
                 continue
             for _ in range(3):
                 threshold = randomizer.uniform(lower, upper)
-                left = [
-                    index for index in indices
-                    if features[index][feature_index] <= threshold
-                ]
+                left = []
+                right = []
+                for index in indices:
+                    target = (
+                        left
+                        if features[index][feature_index] <= threshold
+                        else right
+                    )
+                    target.append(index)
                 if len(left) < self.min_leaf or len(indices) - len(left) < self.min_leaf:
                     continue
-                left_set = set(left)
-                right = [index for index in indices if index not in left_set]
                 left_mean = statistics.fmean(targets[index] for index in left)
                 right_mean = statistics.fmean(targets[index] for index in right)
                 loss = sum((targets[index] - left_mean) ** 2 for index in left)
@@ -856,7 +871,7 @@ class ExtraTreesSurrogate:
             self._build_tree(features, targets, right, depth + 1, randomizer),
         )
 
-    def fit(self, features, targets):
+    def fit(self, features, targets, progress_label=None):
         if not features or len(features) != len(targets):
             raise ValueError("surrogate training features and targets must be non-empty")
         sample_count = len(features)
@@ -871,6 +886,11 @@ class ExtraTreesSurrogate:
             self.trees.append(
                 self._build_tree(features, targets, indices, 0, randomizer)
             )
+            if progress_label and (
+                tree_index + 1 == self.n_trees
+                or (tree_index + 1) % max(1, math.ceil(self.n_trees / 20)) == 0
+            ):
+                _show_loading_progress(progress_label, tree_index + 1, self.n_trees)
         return self
 
     @staticmethod
@@ -880,16 +900,21 @@ class ExtraTreesSurrogate:
             tree = left if features[feature_index] <= threshold else right
         return tree[1]
 
-    def predict_mean_std(self, feature_rows):
+    def predict_mean_std(self, feature_rows, progress_label=None):
         if not self.trees:
             raise ValueError("surrogate must be fitted before prediction")
         output = []
-        for row in feature_rows:
+        total = len(feature_rows)
+        for index, row in enumerate(feature_rows, start=1):
             predictions = [self._predict_tree(tree, row) for tree in self.trees]
             output.append((
                 statistics.fmean(predictions),
                 statistics.pstdev(predictions) if len(predictions) > 1 else 0.0,
             ))
+            if progress_label and (
+                index == total or index % max(1, math.ceil(total / 20)) == 0
+            ):
+                _show_loading_progress(progress_label, index, total)
         return output
 
 
@@ -1006,6 +1031,19 @@ def _latest_market_end():
 
 def _timestamp_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _show_loading_progress(label, completed, total):
+    """Render one in-place startup progress line for potentially large histories."""
+    if total < 5:
+        return
+    percent = 100.0 * completed / max(1, total)
+    end = "\n" if completed >= total else ""
+    print(
+        f"\r{label}: {percent:6.2f}% ({completed:,}/{total:,})",
+        end=end,
+        flush=True,
+    )
 
 
 def _json_safe(value):
@@ -1179,6 +1217,15 @@ def _result_row(keys, index, params, result, duration, objective_score=None):
         realized_profit / closed_trades if closed_trades else None
     )
     return row
+
+
+def _result_fieldnames(keys):
+    """Put outcome and trade metrics before the usually much wider parameter set."""
+    metrics = [column for column in RESULT_COLUMNS if column != "score"]
+    return [
+        "test_index", "objective_score", "score", *metrics,
+        "profit_per_trade", "duration_s", *keys,
+    ]
 
 
 def _parse_grid_csv_value(raw, values):
@@ -1440,11 +1487,13 @@ def _candidate_signature(params, keys):
 
 def _load_auto_seen(output_dir, keys):
     seen = set()
-    for path in sorted((Path(output_dir) / "cycles").glob("cycle_*/*_candidates.json")):
+    paths = sorted((Path(output_dir) / "cycles").glob("cycle_*/*_candidates.json"))
+    for index, path in enumerate(paths, start=1):
         for candidate in _read_candidate_plan(path):
             params = candidate.get("params", {})
             if all(key in params for key in keys):
                 seen.add(_candidate_signature(params, keys))
+        _show_loading_progress("Loading previous candidates", index, len(paths))
     return seen
 
 
@@ -1452,13 +1501,15 @@ def _load_discovery_history(output_dir, keys):
     """Load comparable full-discovery observations from every previous cycle."""
     history = []
     cycles_dir = Path(output_dir) / "cycles"
-    for plan_path in sorted(cycles_dir.glob("cycle_*/discovery_candidates.json")):
-        results_path = plan_path.with_name("discovery_results.csv")
+    plan_paths = sorted(cycles_dir.glob("cycle_*/discovery_candidates.json"))
+    for index, plan_path in enumerate(plan_paths, start=1):
+        results_path = _resolve_csv_path(plan_path.with_name("discovery_results.csv"))
         candidates = _read_candidate_plan(plan_path)
         for record in _read_auto_stage_records(results_path, candidates):
             score = _finite_number(record.get("objective_score"))
             if score is not None and all(key in record["params"] for key in keys):
                 history.append(record)
+        _show_loading_progress("Loading surrogate history", index, len(plan_paths))
     return history
 
 
@@ -1474,6 +1525,20 @@ def _surrogate_feature_row(params, keys, grid):
             values = list(grid[key])
             row.append(float(values.index(value)) if value in values else -1.0)
     return row
+
+
+def _representative_surrogate_history(history, limit):
+    """Select deterministic score quantiles while retaining the complete history on disk."""
+    history = list(history)
+    limit = max(2, int(limit))
+    if len(history) <= limit:
+        return history
+    ranked = sorted(history, key=lambda record: float(record["objective_score"]))
+    indices = {
+        round(position * (len(ranked) - 1) / (limit - 1))
+        for position in range(limit)
+    }
+    return [ranked[index] for index in sorted(indices)]
 
 
 def _select_surrogate_candidates(
@@ -1495,20 +1560,29 @@ def _select_surrogate_candidates(
             "candidate_pool": len(candidates),
         }
 
+    training_history = _representative_surrogate_history(
+        usable_history, SURROGATE_MAX_TRAINING_SAMPLES
+    )
+    if len(training_history) < len(usable_history):
+        print(
+            f"Surrogate training set: {len(training_history):,} representative "
+            f"samples from {len(usable_history):,} stored results."
+        )
     training_features = [
         _surrogate_feature_row(record["params"], keys, grid)
-        for record in usable_history
+        for record in training_history
     ]
-    targets = [float(record["objective_score"]) for record in usable_history]
+    targets = [float(record["objective_score"]) for record in training_history]
     model = ExtraTreesSurrogate(
         n_trees=features["surrogate_trees"],
-        max_depth=max(6, min(14, round(math.log2(len(usable_history) + 1)) + 2)),
-        min_leaf=max(3, min(12, len(usable_history) // 40)),
+        max_depth=max(6, min(12, round(math.log2(len(training_history) + 1)) + 1)),
+        min_leaf=max(3, min(12, len(training_history) // 40)),
         seed=seed,
-    ).fit(training_features, targets)
-    predictions = model.predict_mean_std([
-        _surrogate_feature_row(candidate, keys, grid) for candidate in candidates
-    ])
+    ).fit(training_features, targets, progress_label="Training surrogate model")
+    predictions = model.predict_mean_std(
+        [_surrogate_feature_row(candidate, keys, grid) for candidate in candidates],
+        progress_label="Scoring candidate pool",
+    )
     ranked_mean = sorted(
         range(len(candidates)), key=lambda index: predictions[index][0], reverse=True
     )
@@ -1539,6 +1613,8 @@ def _select_surrogate_candidates(
         "enabled": True,
         "model": "dependency_free_extra_trees",
         "history_samples": len(usable_history),
+        "training_samples": len(training_history),
+        "training_sample_method": "deterministic_score_quantiles",
         "candidate_pool": len(candidates),
         "selected_candidates": len(selected),
         "trees": features["surrogate_trees"],
@@ -1600,11 +1676,64 @@ def _walk_forward_ranges(ranges, fold_count):
 
 def _count_auto_evaluations(output_dir):
     completed = 0
-    for path in (Path(output_dir) / "cycles").glob("cycle_*/*_results.csv"):
-        with path.open(newline="", encoding="utf-8") as csv_file:
+    cycles_dir = Path(output_dir) / "cycles"
+    paths = list(cycles_dir.glob("cycle_*/*_results.csv"))
+    paths.extend(
+        path for path in cycles_dir.glob("cycle_*/*_results.csv.gz")
+        if not path.with_suffix("").is_file()
+    )
+    for index, path in enumerate(paths, start=1):
+        with _open_csv_text(path) as csv_file:
             reader = csv.DictReader(csv_file)
             completed += sum(1 for _ in reader)
+        _show_loading_progress("Counting legacy results", index, len(paths))
     return completed
+
+
+def _resolve_csv_path(path):
+    """Prefer a writable/plain CSV and otherwise use its completed gzip archive."""
+    path = Path(path)
+    if path.is_file():
+        return path
+    compressed = path.with_suffix(path.suffix + ".gz")
+    return compressed if compressed.is_file() else path
+
+
+def _open_csv_text(path):
+    path = Path(path)
+    if path.suffix == ".gz":
+        return gzip.open(path, "rt", newline="", encoding="utf-8")
+    return path.open(newline="", encoding="utf-8")
+
+
+def _count_csv_rows(path):
+    path = _resolve_csv_path(path)
+    if not path.is_file():
+        return 0
+    with _open_csv_text(path) as csv_file:
+        return sum(1 for _ in csv.DictReader(csv_file))
+
+
+def _reconcile_auto_evaluations(output_dir, state):
+    """Trust persisted totals and only reconcile the active stage after a crash."""
+    saved_total = state.get("total_evaluations")
+    if saved_total is None:
+        return _count_auto_evaluations(output_dir)
+    cycle_dir = (
+        Path(output_dir) / "cycles" / f"cycle_{int(state.get('cycle', 1)):06d}"
+    )
+    stage = state.get("stage")
+    if not stage:
+        return int(saved_total)
+    actual_stage_rows = _count_csv_rows(cycle_dir / f"{stage}_results.csv")
+    saved_stage_rows = int(state.get("stage_completed", 0) or 0)
+    recovered_rows = max(0, actual_stage_rows - saved_stage_rows)
+    if recovered_rows:
+        print(
+            f"Resume reconciliation: recovered {recovered_rows:,} completed "
+            f"{stage} result(s) written after the last state flush."
+        )
+    return int(saved_total) + recovered_rows
 
 
 def _write_candidate_plan(path, cycle, stage, candidates, source=None):
@@ -1661,18 +1790,21 @@ def _read_candidate_plan(path):
     return payload.get("candidates", [])
 
 
-def _compact_auto_candidate_plans(output_dir):
+def _compact_auto_candidate_plans(output_dir, show_progress=False):
     """Upgrade verbose legacy plans and replace exact rung-1 copies in place."""
     rewritten = 0
     bytes_before = 0
     bytes_after = 0
     cycles_dir = Path(output_dir) / "cycles"
-    for path in sorted(cycles_dir.glob("cycle_*/*_candidates.json")):
+    paths = sorted(cycles_dir.glob("cycle_*/*_candidates.json"))
+    for index, path in enumerate(paths, start=1):
         payload = _load_json(path, {}) or {}
         needs_upgrade = payload.get("version") != 2
         source_path = path.parent / "discovery_pool_candidates.json"
         use_source = path.name == "discovery_rung_01_candidates.json" and source_path.is_file()
         if not needs_upgrade and (not use_source or payload.get("source")):
+            if show_progress:
+                _show_loading_progress("Checking candidate plans", index, len(paths))
             continue
         candidates = _read_candidate_plan(path)
         if use_source and candidates != _read_candidate_plan(source_path):
@@ -1688,21 +1820,83 @@ def _compact_auto_candidate_plans(output_dir):
         rewritten += 1
         bytes_before += old_size
         bytes_after += path.stat().st_size
+        if show_progress:
+            _show_loading_progress("Checking candidate plans", index, len(paths))
     return rewritten, max(0, bytes_before - bytes_after)
 
 
-def _cleanup_completed_auto_cycles(output_dir, current_cycle):
+def _compress_completed_cycle_results(cycle_dir):
+    """Losslessly archive completed CSVs while keeping their columns easy to scan."""
+    compressed_count = 0
+    reclaimed = 0
+    known_fields = _auto_stage_fieldnames(())
+    known_set = set(known_fields)
+    for path in sorted(Path(cycle_dir).glob("*_results.csv")):
+        destination = path.with_suffix(path.suffix + ".gz")
+        original_size = path.stat().st_size
+        if destination.is_file():
+            path.unlink()
+            compressed_count += 1
+            reclaimed += original_size
+            continue
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        try:
+            with path.open(newline="", encoding="utf-8") as source:
+                reader = csv.DictReader(source)
+                existing_fields = reader.fieldnames or []
+                parameter_fields = [
+                    field for field in existing_fields if field not in known_set
+                ]
+                fieldnames = [
+                    field for field in known_fields if field != "error" and field in existing_fields
+                ]
+                fieldnames.extend(parameter_fields)
+                if "error" in existing_fields:
+                    fieldnames.append("error")
+                with gzip.open(
+                    temporary, "wt", newline="", encoding="utf-8", compresslevel=6
+                ) as target:
+                    writer = csv.DictWriter(target, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(reader)
+            os.replace(temporary, destination)
+            compressed_size = destination.stat().st_size
+            path.unlink()
+            compressed_count += 1
+            reclaimed += max(0, original_size - compressed_size)
+        except BaseException:
+            if temporary.is_file():
+                temporary.unlink()
+            raise
+    return compressed_count, reclaimed
+
+
+def _cleanup_completed_auto_cycles(output_dir, current_cycle, show_progress=False):
     """Drop redundant plans and temporary checkpoints from completed cycles."""
     removed = 0
+    compressed = 0
     reclaimed = 0
     cycles_dir = Path(output_dir) / "cycles"
-    for cycle_dir in sorted(cycles_dir.glob("cycle_*")):
+    cycle_dirs = sorted(cycles_dir.glob("cycle_*"))
+    eligible = []
+    for cycle_dir in cycle_dirs:
         try:
             cycle_number = int(cycle_dir.name.removeprefix("cycle_"))
         except ValueError:
             continue
         if cycle_number >= int(current_cycle):
             continue
+        eligible.append(cycle_dir)
+    for index, cycle_dir in enumerate(eligible, start=1):
+        try:
+            cycle_compressed, cycle_reclaimed = _compress_completed_cycle_results(cycle_dir)
+        except (OSError, UnicodeError, csv.Error) as error:
+            # Storage optimization is optional; a locked or unusual legacy CSV
+            # must not prevent the actual optimization campaign from resuming.
+            print(f"Storage warning: kept legacy files in {cycle_dir.name}: {error}")
+        else:
+            compressed += cycle_compressed
+            reclaimed += cycle_reclaimed
         keep = {"discovery_candidates.json", "discovery_pool_candidates.json"}
         for path in cycle_dir.glob("*_candidates.json"):
             if path.name not in keep:
@@ -1724,14 +1918,28 @@ def _cleanup_completed_auto_cycles(output_dir, current_cycle):
                     checkpoint_dir.rmdir()
             if not any(checkpoints_dir.iterdir()):
                 checkpoints_dir.rmdir()
-    return removed, reclaimed
+        if show_progress:
+            _show_loading_progress("Preparing stored cycles", index, len(eligible))
+    return removed, compressed, reclaimed
+
+
+def _safe_cleanup_completed_auto_cycles(output_dir, current_cycle, show_progress=False):
+    """Keep optional storage cleanup from blocking a compatible resume."""
+    try:
+        return _cleanup_completed_auto_cycles(
+            output_dir, current_cycle, show_progress=show_progress
+        )
+    except OSError as error:
+        print(f"Storage warning: cleanup was deferred: {error}")
+        return 0, 0, 0
 
 
 def _auto_stage_fieldnames(keys):
+    metrics = [column for column in RESULT_COLUMNS if column != "score"]
     return [
         "candidate_id", "cycle", "stage", "range_start", "range_end",
-        *keys, *RESULT_COLUMNS, *DERIVED_RESULT_COLUMNS, *AUTO_TIME_COLUMNS,
-        "duration_s", "error",
+        "objective_score", "time_normalized_score", "score", *metrics,
+        "profit_per_trade", "range_candles", "duration_s", *keys, "error",
     ]
 
 
@@ -1743,7 +1951,8 @@ def _upgrade_auto_stage_csv(path, keys):
     with path.open(newline="", encoding="utf-8") as csv_file:
         reader = csv.DictReader(csv_file)
         existing_fields = reader.fieldnames or []
-        if all(column in existing_fields for column in AUTO_TIME_COLUMNS):
+        target_fields = _auto_stage_fieldnames(keys)
+        if existing_fields == target_fields:
             return
         rows = list(reader)
     for row in rows:
@@ -1784,12 +1993,12 @@ def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
 
 
 def _read_auto_stage_records(path, candidates):
-    path = Path(path)
+    path = _resolve_csv_path(path)
     if not path.is_file():
         return []
     candidate_map = {candidate["candidate_id"]: candidate for candidate in candidates}
     records = {}
-    with path.open(newline="", encoding="utf-8") as csv_file:
+    with _open_csv_text(path) as csv_file:
         reader = csv.DictReader(csv_file)
         if "candidate_id" not in (reader.fieldnames or ()):
             raise ValueError(f"invalid auto checkpoint: {path}")
@@ -2421,7 +2630,7 @@ def run_auto_optimization(args, grid=None):
         importance = _load_json(output_dir / "parameter_importance.json", {}) or {}
         state.update({
             "status": "running",
-            "total_evaluations": _count_auto_evaluations(output_dir),
+            "total_evaluations": _reconcile_auto_evaluations(output_dir, state),
             "updated_at": _timestamp_now(),
         })
         print(
@@ -2458,14 +2667,21 @@ def run_auto_optimization(args, grid=None):
             "advanced_from_cycle": 1,
             "bootstrap": bootstrap,
         }
-    removed_files, removed_bytes = _cleanup_completed_auto_cycles(
-        output_dir, state["cycle"]
+    removed_files, compressed_csvs, removed_bytes = _safe_cleanup_completed_auto_cycles(
+        output_dir, state["cycle"], show_progress=resume_existing
     )
-    compacted_plans, compacted_bytes = _compact_auto_candidate_plans(output_dir)
+    try:
+        compacted_plans, compacted_bytes = _compact_auto_candidate_plans(
+            output_dir, show_progress=resume_existing
+        )
+    except OSError as error:
+        print(f"Storage warning: legacy candidate plans were kept unchanged: {error}")
+        compacted_plans = compacted_bytes = 0
     reclaimed_bytes = removed_bytes + compacted_bytes
-    if removed_files or compacted_plans:
+    if removed_files or compressed_csvs or compacted_plans:
         print(
             f"Storage cleanup: removed {removed_files:,} redundant files, "
+            f"compressed {compressed_csvs:,} result CSVs, "
             f"compacted {compacted_plans:,} candidate plans | "
             f"reclaimed {reclaimed_bytes / (1024 * 1024):.1f} MiB"
         )
@@ -2558,9 +2774,20 @@ def run_auto_optimization(args, grid=None):
                     if advanced and surrogate_ready else 1
                 )
                 generated_pool = (
-                    generator.generate_auto(pool_target, elites=elite_records)
-                    if elite_records else generator.generate(pool_target)
+                    generator.generate_auto(
+                        pool_target,
+                        elites=elite_records,
+                        progress_label="Generating candidate pool",
+                    )
+                    if elite_records else generator.generate(
+                        pool_target, progress_label="Generating candidate pool"
+                    )
                 )
+                if len(generated_pool) < pool_target:
+                    print(
+                        f"\nCandidate pool reached {len(generated_pool):,}/{pool_target:,} "
+                        "unique valid configurations; continuing with the available pool."
+                    )
                 generated, surrogate_metadata = _select_surrogate_candidates(
                     generated_pool,
                     history,
@@ -2832,7 +3059,7 @@ def run_auto_optimization(args, grid=None):
                 output_dir, hall, importance, state, keys,
                 excel_enabled=bool(args.excel_top),
             )
-            _cleanup_completed_auto_cycles(output_dir, state["cycle"])
+            _safe_cleanup_completed_auto_cycles(output_dir, state["cycle"])
             best_text = (
                 f"{hall[0]['robust_score']:.4f}" if hall else "no qualified finalist"
             )
@@ -2877,10 +3104,7 @@ def run_optimization(args, grid=None):
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     results_path = output_dir / "optimization_results.csv"
-    fieldnames = [
-        "test_index", *keys, *RESULT_COLUMNS,
-        *DERIVED_RESULT_COLUMNS, "duration_s",
-    ]
+    fieldnames = _result_fieldnames(keys)
 
     if args.mode == "grid":
         requested_tests = grid_size(grid)

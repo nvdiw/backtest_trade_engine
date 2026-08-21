@@ -312,7 +312,7 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 
 `--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. An existing compatible checkpoint in the output directory is resumed automatically, even when `--resume` is omitted. A new campaign also warm-starts from compatible values in `--base-params` when that file exists.
 
-The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final full-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 30 reach Validation, 10 reach Stress/walk-forward, and 3 reach Final. The default ranges are:
+The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final full-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 30 reach Validation, 10 reach Stress/walk-forward, and 3 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 1,024 deterministic score-quantile samples so startup cost stays bounded. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. The default ranges are:
 
 ```text
 Discovery    2025-01-01 -> latest candle
@@ -375,7 +375,7 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-walk-forward-folds N` | `3` | Disjoint chronological folds; `0` disables them. |
 | `--auto-walk-forward-stability-penalty FLOAT` | `0.15` | Penalty for performance variation between folds. |
 
-Auto checkpoints are flushed per result and stored per cycle/stage. Version-1 state is migrated in place: an interrupted legacy cycle finishes from its existing plans, and the new engine activates on the next unplanned cycle. Resume requires the same profile, grid, base parameters, ranges, funnel sizes, risk constraints, and version-2 engine settings. Worker count and logging frequency may change.
+Auto checkpoints are flushed per result and stored per cycle/stage. Result tables put scores, profit/loss, balances, drawdown, and trade statistics before the parameter columns. Once a cycle is complete, its result CSVs are losslessly converted to `.csv.gz`; resume and surrogate-history loading read these files directly without extraction. Temporary checkpoints and redundant plans are removed, so copying the complete `auto` directory remains the safest portable checkpoint while requiring substantially less space. Version-1 state is migrated in place: an interrupted legacy cycle finishes from its existing plans, and the new engine activates on the next unplanned cycle. Resume requires the same profile, grid, base parameters, ranges, funnel sizes, risk constraints, and version-2 engine settings. Worker count and logging frequency may change.
 
 ```text
 auto_state.json              exact campaign/cycle/stage checkpoint
@@ -384,12 +384,12 @@ hall_of_fame.json/.csv       cross-cycle robust winners
 parameter_importance.json/.csv learned mutation priorities
 auto_summary.json            campaign status and best result
 auto_report.xlsx             Hall of Fame and Parameter Importance sheets
-cycles/cycle_*/              plans and result CSVs for every stage
+cycles/cycle_*/              active CSVs and compressed completed *.csv.gz results
 cycles/cycle_*/surrogate_search.json  model history and selection diagnostics
 cycles/cycle_*/walk_forward_summary.json fold scores and stability ranking
 cycles/cycle_*/training_parent.json  baseline winner used by that cycle
 cycles/cycle_*/best_params.json      latest stage winner in that cycle
-cycles/cycle_*/checkpoints/*/best_params.json  best parameters at every checkpoint
+cycles/cycle_*/checkpoints/*/best_params.json  temporary winner while a stage is active
 ```
 
 ## Testing
