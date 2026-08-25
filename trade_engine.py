@@ -216,7 +216,7 @@ class TradeEngine:
 
     @staticmethod
     @lru_cache(maxsize=4)
-    def load_market_data(start="2025-01-01", end="2026-02-23"):
+    def load_market_data(start="2025-01-01", end="2026-02-23", warmup_candles=0):
         """Resolve and cache an inclusive start/exclusive end candle range.
 
         Optimization workers call the strategy many times for the same range.  The
@@ -228,19 +228,20 @@ class TradeEngine:
         if end_index <= start_index:
             raise ValueError("end must resolve to a candle after start")
 
-        all_data = fetch_all_data(start_index, end_index)
+        warmup_candles = max(0, int(warmup_candles))
+        data_start_index = max(0, start_index - warmup_candles)
+        all_data = fetch_all_data(data_start_index, end_index)
         if not all_data or len(all_data["Close"]) == 0:
             raise ValueError("the selected start/end range contains no candles")
+
+        warmup_offset = start_index - data_start_index
 
         close_times = (
             pd.to_datetime(all_data["Close time"], utc=True)
             + pd.Timedelta(milliseconds=1)
         ).strftime("%Y-%m-%d %H:%M:%S.%f").tolist()
 
-        return {
-            "start": start_index,
-            "end": end_index,
-            "month_starts": get_month_start_indices(start_index, end_index, just_index=True),
+        history = {
             "open_prices": np.asarray(all_data["Open"], dtype=float),
             "close_prices": np.asarray(all_data["Close"], dtype=float),
             "open_times": all_data["Open time"],
@@ -248,6 +249,16 @@ class TradeEngine:
             "low_prices": np.asarray(all_data["Low"], dtype=float),
             "high_prices": np.asarray(all_data["High"], dtype=float),
             "volume_prices": np.asarray(all_data["Volume"], dtype=float),
+        }
+
+        return {
+            "start": start_index,
+            "end": end_index,
+            "data_start": data_start_index,
+            "warmup_offset": warmup_offset,
+            "month_starts": get_month_start_indices(start_index, end_index, just_index=True),
+            **{name: values[warmup_offset:] for name, values in history.items()},
+            **{f"history_{name}": values for name, values in history.items()},
         }
 
     @staticmethod

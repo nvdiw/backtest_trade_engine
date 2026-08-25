@@ -1,6 +1,9 @@
 import ast
 from pathlib import Path
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 from ma_strategy import _parse_bound, _parse_set_overrides, build_parser
 from trade_engine import AccountState, Position, TradeEngine, trade_duration
@@ -150,6 +153,47 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertEqual(liquid_account.total_liquids, 1)
         self.assertEqual(liquid_account.total_losses, 1)
         self.assertEqual(liquid_account.profits_lst, [-100.0])
+
+
+class MarketDataWarmupTests(unittest.TestCase):
+    @staticmethod
+    def fake_data(start, end):
+        values = np.arange(start, end, dtype=float)
+        return {
+            "Open time": [f"open-{i}" for i in range(start, end)],
+            "Close time": ["2026-01-01 00:00:00" for _ in values],
+            "Open": values,
+            "Close": values,
+            "Low": values,
+            "High": values,
+            "Volume": values,
+        }
+
+    @patch("trade_engine.get_month_start_indices", return_value=[])
+    @patch("trade_engine.fetch_all_data", side_effect=fake_data.__func__)
+    def test_warmup_uses_preceding_rows_without_expanding_trade_range(
+        self, fetch_mock, _month_mock
+    ):
+        TradeEngine.load_market_data.cache_clear()
+        market = TradeEngine.load_market_data(500, 510, warmup_candles=200)
+
+        fetch_mock.assert_called_once_with(300, 510)
+        self.assertEqual(market["data_start"], 300)
+        self.assertEqual(market["warmup_offset"], 200)
+        self.assertEqual(market["close_prices"].tolist(), list(range(500, 510)))
+        self.assertEqual(len(market["history_close_prices"]), 210)
+
+    @patch("trade_engine.get_month_start_indices", return_value=[])
+    @patch("trade_engine.fetch_all_data", side_effect=fake_data.__func__)
+    def test_warmup_is_clamped_at_first_available_candle(
+        self, fetch_mock, _month_mock
+    ):
+        TradeEngine.load_market_data.cache_clear()
+        market = TradeEngine.load_market_data(0, 10, warmup_candles=200)
+
+        fetch_mock.assert_called_once_with(0, 10)
+        self.assertEqual(market["warmup_offset"], 0)
+        self.assertEqual(len(market["history_close_prices"]), 10)
 
 
 class StrategyExecutionTimingTests(unittest.TestCase):

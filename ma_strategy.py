@@ -99,7 +99,22 @@ def ma_strategy(
     write_trades = bool(write_trades) and not optimize
     render_chart = (show_chart or bool(chart_file)) and not optimize
 
-    market = TradeEngine.load_market_data(start=start, end=end)
+    cfg = build_ma_strategy_config(tune)
+    # Load preceding candles only to seed rolling/Wilder indicators. They are
+    # excluded from trading, reporting, charts, and performance statistics.
+    indicator_warmup = max(
+        cfg.ema_16_period,
+        cfg.ma_50_period,
+        cfg.ma_100_period,
+        cfg.ma_200_period,
+        cfg.period_adx * 2,
+        cfg.period_atr + cfg.period_atr_ma,
+        cfg.period_vol_avg,
+        cfg.period_rsi + max(cfg.lowest_rsi_last_n_value, cfg.highest_rsi_last_n_value),
+    )
+    market = TradeEngine.load_market_data(
+        start=start, end=end, warmup_candles=indicator_warmup
+    )
     start = market["start"]
     end = market["end"]
     lst_month_starts = market["month_starts"]
@@ -110,14 +125,18 @@ def ma_strategy(
     low_prices = market["low_prices"]
     high_prices = market["high_prices"]
     volume_prices = market["volume_prices"]
+    history_close_prices = market["history_close_prices"]
+    history_low_prices = market["history_low_prices"]
+    history_high_prices = market["history_high_prices"]
+    history_volume_prices = market["history_volume_prices"]
+    warmup_offset = market["warmup_offset"]
 
-    range_key = (market["start"], market["end"])
+    range_key = (market["data_start"], market["end"], warmup_offset)
 
     def _cached_indicator(kind, key, builder):
         return _get_cached_indicator(kind, range_key, key, builder)
 
     # ---- settings ----
-    cfg = build_ma_strategy_config(tune)
     balance = cfg.balance
     leverage = cfg.leverage
     trade_amount_percent = cfg.trade_amount_percent
@@ -406,7 +425,7 @@ def ma_strategy(
     last_close_time = close_times[-1]
 
     # ---- Get MA, EMA ----
-    indicator = Indicator(close_prices, period=None)
+    indicator = Indicator(history_close_prices, period=None)
 
     # MA/EMA
     ema_16_period = cfg.ema_16_period
@@ -414,10 +433,21 @@ def ma_strategy(
     ma_100_period = cfg.ma_100_period
     ma_200_period = cfg.ma_200_period
 
-    ema_16 = _cached_indicator("ema", ema_16_period, lambda: indicator.get_EMA(ema_16_period))
-    ma_50 = _cached_indicator("ma", ma_50_period, lambda: indicator.get_MA(ma_50_period))
-    ma_100 = _cached_indicator("ma", ma_100_period, lambda: indicator.get_MA(ma_100_period))
-    ma_200 = _cached_indicator("ma", ma_200_period, lambda: indicator.get_MA(ma_200_period))
+    def _for_requested_range(values):
+        return values[warmup_offset:]
+
+    ema_16 = _for_requested_range(_cached_indicator(
+        "ema", ema_16_period, lambda: indicator.get_EMA(ema_16_period)
+    ))
+    ma_50 = _for_requested_range(_cached_indicator(
+        "ma", ma_50_period, lambda: indicator.get_MA(ma_50_period)
+    ))
+    ma_100 = _for_requested_range(_cached_indicator(
+        "ma", ma_100_period, lambda: indicator.get_MA(ma_100_period)
+    ))
+    ma_200 = _for_requested_range(_cached_indicator(
+        "ma", ma_200_period, lambda: indicator.get_MA(ma_200_period)
+    ))
 
 
 
@@ -503,34 +533,41 @@ def ma_strategy(
     adx = _cached_indicator(
         "adx",
         period_adx,
-        lambda: indicator.get_ADX(high_prices, low_prices, close_prices, period=period_adx),
-    )
+        lambda: indicator.get_ADX(
+            history_high_prices, history_low_prices, history_close_prices,
+            period=period_adx,
+        ),
+    )[warmup_offset:]
 
     # ---- get_ATR ----
-    atr = _cached_indicator(
+    history_atr = _cached_indicator(
         "atr",
         period_atr,
-        lambda: indicator.get_ATR(high_prices, low_prices, close_prices, period=period_atr),
+        lambda: indicator.get_ATR(
+            history_high_prices, history_low_prices, history_close_prices,
+            period=period_atr,
+        ),
     )
+    atr = history_atr[warmup_offset:]
     # ---- get_ATR_MA ----
     atr_ma = _cached_indicator(
         "atr_ma",
         (period_atr, period_atr_ma),
-        lambda: indicator.get_ATR_MA(atr, period=period_atr_ma),
-    )
+        lambda: indicator.get_ATR_MA(history_atr, period=period_atr_ma),
+    )[warmup_offset:]
     # ---- get volume average ----
     vol_avg_15_list = _cached_indicator(
         "vol_avg",
         period_vol_avg,
-        lambda: indicator.get_volume_avg(volume_prices, period=period_vol_avg),
-    )
+        lambda: indicator.get_volume_avg(history_volume_prices, period=period_vol_avg),
+    )[warmup_offset:]
 
     # ---- get RSI ----
     rsi_list = _cached_indicator(
         "rsi",
         period_rsi,
-        lambda: indicator.get_RSI(close_prices, period=period_rsi),
-    )
+        lambda: indicator.get_RSI(history_close_prices, period=period_rsi),
+    )[warmup_offset:]
 
     def _build_cross_sharp_moves():
         cached_moves = {}
