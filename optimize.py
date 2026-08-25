@@ -16,13 +16,14 @@ import math
 import multiprocessing
 import os
 import random
+import shutil
 import signal
 import statistics
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ma_strategy import ma_strategy
+from ma_strategy import ma_strategy, required_indicator_warmup
 from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
 
 
@@ -210,9 +211,25 @@ PARAMETER_PROFILES = {
             "max_open_trades", "cooldown_after_big_pnl", "skip_logic",
         ),
     ),
+    "risk_core": _grid_subset(
+        "safe_leverage", "monthly_", "consecutive_",
+        extra=(
+            "trade_amount_percent", "leverage", "save_money_recover_trigger_pct",
+            "max_open_trades", "cooldown_after_big_pnl", "skip_logic",
+        ),
+    ),
     "rsi": _grid_subset("rsi_", "lowest_rsi_", "highest_rsi_"),
+    "scale": _grid_subset("scale_", "profit_scale_"),
     "full": FULL_PARAM_GRID,
 }
+
+STAGED_AUTO_PHASES = (
+    ("signal", "signal"),
+    ("exit", "exit"),
+    ("risk", "risk_core"),
+    ("rsi", "rsi"),
+    ("scale", "scale"),
+)
 
 # Backward-compatible public name used by tests and imports.
 param_grid = FULL_PARAM_GRID
@@ -240,13 +257,14 @@ RESULT_COLUMNS = [
 DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
 AUTO_TIME_COLUMNS = ["time_normalized_score", "range_candles"]
 CANDLES_PER_YEAR_15M = 365.25 * 24 * 4
-SURROGATE_MAX_TRAINING_SAMPLES = 1024
+SURROGATE_MAX_TRAINING_SAMPLES = 10_000
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
 SURROGATE_CACHE_VERSION = 2
 
 _WORKER_START = "2025-01-01"
 _WORKER_END = "2026-02-23"
 _WORKER_BASE_TUNE = {}
+_WORKER_USE_INDICATOR_WARMUP = True
 DEFAULT_OUTPUT_DIR = os.path.join("outputs", "optimize")
 
 
@@ -612,26 +630,49 @@ def _parse_bound(value):
         return value
 
 
-def _init_worker(start, end, base_tune=None, ignore_keyboard_interrupt=False):
+def _init_worker(
+    start,
+    end,
+    base_tune=None,
+    ignore_keyboard_interrupt=False,
+    use_indicator_warmup=True,
+):
     global _WORKER_START, _WORKER_END, _WORKER_BASE_TUNE
+    global _WORKER_USE_INDICATOR_WARMUP
     if ignore_keyboard_interrupt:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     _WORKER_START = start
     _WORKER_END = end
     _WORKER_BASE_TUNE = dict(base_tune or {})
+    _WORKER_USE_INDICATOR_WARMUP = bool(use_indicator_warmup)
     # Warm the largest repeated I/O cost once per process.
     from trade_engine import TradeEngine
-    TradeEngine.load_market_data(start=start, end=end)
+    config = build_ma_strategy_config(base_tune)
+    TradeEngine.load_market_data(
+        start=start,
+        end=end,
+        warmup_candles=(
+            required_indicator_warmup(config)
+            if _WORKER_USE_INDICATOR_WARMUP else 0
+        ),
+    )
 
 
-def _evaluate_candidate(index, params, base_tune, start, end):
+def _evaluate_candidate(
+    index, params, base_tune, start, end, use_indicator_warmup=True
+):
     started = time.perf_counter()
     try:
-        result = ma_strategy(
-            tune={**base_tune, **params, "optimize": True},
-            start=start,
-            end=end,
-        )
+        strategy_kwargs = {
+            "tune": {**base_tune, **params, "optimize": True},
+            "start": start,
+            "end": end,
+        }
+        # Keep the historical call shape for normal/new runs. The explicit
+        # override is only needed when resuming a pre-warm-up checkpoint.
+        if not use_indicator_warmup:
+            strategy_kwargs["use_indicator_warmup"] = False
+        result = ma_strategy(**strategy_kwargs)
         error = None
     except Exception as exc:  # return errors to the parent without killing the run
         result = None
@@ -643,7 +684,32 @@ def _evaluate_task(task):
     """Small multiprocessing payload: workers merge the shared base tune locally."""
     index, params = task
     return _evaluate_candidate(
-        index, params, _WORKER_BASE_TUNE, _WORKER_START, _WORKER_END
+        index,
+        params,
+        _WORKER_BASE_TUNE,
+        _WORKER_START,
+        _WORKER_END,
+        _WORKER_USE_INDICATOR_WARMUP,
+    )
+
+
+def _evaluate_random_window_task(task):
+    """Evaluate one full configuration on one independently selected time window."""
+    test_index, candidate_id, window_id, params, start, end = task
+    started = time.perf_counter()
+    try:
+        result = ma_strategy(
+            tune={**params, "optimize": True},
+            start=start,
+            end=end,
+        )
+        error = None
+    except Exception as exc:
+        result = None
+        error = f"{type(exc).__name__}: {exc}"
+    return (
+        test_index, candidate_id, window_id, params, start, end,
+        result, time.perf_counter() - started, error,
     )
 
 
@@ -998,7 +1064,9 @@ class ExtraTreesSurrogate:
             return self._leaf(targets, indices)
 
         feature_count = len(features[0])
-        requested = self.max_features or max(1, round(math.sqrt(feature_count)))
+        requested = self.max_features or max(
+            1, round(2.0 * math.sqrt(feature_count))
+        )
         selected_features = randomizer.sample(
             range(feature_count), min(feature_count, requested)
         )
@@ -1008,7 +1076,9 @@ class ExtraTreesSurrogate:
             lower, upper = min(values), max(values)
             if lower == upper:
                 continue
-            for _ in range(3):
+            # More randomized thresholds substantially improve split quality in
+            # wide, conditional parameter spaces while keeping the model cheap.
+            for _ in range(8):
                 threshold = randomizer.uniform(lower, upper)
                 left = []
                 right = []
@@ -1599,6 +1669,9 @@ def _auto_configuration(args, profile, grid, base_tune, base_description, resolv
         "seed": args.seed,
         "minimum_trades": args.min_trades,
         "maximum_allowed_drawdown": args.max_drawdown,
+        "indicator_warmup": bool(
+            getattr(args, "_indicator_warmup_enabled", True)
+        ),
         "ranges": ranges,
     }
 
@@ -1612,12 +1685,80 @@ def _auto_feature_configuration(args):
         "surrogate_min_samples": int(args.auto_surrogate_min_samples),
         "surrogate_pool_multiplier": int(args.auto_surrogate_pool),
         "surrogate_trees": int(args.auto_surrogate_trees),
+        "surrogate_max_samples": int(
+            getattr(args, "auto_surrogate_max_samples", SURROGATE_MAX_TRAINING_SAMPLES)
+        ),
         "walk_forward_folds": int(args.auto_walk_forward_folds),
         "walk_forward_top": int(args.auto_walk_forward_top),
         "walk_forward_stability_penalty": float(
             args.auto_walk_forward_stability_penalty
         ),
     }
+
+
+def _restore_auto_resume_args(args, state):
+    """Restore persisted search settings before validating a legacy checkpoint."""
+    config = state.get("config") or {}
+    if "indicator_warmup" not in config:
+        # Checkpoints created before historical warm-up existed must retain their
+        # original strategy semantics; otherwise old and new scores get mixed.
+        config["indicator_warmup"] = False
+        state["strategy_semantics_migration"] = {
+            "indicator_warmup": False,
+            "reason": "legacy checkpoint created before indicator warm-up",
+        }
+    args._indicator_warmup_enabled = bool(config["indicator_warmup"])
+    profile = config.get("profile")
+    requested_profile = getattr(args, "profile", None) or profile
+    if profile and requested_profile != profile:
+        raise ValueError(
+            f"checkpoint profile is {profile!r}, not {requested_profile!r}"
+        )
+    if profile:
+        args.profile = profile
+    config_mapping = {
+        "tests_per_cycle": "auto_tests",
+        "validation_top": "auto_validation_top",
+        "stress_top": "auto_stress_top",
+        "final_top": "auto_final_top",
+        "hall_size": "auto_hall_size",
+        "importance_target": "auto_importance_target",
+        "seed": "seed",
+        "minimum_trades": "min_trades",
+        "maximum_allowed_drawdown": "max_drawdown",
+    }
+    for saved_key, argument_name in config_mapping.items():
+        if saved_key in config:
+            setattr(args, argument_name, config[saved_key])
+    ranges = config.get("ranges") or {}
+    if ranges:
+        args.auto_discovery_start = ranges["discovery"][0]
+        args.auto_validation_start = ranges["validation"][0]
+        args.auto_stress_start = ranges["stress"][0]
+        args.auto_end = ranges["final"][1]
+
+    features = state.get("optimizer_features") or {}
+    feature_mapping = {
+        "advanced_min_candidates": "auto_advanced_min_candidates",
+        "halving_rungs": "auto_halving_rungs",
+        "halving_keep": "auto_halving_keep",
+        "surrogate_min_samples": "auto_surrogate_min_samples",
+        "surrogate_pool_multiplier": "auto_surrogate_pool",
+        "surrogate_trees": "auto_surrogate_trees",
+        "walk_forward_folds": "auto_walk_forward_folds",
+        "walk_forward_top": "auto_walk_forward_top",
+        "walk_forward_stability_penalty": "auto_walk_forward_stability_penalty",
+    }
+    for saved_key, argument_name in feature_mapping.items():
+        if saved_key in features:
+            setattr(args, argument_name, features[saved_key])
+    # Version-2 checkpoints predate the configurable history cap. Preserve the
+    # exact 1,024-sample behavior they were trained with instead of silently
+    # changing their tree model during resume.
+    args.auto_surrogate_max_samples = int(
+        features.get("surrogate_max_samples", 1024)
+    )
+    return config
 
 
 def _auto_bootstrap(args, grid):
@@ -1936,7 +2077,9 @@ def _select_surrogate_candidates(
         }
 
     training_history = _representative_surrogate_history(
-        usable_history, SURROGATE_MAX_TRAINING_SAMPLES
+        usable_history, features.get(
+            "surrogate_max_samples", SURROGATE_MAX_TRAINING_SAMPLES
+        )
     )
     if len(training_history) < len(usable_history):
         print(
@@ -2595,6 +2738,9 @@ def _run_auto_stage(
     )
     range_candles = _range_candle_count(range_start, range_end)
     current_best = _auto_stage_best(records.values())
+    use_indicator_warmup = bool(
+        state["config"].get("indicator_warmup", False)
+    )
 
     with results_path.open("a" if append else "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -2605,12 +2751,20 @@ def _run_auto_stage(
                 workers,
                 initializer=_init_worker,
                 initargs=(
-                    _parse_bound(range_start), _parse_bound(range_end), base_tune, True,
+                    _parse_bound(range_start),
+                    _parse_bound(range_end),
+                    base_tune,
+                    True,
+                    use_indicator_warmup,
                 ),
             )
         else:
             _init_worker(
-                _parse_bound(range_start), _parse_bound(range_end), base_tune
+                _parse_bound(range_start),
+                _parse_bound(range_end),
+                base_tune,
+                False,
+                use_indicator_warmup,
             )
 
         tasks = [
@@ -2627,6 +2781,7 @@ def _run_auto_stage(
                     base_tune,
                     _parse_bound(range_start),
                     _parse_bound(range_end),
+                    use_indicator_warmup,
                 )
                 for candidate_id, params in tasks
             )
@@ -3047,23 +3202,37 @@ def _merge_hall_of_fame(hall, finalists, cycle, keys, base_tune, limit):
 
 def run_auto_optimization(args, grid=None):
     """Run an unlimited, staged, importance-guided optimization campaign."""
-    profile = getattr(args, "profile", None) or "full"
-    grid = PARAMETER_PROFILES[profile] if grid is None else grid
-    keys = tuple(grid)
-    base_tune, base_description = _load_base_tune(args)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / "auto_state.json"
+    resume_existing = bool(args.resume or state_path.is_file())
+    saved_state = _load_json(state_path) if resume_existing and state_path.is_file() else None
+    saved_config = _restore_auto_resume_args(args, saved_state) if saved_state else None
+    profile = getattr(args, "profile", None) or "full"
+    if saved_config and saved_config.get("parameter_grid"):
+        grid = {
+            key: list(values)
+            for key, values in saved_config["parameter_grid"].items()
+        }
+    else:
+        grid = PARAMETER_PROFILES[profile] if grid is None else grid
+    keys = tuple(grid)
+    if saved_config:
+        base_tune = dict(saved_config.get("base_tune") or {})
+        base_description = saved_config.get("base_source", "saved checkpoint")
+    else:
+        base_tune, base_description = _load_base_tune(args)
     resolved_end = _latest_market_end() if args.auto_end == "latest" else args.auto_end
     config = _auto_configuration(
         args, profile, grid, base_tune, base_description, resolved_end
     )
     optimizer_features = _auto_feature_configuration(args)
     bootstrap = _auto_bootstrap(args, grid)
-    resume_existing = bool(args.resume or state_path.is_file())
+    seed_elites = list(getattr(args, "_seed_elites", ()) or ())
+    seed_history = list(getattr(args, "_seed_history", ()) or ())
 
     if resume_existing:
-        state = _load_json(state_path)
+        state = saved_state or _load_json(state_path)
         if state is None:
             raise FileNotFoundError(
                 f"auto checkpoint not found: {state_path}. Start without --resume first."
@@ -3076,6 +3245,17 @@ def run_auto_optimization(args, grid=None):
                 "profile, ranges, test counts, base parameters, and constraints"
             )
         saved_features = state.get("optimizer_features")
+        if saved_features is not None and "surrogate_max_samples" not in saved_features:
+            saved_features["surrogate_max_samples"] = optimizer_features[
+                "surrogate_max_samples"
+            ]
+            state["resume_migration"] = {
+                "restored_saved_cli_settings": True,
+                "legacy_surrogate_max_samples": optimizer_features[
+                    "surrogate_max_samples"
+                ],
+                "migrated_at": _timestamp_now(),
+            }
         if saved_features is not None and saved_features != optimizer_features:
             raise ValueError(
                 "auto search-engine settings differ from this checkpoint; use the "
@@ -3190,7 +3370,7 @@ def run_auto_optimization(args, grid=None):
     # Disk history is loaded once per process. Subsequent cycles extend these
     # caches with only their new plans/results instead of rescanning everything.
     seen_cache = None
-    history_cache = None
+    history_cache = seed_history or None
     try:
         while cycle_limit == 0 or state["cycles_completed"] < cycle_limit:
             cycle = int(state["cycle"])
@@ -3239,6 +3419,17 @@ def run_auto_optimization(args, grid=None):
                     }
                     for record in hall
                 ]
+                if not elite_records and seed_elites:
+                    elite_records = [
+                        {
+                            "params": {
+                                key: record["params"][key] for key in keys
+                            },
+                            "result": record.get("result", {}),
+                        }
+                        for record in seed_elites
+                        if all(key in record.get("params", {}) for key in keys)
+                    ]
                 if advanced:
                     if history_cache is None:
                         history_cache = _load_discovery_history(output_dir, keys)
@@ -3665,6 +3856,613 @@ def run_auto_optimization(args, grid=None):
         f"Resume with --auto --resume."
     )
     return hall[0] if hall else None
+
+
+def _merge_staged_archive(archive, phase_hall, block, phase_name, limit):
+    """Keep the strongest unique full configurations across staged phases."""
+    merged = {}
+    sources = [(record, False) for record in archive]
+    sources.extend((record, True) for record in phase_hall)
+    for record, is_current_phase in sources:
+        effective = record.get("effective_params") or record.get("params") or {}
+        if not effective:
+            continue
+        signature = json.dumps(effective, sort_keys=True, separators=(",", ":"))
+        enriched = dict(record)
+        enriched["effective_params"] = dict(effective)
+        if is_current_phase:
+            enriched["block"] = block
+            enriched["phase"] = phase_name
+            original_id = record.get("candidate_id")
+            enriched["phase_candidate_id"] = original_id
+            enriched["candidate_id"] = f"b{block:04d}-{phase_name}-{original_id}"
+        previous = merged.get(signature)
+        current_score = _finite_number(enriched.get("robust_score"))
+        previous_score = _finite_number(previous.get("robust_score")) if previous else None
+        if current_score is None:
+            continue
+        if previous is None or previous_score is None or current_score > previous_score:
+            merged[signature] = enriched
+    return sorted(
+        merged.values(),
+        key=lambda record: (
+            _finite_number(record.get("robust_score"))
+            if _finite_number(record.get("robust_score")) is not None
+            else -math.inf
+        ),
+        reverse=True,
+    )[:limit]
+
+
+def _staged_seed_data(records, grid, baseline):
+    """Project full historical winners onto one phase for trees and parent selection."""
+    keys = tuple(grid)
+    defaults = build_ma_strategy_config(baseline)
+    seeds = []
+    seen = set()
+    def seed_rank(record):
+        audit_score = _finite_number(record.get("random_audit_score"))
+        robust_score = _finite_number(record.get("robust_score"))
+        return (
+            int(audit_score is not None),
+            audit_score if audit_score is not None else -math.inf,
+            robust_score if robust_score is not None else -math.inf,
+        )
+
+    ranked = sorted(records, key=seed_rank, reverse=True)
+    denominator = max(1, len(ranked) - 1)
+    for rank, record in enumerate(ranked):
+        effective = record.get("effective_params") or record.get("params") or {}
+        params = {
+            key: _nearest_value(grid[key], effective.get(key, getattr(defaults, key)))
+            for key in keys
+        }
+        signature = _candidate_signature(params, keys)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        seeds.append({
+            "candidate_id": f"staged-seed-{rank + 1:04d}",
+            "params": params,
+            "learning_score": 1.0 - rank / denominator,
+            "learning_source": "previous_staged_top",
+            "result": record.get("stage_metrics", {}).get("final", {}),
+        })
+    return seeds
+
+
+def _staged_report_rows(records):
+    parameter_keys = tuple(FULL_PARAM_GRID)
+    rows = []
+    for rank, record in enumerate(records, start=1):
+        effective = record.get("effective_params") or {}
+        final_metrics = record.get("stage_metrics", {}).get("final", {})
+        row = {
+            "rank": rank,
+            "block": record.get("block"),
+            "phase": record.get("phase"),
+            "cycle": record.get("cycle"),
+            "candidate_id": record.get("candidate_id"),
+            "robust_score": record.get("robust_score"),
+            "worst_stage_percentile": record.get("worst_stage_percentile"),
+            "random_audit_score": record.get("random_audit_score"),
+            "random_audit_valid_ratio": record.get("random_audit_valid_ratio"),
+            "random_audit_positive_ratio": record.get("random_audit_positive_ratio"),
+        }
+        for metric in (
+            "score", "total_profit", "total_profit_percent", "closed_trades",
+            "win_rate", "maximum_drawdown", "profit_factor",
+            "expectancy_percent", "calmar_ratio", "liquidations",
+        ):
+            row[metric] = final_metrics.get(metric)
+        row.update({key: effective.get(key) for key in parameter_keys})
+        rows.append(row)
+    return rows
+
+
+def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
+    ranked = list(records)[:max(1, int(top_n))]
+    if not ranked:
+        return
+    rows = _staged_report_rows(ranked)
+    fieldnames = list(rows[0])
+    output_dir = Path(output_dir)
+    _write_rows_atomic(output_dir / "top_100.csv", fieldnames, rows)
+    _write_json(output_dir / "best_params.json", ranked[0]["effective_params"])
+    if snapshot_dir is not None:
+        snapshot_dir = Path(snapshot_dir)
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        _write_rows_atomic(snapshot_dir / "top_100.csv", fieldnames, rows)
+        _write_json(snapshot_dir / "best_params.json", ranked[0]["effective_params"])
+
+
+def _generate_random_audit_windows(
+    earliest, recent_start, end, count, recent_ratio, seed,
+    min_months=6, max_months=12,
+):
+    """Build deterministic, unique random windows with a recent-data quota."""
+    earliest_index = _bound_index(earliest)
+    recent_index = max(earliest_index, _bound_index(recent_start))
+    end_index = _bound_index(end)
+    if end_index <= earliest_index:
+        raise ValueError("random audit end must be after its earliest allowed date")
+    min_months = max(1, int(min_months))
+    max_months = max(min_months, int(max_months))
+    count = max(1, int(count))
+    recent_target = min(count, max(0, round(count * float(recent_ratio))))
+    randomizer = random.Random(seed)
+    candles_per_month = round(CANDLES_PER_YEAR_15M / 12)
+    windows = []
+    seen = set()
+
+    def add_windows(tier, target, lower, upper):
+        attempts = 0
+        while sum(window["tier"] == tier for window in windows) < target:
+            attempts += 1
+            if attempts > max(1000, target * 200):
+                break
+            months = randomizer.randint(min_months, max_months)
+            duration = months * candles_per_month
+            latest_start = upper - duration
+            if latest_start < lower:
+                continue
+            start_index = randomizer.randint(lower, latest_start)
+            signature = (start_index, start_index + duration)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            windows.append({
+                "window_id": len(windows) + 1,
+                "tier": tier,
+                "months": months,
+                "start": start_index,
+                "end": start_index + duration,
+            })
+
+    add_windows("recent", recent_target, recent_index, end_index)
+    older_target = count - len(windows)
+    add_windows("historical", older_target, earliest_index, min(recent_index, end_index))
+    if len(windows) < count:
+        # Short datasets may not have room for the requested historical quota.
+        add_windows("fallback", count - len(windows), earliest_index, end_index)
+    if len(windows) < count:
+        raise ValueError(
+            f"could only construct {len(windows)}/{count} unique random audit windows"
+        )
+    randomizer.shuffle(windows)
+    for index, window in enumerate(windows, start=1):
+        window["window_id"] = index
+        window["start_label"] = _format_range_bound(window["start"])
+        window["end_label"] = _format_range_bound(window["end"])
+    return windows
+
+
+def _aggregate_random_audit(records, candidates, expected_windows):
+    """Rank candidates by cross-window percentile, downside, and consistency."""
+    candidate_map = {record["candidate_id"]: record for record in candidates}
+    by_window = {}
+    for record in records:
+        by_window.setdefault(record["window_id"], []).append(record)
+    for window_records in by_window.values():
+        percentiles = _score_percentiles(
+            window_records,
+            score_getter=lambda item: item.get("time_normalized_score"),
+        )
+        for record in window_records:
+            record["window_percentile"] = percentiles.get(record["candidate_id"])
+
+    grouped = {candidate_id: [] for candidate_id in candidate_map}
+    for record in records:
+        grouped.setdefault(record["candidate_id"], []).append(record)
+    summaries = []
+    for candidate_id, candidate_records in grouped.items():
+        valid = [
+            record for record in candidate_records
+            if record.get("window_percentile") is not None
+        ]
+        percentiles = sorted(record["window_percentile"] for record in valid)
+        valid_ratio = len(valid) / max(1, expected_windows)
+        if percentiles:
+            tail_count = max(1, math.ceil(len(percentiles) * 0.10))
+            median_percentile = statistics.median(percentiles)
+            mean_percentile = statistics.fmean(percentiles)
+            worst_decile = statistics.fmean(percentiles[:tail_count])
+            positive_ratio = statistics.fmean(
+                float((record.get("result") or {}).get("total_profit", 0) > 0)
+                for record in valid
+            )
+            stability = statistics.pstdev(percentiles) if len(percentiles) > 1 else 0.0
+            robust_score = 100.0 * valid_ratio * (
+                0.45 * median_percentile
+                + 0.25 * mean_percentile
+                + 0.20 * worst_decile
+                + 0.10 * positive_ratio
+            ) - 10.0 * stability
+        else:
+            median_percentile = mean_percentile = worst_decile = None
+            positive_ratio = stability = 0.0
+            robust_score = -math.inf
+        drawdowns = [
+            _finite_number((record.get("result") or {}).get("maximum_drawdown"))
+            for record in valid
+        ]
+        drawdowns = [value for value in drawdowns if value is not None]
+        profits = [
+            _finite_number((record.get("result") or {}).get("total_profit_percent"))
+            for record in valid
+        ]
+        profits = [value for value in profits if value is not None]
+        summaries.append({
+            "candidate_id": candidate_id,
+            "random_audit_score": robust_score,
+            "valid_windows": len(valid),
+            "expected_windows": expected_windows,
+            "valid_ratio": valid_ratio,
+            "median_percentile": median_percentile,
+            "mean_percentile": mean_percentile,
+            "worst_decile_percentile": worst_decile,
+            "positive_window_ratio": positive_ratio,
+            "percentile_std": stability,
+            "median_profit_percent": statistics.median(profits) if profits else None,
+            "worst_drawdown": min(drawdowns) if drawdowns else None,
+            "effective_params": dict(
+                candidate_map[candidate_id].get("effective_params", {})
+            ),
+        })
+    summaries.sort(key=lambda item: item["random_audit_score"], reverse=True)
+    return summaries
+
+
+def _run_random_window_audit(args, candidates, output_dir, block, final_end):
+    """Evaluate staged finalists on shared random periods and publish robust winner."""
+    candidate_count = min(int(args.random_audit_top), len(candidates))
+    if candidate_count <= 0 or int(args.random_audit_tests) <= 0:
+        return None
+    selected = list(candidates)[:candidate_count]
+    window_count = max(1, int(args.random_audit_tests) // candidate_count)
+    windows = _generate_random_audit_windows(
+        args.random_audit_earliest,
+        args.random_audit_recent_start,
+        final_end,
+        window_count,
+        args.random_audit_recent_ratio,
+        args.seed + block * 1_000_003,
+        args.random_audit_min_months,
+        args.random_audit_max_months,
+    )
+    tasks = []
+    windows_by_id = {window["window_id"]: window for window in windows}
+    for window in windows:
+        for candidate in selected:
+            tasks.append((
+                len(tasks) + 1,
+                candidate["candidate_id"],
+                window["window_id"],
+                candidate["effective_params"],
+                window["start"],
+                window["end"],
+            ))
+    tasks = tasks[:int(args.random_audit_tests)]
+    workers = max(1, int(args.workers))
+    chunksize = args.chunksize or max(1, len(tasks) // max(1, workers * 20))
+    print(
+        f"Random-window audit: {len(selected)} finalists x {len(windows)} windows "
+        f"= {len(tasks)} tests | {args.random_audit_recent_ratio:.0%} recent target"
+    )
+    if workers == 1:
+        evaluated = map(_evaluate_random_window_task, tasks)
+        pool = None
+    else:
+        pool = multiprocessing.Pool(processes=workers)
+        evaluated = pool.imap_unordered(
+            _evaluate_random_window_task, tasks, chunksize=chunksize
+        )
+    records = []
+    pool_terminated = False
+    try:
+        for completed, item in enumerate(evaluated, start=1):
+            (
+                test_index, candidate_id, window_id, params, start, end,
+                result, duration, error,
+            ) = item
+            window = windows_by_id[window_id]
+            audit_min_trades = (
+                0 if not args.min_trades else max(
+                    1,
+                    math.ceil(
+                        args.min_trades * window["months"]
+                        / max(1, args.random_audit_max_months)
+                    ),
+                )
+            )
+            objective = _objective_score(
+                result, min_trades=audit_min_trades, max_drawdown=args.max_drawdown
+            )
+            comparable = _time_normalized_score(objective, end - start)
+            records.append({
+                "test_index": test_index,
+                "candidate_id": candidate_id,
+                "window_id": window_id,
+                "tier": window["tier"],
+                "months": window["months"],
+                "start": start,
+                "end": end,
+                "start_label": window["start_label"],
+                "end_label": window["end_label"],
+                "objective_score": objective if math.isfinite(objective) else None,
+                "time_normalized_score": comparable,
+                "minimum_trades_required": audit_min_trades,
+                "duration_s": round(duration, 4),
+                "error": error,
+                "result": result or {},
+            })
+            if args.log_every and (
+                completed == len(tasks) or completed % args.log_every == 0
+            ):
+                print(f"  Random audit: {completed:,}/{len(tasks):,} complete")
+    except BaseException:
+        if pool is not None:
+            pool.terminate()
+            pool_terminated = True
+        raise
+    finally:
+        if pool is not None:
+            if not pool_terminated:
+                pool.close()
+            pool.join()
+
+    summaries = _aggregate_random_audit(records, selected, len(windows))
+    output_dir = Path(output_dir)
+    result_rows = []
+    for record in sorted(records, key=lambda item: item["test_index"]):
+        row = {key: value for key, value in record.items() if key != "result"}
+        row.update({
+            metric: record["result"].get(metric)
+            for metric in (
+                "total_profit", "total_profit_percent", "closed_trades", "win_rate",
+                "maximum_drawdown", "profit_factor", "expectancy_percent",
+                "calmar_ratio", "liquidations",
+            )
+        })
+        result_rows.append(row)
+    if result_rows:
+        _write_rows_atomic(
+            output_dir / "random_window_results.csv", list(result_rows[0]), result_rows
+        )
+    summary_rows = [
+        {key: value for key, value in record.items() if key != "effective_params"}
+        for record in summaries
+    ]
+    if summary_rows:
+        _write_rows_atomic(
+            output_dir / "random_window_summary.csv", list(summary_rows[0]), summary_rows
+        )
+    window_rows = list(windows)
+    _write_rows_atomic(
+        output_dir / "random_windows.csv", list(window_rows[0]), window_rows
+    )
+    _write_json(output_dir / "random_window_summary.json", summaries)
+    if summaries:
+        _write_json(output_dir / "best_params.json", summaries[0]["effective_params"])
+    return summaries[0] if summaries else None
+
+
+def run_staged_optimization(args):
+    """Run repeatable 50-cycle blocks with one locked parameter group per phase."""
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / "staged_state.json"
+    archive_path = output_dir / "staged_hall_of_fame.json"
+    phase_count = len(STAGED_AUTO_PHASES)
+    block_cycles = int(args.stage_cycles) * phase_count
+    if int(args.snapshot_cycles) != block_cycles:
+        raise ValueError(
+            f"--snapshot-cycles must equal --stage-cycles x {phase_count} "
+            f"({block_cycles} with the current schedule)"
+        )
+
+    staged_config = {
+        "phases": [list(item) for item in STAGED_AUTO_PHASES],
+        "stage_cycles": int(args.stage_cycles),
+        "snapshot_cycles": int(args.snapshot_cycles),
+        "snapshot_top": int(args.snapshot_top),
+        "random_audit_tests": int(args.random_audit_tests),
+        "random_audit_top": int(args.random_audit_top),
+        "random_audit_earliest": args.random_audit_earliest,
+        "random_audit_recent_start": args.random_audit_recent_start,
+        "random_audit_recent_ratio": float(args.random_audit_recent_ratio),
+        "random_audit_min_months": int(args.random_audit_min_months),
+        "random_audit_max_months": int(args.random_audit_max_months),
+    }
+    if state_path.is_file():
+        state = _load_json(state_path, {}) or {}
+        if state.get("config") != staged_config:
+            raise ValueError(
+                "staged checkpoint settings differ from this command; use the original "
+                "phase, snapshot, and random-audit settings"
+            )
+        archive = _load_json(archive_path, []) or []
+        baseline = state.get("baseline_params", {})
+        print(
+            f"Resuming staged campaign after {state.get('cycles_completed', 0):,} "
+            "completed cycles."
+        )
+    else:
+        base_tune, base_description = _load_base_tune(args)
+        baseline = dict(base_tune)
+        archive = []
+        legacy_auto_dir = output_dir.parent / "auto"
+        legacy_best_path = legacy_auto_dir / "best_params.json"
+        legacy_hall_path = legacy_auto_dir / "hall_of_fame.json"
+        if getattr(args, "base_source", "config") == "config" and legacy_best_path.is_file():
+            baseline = load_ma_strategy_tune(legacy_best_path)
+            base_description = f"legacy auto winner: {legacy_best_path}"
+            legacy_hall = _load_json(legacy_hall_path, []) or []
+            for rank, record in enumerate(legacy_hall, start=1):
+                migrated = dict(record)
+                migrated["candidate_id"] = (
+                    f"legacy-auto-{record.get('candidate_id', rank)}"
+                )
+                migrated["phase_candidate_id"] = record.get("candidate_id")
+                migrated["block"] = 0
+                migrated["phase"] = "legacy_auto"
+                migrated["effective_params"] = dict(
+                    record.get("effective_params") or record.get("params") or baseline
+                )
+                archive.append(migrated)
+            if archive:
+                _write_json(archive_path, archive)
+            print(
+                f"Staged bootstrap: loaded {len(archive)} legacy winners and "
+                f"baseline from {legacy_auto_dir}."
+            )
+        state = {
+            "version": 1,
+            "status": "running",
+            "cycles_completed": 0,
+            "block": 1,
+            "phase_index": 0,
+            "baseline_source": base_description,
+            "baseline_params": baseline,
+            "config": staged_config,
+            "created_at": _timestamp_now(),
+            "updated_at": _timestamp_now(),
+        }
+        _write_json(state_path, state)
+
+    total_limit = max(0, int(args.auto_cycles))
+    internal_limit = max(500, int(args.snapshot_top) * 5)
+    while total_limit == 0 or state["cycles_completed"] < total_limit:
+        phase_index = int(state.get("phase_index", 0)) % phase_count
+        phase_name, profile_name = STAGED_AUTO_PHASES[phase_index]
+        block = int(state.get("block", 1))
+        phase_dir = (
+            output_dir / "blocks" / f"block_{block:04d}" /
+            "phases" / f"{phase_index + 1:02d}_{phase_name}"
+        )
+        phase_dir.mkdir(parents=True, exist_ok=True)
+        baseline_path = phase_dir / "baseline_params.json"
+        if not baseline_path.is_file():
+            _write_json(baseline_path, baseline)
+
+        phase_args = argparse.Namespace(**vars(args))
+        phase_args.staged = False
+        phase_args.profile = profile_name
+        phase_args.output_dir = str(phase_dir)
+        phase_args.auto_cycles = int(args.stage_cycles)
+        phase_args.base_source = "file"
+        phase_args.base_params = str(baseline_path)
+        phase_args.resume = (phase_dir / "auto_state.json").is_file()
+        seeds = _staged_seed_data(
+            archive[:int(args.snapshot_top)], PARAMETER_PROFILES[profile_name], baseline
+        )
+        phase_args._seed_elites = seeds
+        phase_args._seed_history = seeds
+
+        print(
+            f"\nStaged block {block} | phase {phase_index + 1}/{phase_count}: "
+            f"{phase_name.upper()} | {args.stage_cycles} cycles | "
+            f"{len(PARAMETER_PROFILES[profile_name])} active parameters"
+        )
+        run_auto_optimization(phase_args, grid=PARAMETER_PROFILES[profile_name])
+        phase_state = _load_json(phase_dir / "auto_state.json", {}) or {}
+        if int(phase_state.get("cycles_completed", 0)) < int(args.stage_cycles):
+            state.update({
+                "status": "interrupted",
+                "active_phase": phase_name,
+                "updated_at": _timestamp_now(),
+            })
+            _write_json(state_path, state)
+            return archive[0] if archive else None
+
+        phase_hall = _load_json(phase_dir / "hall_of_fame.json", []) or []
+        if phase_hall:
+            baseline = dict(phase_hall[0]["effective_params"])
+            archive = _merge_staged_archive(
+                archive, phase_hall, block, phase_name, internal_limit
+            )
+            _write_json(archive_path, archive)
+
+        state["cycles_completed"] = int(state.get("cycles_completed", 0)) + int(
+            args.stage_cycles
+        )
+        state["phase_index"] = phase_index + 1
+        state["baseline_params"] = baseline
+        state["status"] = "running"
+        state["updated_at"] = _timestamp_now()
+
+        if state["phase_index"] >= phase_count:
+            snapshot_dir = output_dir / "snapshots" / f"cycles_{state['cycles_completed']:06d}"
+            _write_staged_ranking(
+                output_dir, archive, args.snapshot_top, snapshot_dir=snapshot_dir
+            )
+            audit_best = _run_random_window_audit(
+                args, archive[:args.random_audit_top], output_dir, block,
+                _latest_market_end() if args.auto_end == "latest" else args.auto_end,
+            )
+            if audit_best:
+                audit_summaries = _load_json(
+                    output_dir / "random_window_summary.json", []
+                ) or []
+                audit_by_id = {
+                    record["candidate_id"]: record for record in audit_summaries
+                }
+                for record in archive:
+                    audit = audit_by_id.get(record.get("candidate_id"))
+                    if audit:
+                        record["random_audit_score"] = audit.get("random_audit_score")
+                        record["random_audit_valid_ratio"] = audit.get("valid_ratio")
+                        record["random_audit_positive_ratio"] = audit.get(
+                            "positive_window_ratio"
+                        )
+                archive.sort(
+                    key=lambda record: (
+                        int(_finite_number(record.get("random_audit_score")) is not None),
+                        (
+                            _finite_number(record.get("random_audit_score"))
+                            if _finite_number(record.get("random_audit_score")) is not None
+                            else -math.inf
+                        ),
+                        (
+                            _finite_number(record.get("robust_score"))
+                            if _finite_number(record.get("robust_score")) is not None
+                            else -math.inf
+                        ),
+                    ),
+                    reverse=True,
+                )
+                _write_json(archive_path, archive)
+                _write_staged_ranking(
+                    output_dir, archive, args.snapshot_top, snapshot_dir=snapshot_dir
+                )
+                for filename in (
+                    "random_window_results.csv", "random_window_summary.csv",
+                    "random_windows.csv", "random_window_summary.json", "best_params.json",
+                ):
+                    source = output_dir / filename
+                    if source.is_file():
+                        shutil.copy2(source, snapshot_dir / filename)
+                state["random_audit_best"] = {
+                    key: value for key, value in audit_best.items()
+                    if key != "effective_params"
+                }
+            state["block"] = block + 1
+            state["phase_index"] = 0
+            if audit_best:
+                baseline = dict(audit_best["effective_params"])
+                state["baseline_params"] = baseline
+            elif archive:
+                baseline = dict(archive[0]["effective_params"])
+                state["baseline_params"] = baseline
+            print(
+                f"Completed {state['cycles_completed']:,} staged cycles | "
+                f"top {min(len(archive), args.snapshot_top)} snapshot: {snapshot_dir}"
+            )
+        _write_json(state_path, state)
+
+    state.update({"status": "completed", "updated_at": _timestamp_now()})
+    _write_json(state_path, state)
+    return archive[0] if archive else None
 
 
 def run_optimization(args, grid=None):
@@ -4114,22 +4912,22 @@ Tips:
         help="new discovery candidates generated in every auto cycle",
     )
     auto.add_argument(
-        "--auto-validation-top", type=int, default=30,
+        "--auto-validation-top", type=int, default=500,
         metavar="N",
         help="discovery finalists sent to the independent validation range",
     )
     auto.add_argument(
-        "--auto-stress-top", type=int, default=10,
+        "--auto-stress-top", type=int, default=250,
         metavar="N",
         help="validation finalists sent to the older stress range",
     )
     auto.add_argument(
-        "--auto-final-top", type=int, default=3,
+        "--auto-final-top", type=int, default=100,
         metavar="N",
         help="stress finalists tested on the complete market range",
     )
     auto.add_argument(
-        "--auto-hall-size", type=int, default=20,
+        "--auto-hall-size", type=int, default=100,
         metavar="N",
         help="maximum robust winners retained across all auto cycles",
     )
@@ -4185,21 +4983,69 @@ Tips:
         help="unevaluated quality/uncertainty/diversity pool relative to --auto-tests",
     )
     auto.add_argument(
-        "--auto-surrogate-trees", type=int, default=32, metavar="N",
+        "--auto-surrogate-trees", type=int, default=64, metavar="N",
         help="trees learning normalized ranks and robust funnel outcomes",
+    )
+    auto.add_argument(
+        "--auto-surrogate-max-samples", type=int, default=10_000, metavar="N",
+        help="representative historical samples retained for tree training",
     )
     auto.add_argument(
         "--auto-walk-forward-folds", type=int, default=3, metavar="N",
         help="disjoint pre-Discovery time folds (0 disables; minimum enabled value is 2)",
     )
     auto.add_argument(
-        "--auto-walk-forward-top", type=int, default=10, metavar="N",
+        "--auto-walk-forward-top", type=int, default=150, metavar="N",
         help="Stress finalists evaluated on every walk-forward fold",
     )
     auto.add_argument(
         "--auto-walk-forward-stability-penalty", type=float, default=0.15,
         metavar="FLOAT",
         help="penalty multiplier applied to score variation across folds",
+    )
+    auto.add_argument(
+        "--staged", action="store_true",
+        help="optimize Signal, Exit, Risk, RSI, and Scale in consecutive phases",
+    )
+    auto.add_argument(
+        "--stage-cycles", type=int, default=10, metavar="N",
+        help="completed auto cycles allocated to each staged parameter phase",
+    )
+    auto.add_argument(
+        "--snapshot-cycles", type=int, default=50, metavar="N",
+        help="completed staged cycles between top-candidate snapshots",
+    )
+    auto.add_argument(
+        "--snapshot-top", type=int, default=100, metavar="N",
+        help="ranked candidates retained in each staged snapshot and next block",
+    )
+    auto.add_argument(
+        "--random-audit-tests", type=int, default=500, metavar="N",
+        help="total random-window backtests after every staged snapshot",
+    )
+    auto.add_argument(
+        "--random-audit-top", type=int, default=10, metavar="N",
+        help="staged finalists compared on identical random windows",
+    )
+    auto.add_argument(
+        "--random-audit-earliest", default="2019-01-01", metavar="DATE|INDEX",
+        help="earliest allowed random-window candle",
+    )
+    auto.add_argument(
+        "--random-audit-recent-start", default="2024-01-01", metavar="DATE|INDEX",
+        help="start boundary used for the recent-window quota",
+    )
+    auto.add_argument(
+        "--random-audit-recent-ratio", type=float, default=0.70, metavar="RATIO",
+        help="fraction of random windows starting on recent data",
+    )
+    auto.add_argument(
+        "--random-audit-min-months", type=int, default=6, metavar="N",
+        help="minimum random audit window duration",
+    )
+    auto.add_argument(
+        "--random-audit-max-months", type=int, default=12, metavar="N",
+        help="maximum random audit window duration",
     )
     return parser
 
@@ -4254,6 +5100,10 @@ def main(argv=None):
         raise SystemExit("--auto-surrogate-min-samples must be at least 4")
     if args.auto_surrogate_pool <= 0 or args.auto_surrogate_trees <= 0:
         raise SystemExit("auto surrogate pool and tree counts must be greater than zero")
+    if args.auto_surrogate_max_samples < args.auto_surrogate_min_samples:
+        raise SystemExit(
+            "--auto-surrogate-max-samples must be at least --auto-surrogate-min-samples"
+        )
     if args.auto_walk_forward_folds == 1 or args.auto_walk_forward_folds < 0:
         raise SystemExit("--auto-walk-forward-folds must be 0 or at least 2")
     if args.auto_walk_forward_top <= 0:
@@ -4268,6 +5118,30 @@ def main(argv=None):
         )
     if args.auto_walk_forward_stability_penalty < 0:
         raise SystemExit("--auto-walk-forward-stability-penalty cannot be negative")
+    if args.staged:
+        if not args.auto:
+            raise SystemExit("--staged requires --auto")
+        if min(args.stage_cycles, args.snapshot_cycles, args.snapshot_top) <= 0:
+            raise SystemExit("staged cycle and snapshot settings must be greater than zero")
+        if min(args.random_audit_tests, args.random_audit_top) <= 0:
+            raise SystemExit("random-audit test and finalist counts must be greater than zero")
+        if args.random_audit_tests < args.random_audit_top:
+            raise SystemExit("--random-audit-tests must be at least --random-audit-top")
+        if not 0 <= args.random_audit_recent_ratio <= 1:
+            raise SystemExit("--random-audit-recent-ratio must be between 0 and 1")
+        if (
+            args.random_audit_min_months <= 0
+            or args.random_audit_max_months < args.random_audit_min_months
+        ):
+            raise SystemExit("random-audit month limits must satisfy 0 < min <= max")
+        expected_snapshot = args.stage_cycles * len(STAGED_AUTO_PHASES)
+        if args.snapshot_cycles != expected_snapshot:
+            raise SystemExit(
+                f"--snapshot-cycles must equal {expected_snapshot} for the current "
+                "five-phase schedule"
+            )
+        if args.auto_cycles and args.auto_cycles % args.stage_cycles:
+            raise SystemExit("--auto-cycles must be divisible by --stage-cycles in staged mode")
     if bool(args.validation_start) != bool(args.validation_end):
         raise SystemExit("--validation-start and --validation-end must be used together")
     if args.dry_run:
@@ -4276,8 +5150,30 @@ def main(argv=None):
             resolved_end = _latest_market_end() if args.auto_end == "latest" else args.auto_end
             ranges = _auto_ranges(args, resolved_end)
             _validate_auto_ranges(ranges)
-            print("Mode: auto")
-            print(f"Profile: {args.profile} ({len(selected_grid)} parameters)")
+            print("Mode: staged auto" if args.staged else "Mode: auto")
+            if args.staged:
+                print(
+                    "Phase schedule: "
+                    + " -> ".join(
+                        f"{name} ({len(PARAMETER_PROFILES[profile])} params, "
+                        f"{args.stage_cycles} cycles)"
+                        for name, profile in STAGED_AUTO_PHASES
+                    )
+                )
+                print(
+                    f"Snapshot: top {args.snapshot_top} every "
+                    f"{args.snapshot_cycles} completed cycles"
+                )
+                audit_windows = args.random_audit_tests // args.random_audit_top
+                print(
+                    f"Random audit: {args.random_audit_top} finalists x "
+                    f"{audit_windows} shared windows = "
+                    f"{audit_windows * args.random_audit_top} tests | "
+                    f"{args.random_audit_recent_ratio:.0%} starting after "
+                    f"{args.random_audit_recent_start}"
+                )
+            else:
+                print(f"Profile: {args.profile} ({len(selected_grid)} parameters)")
             print(
                 f"Funnel per cycle: {args.auto_tests:,} -> "
                 f"{args.auto_validation_top} -> {args.auto_stress_top} -> "
@@ -4315,8 +5211,13 @@ def main(argv=None):
     multiprocessing.freeze_support()
     if args.auto:
         if args.output_dir == DEFAULT_OUTPUT_DIR:
-            args.output_dir = os.path.join(DEFAULT_OUTPUT_DIR, "auto")
-        run_auto_optimization(args)
+            args.output_dir = os.path.join(
+                DEFAULT_OUTPUT_DIR, "staged" if args.staged else "auto"
+            )
+        if args.staged:
+            run_staged_optimization(args)
+        else:
+            run_auto_optimization(args)
     else:
         run_optimization(args)
 

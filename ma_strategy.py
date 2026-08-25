@@ -55,6 +55,22 @@ _INDICATOR_CACHE = {
 }
 
 
+def required_indicator_warmup(config):
+    """Return preceding candles required to seed every configured indicator."""
+    return max(
+        config.ema_16_period,
+        config.ma_50_period,
+        config.ma_100_period,
+        config.ma_200_period,
+        config.period_adx * 2,
+        config.period_atr + config.period_atr_ma,
+        config.period_vol_avg,
+        config.period_rsi + max(
+            config.lowest_rsi_last_n_value, config.highest_rsi_last_n_value
+        ),
+    )
+
+
 def _get_cached_indicator(kind, range_key, indicator_key, builder):
     """Keep reusable indicator arrays in each optimizer worker process."""
     cache = _INDICATOR_CACHE[kind]
@@ -81,6 +97,7 @@ def ma_strategy(
     write_trades=None,
     write_excel=True,
     output_dir="outputs",
+    use_indicator_warmup=True,
 ):
     """Run the MA strategy over ``start`` (inclusive) to ``end`` (exclusive).
 
@@ -102,16 +119,7 @@ def ma_strategy(
     cfg = build_ma_strategy_config(tune)
     # Load preceding candles only to seed rolling/Wilder indicators. They are
     # excluded from trading, reporting, charts, and performance statistics.
-    indicator_warmup = max(
-        cfg.ema_16_period,
-        cfg.ma_50_period,
-        cfg.ma_100_period,
-        cfg.ma_200_period,
-        cfg.period_adx * 2,
-        cfg.period_atr + cfg.period_atr_ma,
-        cfg.period_vol_avg,
-        cfg.period_rsi + max(cfg.lowest_rsi_last_n_value, cfg.highest_rsi_last_n_value),
-    )
+    indicator_warmup = required_indicator_warmup(cfg) if use_indicator_warmup else 0
     market = TradeEngine.load_market_data(
         start=start, end=end, warmup_candles=indicator_warmup
     )

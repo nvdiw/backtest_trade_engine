@@ -212,7 +212,7 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `-h`, `--help` | — | Show built-in help. |
 | `--mode smart\|grid` | `smart` | Adaptive budget or full Cartesian grid. |
 | `--tests N` | `5000` | Smart-mode candidate budget; not a grid-mode limit. |
-| `--profile NAME` | mode-dependent | `full` in Auto mode, `focused` otherwise; explicit choices are `focused`, `signal`, `exit`, `risk`, `rsi`, or `full`. |
+| `--profile NAME` | mode-dependent | `full` in Auto mode, `focused` otherwise; staged mode selects `signal`, `exit`, `risk_core`, `rsi`, and `scale` automatically. |
 | `--base-source config\|best\|file` | `config` | Baseline outside the selected profile. |
 | `--base-params FILE` | `outputs/optimize/best_params.json` | JSON for `best` or `file`. |
 | `-w N`, `--workers N` | up to `8` | Worker processes; use `1` for easiest debugging. |
@@ -344,6 +344,28 @@ After the first cycle, Auto mode can create numeric values not present in the co
 
 Auto mode learns parameter importance from completed Discovery results. Once enough full-Discovery history exists, an internal dependency-free Extra Trees ensemble learns nonlinear parameter interactions. It scores a larger unevaluated pool and selects 55% for predicted quality, 20% for model uncertainty, and 25% for random exploration. Local Hall-of-Fame mutations and crossover still feed that pool, so the model guides the existing search instead of replacing it.
 
+Staged Auto mode searches one related parameter family at a time and locks each
+phase winner into the next phase. The default 50-cycle block is Signal (10), Exit
+(10), Risk (10), RSI (10), and Scale-in (10). It keeps at least 500 internal
+finalists, writes the best 100 to `top_100.csv`, saves the winner to
+`best_params.json`, and creates an immutable snapshot every 50 completed cycles.
+Those top candidates seed both parent generation and Extra Trees training in the
+next block.
+
+Every 50-cycle snapshot also runs a deterministic random-window audit. By
+default, the best 10 finalists are evaluated on the same 50 random 6-12 month
+windows (500 backtests total). All windows begin on or after 2019-01-01 and 70%
+begin on or after 2024-01-01. The audit ranks consistency using per-window
+percentiles, median performance, the worst decile, positive-window ratio, failed
+windows, and score dispersion. Its most robust candidate becomes the snapshot's
+final `best_params.json`.
+
+```powershell
+python optimize.py --auto --staged -w 16
+python optimize.py --auto --staged --auto-cycles 50 -w 16
+python optimize.py --auto --staged --dry-run -w 16
+```
+
 Successive halving evaluates every selected candidate on a short recent range, promotes the best fraction to a larger range, and only then runs full Discovery. Minimum-trade constraints are scaled to rung length. Walk-forward evaluates fixed finalists on disjoint chronological folds; its score combines median, mean, worst-fold performance, and a variation penalty. Every fold has its own resumable CSV checkpoint.
 
 Cross-range ranking never compares raw scores directly. Auto preserves `objective_score`, records the exact `range_candles`, and calculates `time_normalized_score = objective_score × 35,064 / range_candles` (the annual 15-minute-candle rate). Thus a score of 100 over 30 days is approximately 1,217.5/year and does not incorrectly beat a score of 2,000 over a year. Stage percentiles remain duration-neutral, while transformed-quality, walk-forward stability, and normal train/validation comparisons use the normalized rate. Version-1 stage CSV files receive these columns atomically before resume.
@@ -356,11 +378,11 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 |---|---:|---|
 | `--auto` | off | Start the continuous staged campaign. |
 | `--auto-tests N` | `2000` | New discovery candidates per cycle. |
-| `--auto-validation-top N` | `30` | Discovery finalists sent to validation. |
-| `--auto-stress-top N` | `10` | Validation finalists sent to stress testing. |
-| `--auto-walk-forward-top N` | `10` | Stress finalists evaluated on every time fold. |
-| `--auto-final-top N` | `3` | Stress finalists sent to the full-range test. |
-| `--auto-hall-size N` | `20` | Winners retained across cycles. |
+| `--auto-validation-top N` | `500` | Discovery finalists sent to validation. |
+| `--auto-stress-top N` | `250` | Validation finalists sent to stress testing. |
+| `--auto-walk-forward-top N` | `150` | Stress finalists evaluated on every time fold. |
+| `--auto-final-top N` | `100` | Stress finalists sent to the full-range test. |
+| `--auto-hall-size N` | `100` | Winners retained across cycles. |
 | `--auto-cycles N` | `0` | Completed-cycle limit; `0` means until `Ctrl+C`. |
 | `--auto-discovery-start VALUE` | `2025-01-01` | Recent discovery start. |
 | `--auto-validation-start VALUE` | `2023-01-01` | Validation start; ends at discovery start. |
@@ -371,7 +393,19 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-halving-keep RATIO` | `0.25` | Fraction promoted after every cheap rung. |
 | `--auto-surrogate-min-samples N` | `64` | Full-Discovery history required before Extra Trees activates. |
 | `--auto-surrogate-pool N` | `8` | Candidate-pool multiplier scored by the surrogate. |
-| `--auto-surrogate-trees N` | `32` | Number of randomized regression trees. |
+| `--auto-surrogate-trees N` | `64` | Number of randomized regression trees. |
+| `--auto-surrogate-max-samples N` | `10000` | Representative historical samples used to train the trees. |
+| `--staged` | off | Run the five locked 10-cycle parameter phases. |
+| `--stage-cycles N` | `10` | Cycles allocated to each staged phase. |
+| `--snapshot-cycles N` | `50` | Completed cycles per staged snapshot. |
+| `--snapshot-top N` | `100` | Winners written and reused at each snapshot. |
+| `--random-audit-tests N` | `500` | Total random-period tests after each snapshot. |
+| `--random-audit-top N` | `10` | Finalists compared on shared random periods. |
+| `--random-audit-earliest VALUE` | `2019-01-01` | Earliest allowed audit candle. |
+| `--random-audit-recent-start VALUE` | `2024-01-01` | Boundary for recent audit windows. |
+| `--random-audit-recent-ratio X` | `0.70` | Required share of recent windows. |
+| `--random-audit-min-months N` | `6` | Minimum random-window duration. |
+| `--random-audit-max-months N` | `12` | Maximum random-window duration. |
 | `--auto-walk-forward-folds N` | `3` | Disjoint chronological folds; `0` disables them. |
 | `--auto-walk-forward-stability-penalty FLOAT` | `0.15` | Penalty for performance variation between folds. |
 

@@ -11,18 +11,20 @@ from unittest.mock import patch
 from openpyxl import load_workbook
 
 from optimize import (
-    ExtraTreesSurrogate, SmartCandidateGenerator,
-    _aggregate_walk_forward_records, _auto_bootstrap, _compact_auto_candidate_plans,
+    ExtraTreesSurrogate, SmartCandidateGenerator, STAGED_AUTO_PHASES,
+    _aggregate_random_audit, _aggregate_walk_forward_records, _auto_bootstrap,
+    _compact_auto_candidate_plans, _generate_random_audit_windows,
     _annotate_discovery_learning_scores, _apply_funnel_learning_scores,
     _learn_mutation_guidance, _learn_parameter_importance, _open_csv_text,
     _resolve_csv_path,
     _read_candidate_plan, _read_surrogate_history_cache,
-    _representative_surrogate_history, _select_surrogate_candidates,
-    _write_surrogate_history_cache,
+    _representative_surrogate_history, _run_random_window_audit,
+    _restore_auto_resume_args, _select_surrogate_candidates,
+    _staged_seed_data, _write_staged_ranking, _write_surrogate_history_cache,
     _robust_validation_score, _time_normalized_score,
     build_parser, grid_size,
     iter_grid_candidates,
-    param_grid, run_auto_optimization, run_optimization,
+    param_grid, run_auto_optimization, run_optimization, run_staged_optimization,
 )
 from ma_strategy import resolve_parameter_source
 from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
@@ -30,6 +32,40 @@ from trade_engine import TradeEngine
 
 
 class OptimizerSearchTests(unittest.TestCase):
+    def test_legacy_auto_checkpoint_restores_saved_defaults_before_resume(self):
+        args = build_parser().parse_args(["--auto"])
+        args.profile = "full"
+        state = {
+            "config": {
+                "profile": "full", "tests_per_cycle": 2000,
+                "validation_top": 30, "stress_top": 10, "final_top": 3,
+                "hall_size": 20, "seed": 42, "minimum_trades": 0,
+                "maximum_allowed_drawdown": None,
+                "ranges": {
+                    "discovery": ["2025-01-01", "2026-06-01"],
+                    "validation": ["2023-01-01", "2025-01-01"],
+                    "stress": ["2019-01-01", "2023-01-01"],
+                    "final": ["2019-01-01", "2026-06-01"],
+                },
+            },
+            "optimizer_features": {
+                "surrogate_trees": 32, "walk_forward_top": 10,
+            },
+        }
+
+        _restore_auto_resume_args(args, state)
+
+        self.assertEqual(args.auto_validation_top, 30)
+        self.assertEqual(args.auto_stress_top, 10)
+        self.assertEqual(args.auto_final_top, 3)
+        self.assertEqual(args.auto_hall_size, 20)
+        self.assertEqual(args.auto_surrogate_trees, 32)
+        self.assertEqual(args.auto_surrogate_max_samples, 1024)
+        self.assertEqual(args.auto_end, "2026-06-01")
+        self.assertFalse(args._indicator_warmup_enabled)
+        self.assertFalse(state["config"]["indicator_warmup"])
+        self.assertIn("strategy_semantics_migration", state)
+
     def test_legacy_surrogate_cache_migrates_raw_scores_to_comparable_ranks(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             cache_path = Path(temp_dir) / "surrogate_history_cache.json.gz"
@@ -145,7 +181,7 @@ class OptimizerSearchTests(unittest.TestCase):
                 cache_path, ("x", "y")
             )
 
-        self.assertEqual(len(selected), 1024)
+        self.assertEqual(len(selected), 10_000)
         self.assertEqual(loaded, selected)
         self.assertEqual(latest_cycle, 159)
 
@@ -216,9 +252,205 @@ class OptimizerSearchTests(unittest.TestCase):
         auto_args = build_parser().parse_args(["--auto"])
         self.assertTrue(auto_args.auto)
         self.assertEqual(auto_args.auto_tests, 2000)
-        self.assertEqual(auto_args.auto_validation_top, 30)
-        self.assertEqual(auto_args.auto_stress_top, 10)
-        self.assertEqual(auto_args.auto_final_top, 3)
+        self.assertEqual(auto_args.auto_validation_top, 500)
+        self.assertEqual(auto_args.auto_stress_top, 250)
+        self.assertEqual(auto_args.auto_walk_forward_top, 150)
+        self.assertEqual(auto_args.auto_final_top, 100)
+        self.assertEqual(auto_args.auto_hall_size, 100)
+        self.assertEqual(auto_args.auto_surrogate_trees, 64)
+        self.assertEqual(auto_args.auto_surrogate_max_samples, 10_000)
+
+        staged = build_parser().parse_args(["--auto", "--staged"])
+        self.assertTrue(staged.staged)
+        self.assertEqual(staged.stage_cycles, 10)
+        self.assertEqual(staged.snapshot_cycles, 50)
+        self.assertEqual(staged.snapshot_top, 100)
+        self.assertEqual(staged.random_audit_tests, 500)
+        self.assertEqual(staged.random_audit_top, 10)
+        self.assertEqual(staged.random_audit_recent_ratio, 0.70)
+        self.assertEqual([name for name, _ in STAGED_AUTO_PHASES], [
+            "signal", "exit", "risk", "rsi", "scale",
+        ])
+
+    def test_staged_top_records_seed_the_next_parameter_phase(self):
+        records = [
+            {
+                "candidate_id": "winner",
+                "robust_score": 90,
+                "effective_params": {"entry_score_threshold": 11},
+                "stage_metrics": {"final": {"score": 50}},
+            },
+            {
+                "candidate_id": "runner-up",
+                "robust_score": 80, "random_audit_score": 95,
+                "effective_params": {"entry_score_threshold": 7},
+                "stage_metrics": {"final": {"score": 40}},
+            },
+        ]
+        grid = {"entry_score_threshold": [6, 7, 8, 9, 10, 11, 12]}
+
+        seeds = _staged_seed_data(records, grid, {})
+
+        self.assertEqual([seed["params"]["entry_score_threshold"] for seed in seeds], [7, 11])
+        self.assertEqual(seeds[0]["learning_score"], 1.0)
+        self.assertEqual(seeds[-1]["learning_score"], 0.0)
+
+    def test_random_audit_windows_enforce_recent_quota_and_are_reproducible(self):
+        first = _generate_random_audit_windows(
+            0, 50_000, 100_000, 50, 0.70, seed=123,
+        )
+        second = _generate_random_audit_windows(
+            0, 50_000, 100_000, 50, 0.70, seed=123,
+        )
+
+        self.assertEqual(first, second)
+        self.assertEqual(len(first), 50)
+        self.assertEqual(sum(row["tier"] == "recent" for row in first), 35)
+        self.assertTrue(all(row["start"] >= 0 for row in first))
+        self.assertTrue(all(row["end"] <= 100_000 for row in first))
+
+    def test_random_audit_prefers_consistent_cross_window_candidate(self):
+        candidates = [
+            {"candidate_id": "stable", "effective_params": {"leverage": 2}},
+            {"candidate_id": "unstable", "effective_params": {"leverage": 10}},
+        ]
+        records = []
+        for window_id in range(1, 11):
+            records.extend([
+                {
+                    "candidate_id": "stable", "window_id": window_id,
+                    "time_normalized_score": 80,
+                    "result": {"total_profit": 10, "total_profit_percent": 5,
+                               "maximum_drawdown": -10},
+                },
+                {
+                    "candidate_id": "unstable", "window_id": window_id,
+                    "time_normalized_score": 100 if window_id <= 4 else 20,
+                    "result": {"total_profit": 10 if window_id <= 4 else -10,
+                               "total_profit_percent": 8 if window_id <= 4 else -5,
+                               "maximum_drawdown": -40},
+                },
+            ])
+
+        summaries = _aggregate_random_audit(records, candidates, 10)
+
+        self.assertEqual(summaries[0]["candidate_id"], "stable")
+        self.assertGreater(
+            summaries[0]["random_audit_score"], summaries[1]["random_audit_score"]
+        )
+
+    def test_random_audit_runs_requested_shared_window_matrix_and_writes_reports(self):
+        candidates = [
+            {"candidate_id": "safe", "effective_params": {"leverage": 2}},
+            {"candidate_id": "risky", "effective_params": {"leverage": 10}},
+        ]
+        args = build_parser().parse_args([
+            "--auto", "--staged", "--workers", "1",
+            "--random-audit-tests", "4", "--random-audit-top", "2",
+            "--random-audit-earliest", "0",
+            "--random-audit-recent-start", "20000",
+            "--random-audit-min-months", "1",
+            "--random-audit-max-months", "1",
+            "--log-every", "0",
+        ])
+
+        def fake_strategy(tune, start, end):
+            safe = tune["leverage"] == 2
+            return {
+                "score": 100 if safe else 50,
+                "total_profit": 10 if safe else -5,
+                "total_profit_percent": 5 if safe else -2,
+                "closed_trades": 20,
+                "maximum_drawdown": -8 if safe else -30,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("optimize.ma_strategy", side_effect=fake_strategy):
+                winner = _run_random_window_audit(
+                    args, candidates, temp_dir, block=1, final_end=50_000
+                )
+            output = Path(temp_dir)
+            with (output / "random_window_results.csv").open(encoding="utf-8") as file:
+                result_rows = list(csv.DictReader(file))
+            best = json.loads((output / "best_params.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(len(result_rows), 4)
+        self.assertEqual(winner["candidate_id"], "safe")
+        self.assertEqual(best["leverage"], 2)
+
+    def test_staged_snapshot_writes_ranked_csv_and_best_params(self):
+        records = [{
+            "candidate_id": "best", "robust_score": 99, "cycle": 10,
+            "block": 1, "phase": "signal",
+            "effective_params": {"entry_score_threshold": 11},
+            "stage_metrics": {"final": {"score": 88, "total_profit": 123}},
+        }]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir)
+            snapshot = output / "snapshots" / "cycles_000050"
+            _write_staged_ranking(output, records, 100, snapshot_dir=snapshot)
+            best = json.loads((output / "best_params.json").read_text(encoding="utf-8"))
+            with (snapshot / "top_100.csv").open(encoding="utf-8") as csv_file:
+                rows = list(csv.DictReader(csv_file))
+
+        self.assertEqual(best["entry_score_threshold"], 11)
+        self.assertEqual(rows[0]["phase"], "signal")
+        self.assertEqual(rows[0]["robust_score"], "99")
+
+    def test_staged_campaign_locks_each_phase_winner_and_writes_block_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args = build_parser().parse_args([
+                "--auto", "--staged", "--auto-cycles", "5",
+                "--stage-cycles", "1", "--snapshot-cycles", "5",
+                "--snapshot-top", "100", "--output-dir", temp_dir,
+            ])
+            observed_baselines = []
+
+            def fake_phase(phase_args, grid=None):
+                phase_output = Path(phase_args.output_dir)
+                baseline = json.loads(
+                    Path(phase_args.base_params).read_text(encoding="utf-8")
+                )
+                observed_baselines.append(dict(baseline))
+                key = next(iter(grid))
+                effective = {**baseline, key: list(grid[key])[-1]}
+                record = {
+                    "candidate_id": f"phase-{len(observed_baselines)}",
+                    "params": {key: effective[key]},
+                    "effective_params": effective,
+                    "robust_score": float(len(observed_baselines)),
+                    "cycle": 1,
+                    "stage_metrics": {"final": {"score": len(observed_baselines)}},
+                }
+                phase_output.mkdir(parents=True, exist_ok=True)
+                (phase_output / "auto_state.json").write_text(
+                    json.dumps({"cycles_completed": 1}), encoding="utf-8"
+                )
+                (phase_output / "hall_of_fame.json").write_text(
+                    json.dumps([record]), encoding="utf-8"
+                )
+                return record
+
+            with patch("optimize.run_auto_optimization", side_effect=fake_phase):
+                with patch("optimize._run_random_window_audit", return_value={
+                    "candidate_id": "audited", "random_audit_score": 99,
+                    "effective_params": {"leverage": 3},
+                }):
+                    run_staged_optimization(args)
+
+            output = Path(temp_dir)
+            state = json.loads((output / "staged_state.json").read_text(encoding="utf-8"))
+            snapshot = output / "snapshots" / "cycles_000005"
+            snapshot_csv_exists = (snapshot / "top_100.csv").is_file()
+            snapshot_best_exists = (snapshot / "best_params.json").is_file()
+
+        self.assertEqual(len(observed_baselines), 5)
+        self.assertTrue(observed_baselines[1])
+        self.assertEqual(state["cycles_completed"], 5)
+        self.assertEqual(state["status"], "completed")
+        self.assertEqual(state["baseline_params"]["leverage"], 3)
+        self.assertTrue(snapshot_csv_exists)
+        self.assertTrue(snapshot_best_exists)
 
     def test_grid_is_complete_and_deterministic(self):
         grid = {"a": [1, 2], "b": ["x", "y", "z"]}
