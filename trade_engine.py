@@ -185,6 +185,11 @@ class TradeEngine:
         output_dir="outputs",
         track_equity_curve=None,
         csv_logger=None,
+        fee_rate=0.0,
+        slippage_rate=0.0,
+        funding_rate_per_8h=0.0,
+        maintenance_margin_rate=0.0,
+        liquidation_fee_rate=0.0,
     ):
         self.write_trades = bool(write_trades) and not bool(optimize)
         self.output_dir = os.fspath(output_dir)
@@ -207,6 +212,11 @@ class TradeEngine:
         self.safe_leverage_balance_pct_med = safe_leverage_balance_pct_med
         self.safe_leverage_balance_pct_high = safe_leverage_balance_pct_high
         self.save_money_recover_trigger_pct = save_money_recover_trigger_pct
+        self.fee_rate = max(0.0, float(fee_rate))
+        self.slippage_rate = max(0.0, float(slippage_rate))
+        self.funding_rate_per_8h = abs(float(funding_rate_per_8h))
+        self.maintenance_margin_rate = max(0.0, float(maintenance_margin_rate))
+        self.liquidation_fee_rate = max(0.0, float(liquidation_fee_rate))
         self.verbose = bool(verbose)
         if track_equity_curve is None:
             track_equity_curve = not bool(optimize)
@@ -240,6 +250,18 @@ class TradeEngine:
             pd.to_datetime(all_data["Close time"], utc=True)
             + pd.Timedelta(milliseconds=1)
         ).strftime("%Y-%m-%d %H:%M:%S.%f").tolist()
+        try:
+            open_time_ns = np.asarray(
+                pd.to_datetime(
+                    all_data["Open time"], utc=True, format="mixed", errors="raise"
+                ).asi8,
+                dtype=np.int64,
+            )
+        except (TypeError, ValueError):
+            # Some unit/integration clients deliberately use opaque timestamp
+            # labels.  They retain the legacy payload; audited market CSVs get
+            # the fast elapsed-time clock used for accurate funding across gaps.
+            open_time_ns = None
 
         history = {
             "open_prices": np.asarray(all_data["Open"], dtype=float),
@@ -250,6 +272,8 @@ class TradeEngine:
             "high_prices": np.asarray(all_data["High"], dtype=float),
             "volume_prices": np.asarray(all_data["Volume"], dtype=float),
         }
+        if open_time_ns is not None:
+            history["open_time_ns"] = open_time_ns
 
         return {
             "start": start_index,
@@ -313,6 +337,19 @@ class TradeEngine:
     def _resolve_total_assets(balance, save_money, remaining_open_margin, remaining_open_equity=None):
         open_position_value = remaining_open_margin if remaining_open_equity is None else remaining_open_equity
         return balance + open_position_value + save_money
+
+    def _funding_cost(self, notional, open_time, close_time):
+        """Conservative funding charge for every crossed eight-hour interval."""
+        if self.funding_rate_per_8h <= 0 or notional <= 0:
+            return 0.0
+        try:
+            opened = pd.to_datetime(open_time, utc=True)
+            closed = pd.to_datetime(close_time, utc=True)
+            elapsed_hours = max(0.0, (closed - opened).total_seconds() / 3600.0)
+        except (TypeError, ValueError):
+            return 0.0
+        intervals = int(math.ceil(elapsed_hours / 8.0 - 1e-12))
+        return float(notional) * self.funding_rate_per_8h * max(0, intervals)
 
     def _update_drawdown(self, equity_curve, max_drawdown, total_assets):
         if self.track_equity_curve:
@@ -572,7 +609,7 @@ class TradeEngine:
         if tactical_balance is None:
             tactical_balance = balance
 
-        entry_price = open_prices[i]
+        entry_price = open_prices[i] * (1.0 + self.slippage_rate)
 
         portfolio_balance_before_open = margin_balance if margin_balance is not None else balance
         portfolio_balance_before_open_no_fee = margin_balance_no_fee if margin_balance_no_fee is not None else balance_without_fee
@@ -662,7 +699,7 @@ class TradeEngine:
                 balance_before_log_override=None, balance_before_log_override_no_fee=None, remaining_open_equity=None):
         """Close 100% of the supplied long position using its original leverage."""
 
-        close_price = open_prices[i]
+        close_price = open_prices[i] * (1.0 - self.slippage_rate)
         if balance_before_close_snapshot is None:
             free_balance_before_close = balance
         else:
@@ -679,7 +716,10 @@ class TradeEngine:
         # Fee like Toobit
         entry_fee = entry_price * position_size * fee_rate
         exit_fee = close_price * position_size * fee_rate
-        total_fee = entry_fee + exit_fee
+        funding_fee = self._funding_cost(
+            entry_price * position_size, open_time_value, open_times[i]
+        )
+        total_fee = entry_fee + exit_fee + funding_fee
 
         # Update balance
         balance += margin + pnl - total_fee
@@ -839,7 +879,7 @@ class TradeEngine:
         if tactical_balance is None:
             tactical_balance = balance
 
-        entry_price = open_prices[i]
+        entry_price = open_prices[i] * (1.0 - self.slippage_rate)
 
         portfolio_balance_before_open = margin_balance if margin_balance is not None else balance
         portfolio_balance_before_open_no_fee = margin_balance_no_fee if margin_balance_no_fee is not None else balance_without_fee
@@ -929,7 +969,7 @@ class TradeEngine:
             balance_before_log_override=None, balance_before_log_override_no_fee=None, remaining_open_equity=None):
         """Close 100% of the supplied short position using its original leverage."""
 
-        close_price = open_prices[i]
+        close_price = open_prices[i] * (1.0 + self.slippage_rate)
         if balance_before_close_snapshot is None:
             free_balance_before_close = balance
         else:
@@ -946,7 +986,10 @@ class TradeEngine:
         # Fee like Toobit
         entry_fee = entry_price * position_size * fee_rate
         exit_fee = close_price * position_size * fee_rate
-        total_fee = entry_fee + exit_fee
+        funding_fee = self._funding_cost(
+            entry_price * position_size, open_time_value, open_times[i]
+        )
+        total_fee = entry_fee + exit_fee + funding_fee
 
         # Update balance
         balance += margin + pnl - total_fee
@@ -1113,7 +1156,9 @@ class TradeEngine:
         remaining_open_equity=None
     ):
 
-        liquid_price_long = entry_price * (1 - 1 / leverage)
+        liquid_price_long = entry_price * (
+            1 - 1 / leverage + self.maintenance_margin_rate
+        )
 
         # --------------------------
         # NOT LIQUIDATED
@@ -1156,9 +1201,13 @@ class TradeEngine:
         pnl = -margin
         pnl_no_fee = -margin
 
-        entry_fee = 0
-        exit_fee = 0
-        total_fee = 0
+        notional = margin * leverage
+        entry_fee = notional * self.fee_rate
+        exit_fee = notional * self.liquidation_fee_rate
+        funding_fee = self._funding_cost(
+            notional, open_time_value, close_time_value
+        )
+        total_fee = entry_fee + exit_fee + funding_fee
 
         # --------------------------
         # BALANCE UPDATE (same logic style as close_long)
@@ -1564,7 +1613,7 @@ class TradeEngine:
             except Exception:
                 pass
 
-        return {
+        result = {
             "final_balance_static": state["total_money_static"],
             "final_balance_dynamic": state["total_money_dynamic"],
             "final_balance": round(balance, 6),
@@ -1626,6 +1675,22 @@ class TradeEngine:
             "scale_short_winrate": scale_short_winrate,
             "scale_short_profit": state["scale_ma_short_total_profit"],
         }
+        if state.get("research"):
+            # These compact series are emitted only for finalists/audits.  They
+            # are intentionally omitted from mass discovery results and CSVs.
+            result["trade_profits"] = [float(value) for value in profits]
+            dedicated_returns = state.get("research_monthly_returns")
+            if dedicated_returns is not None:
+                result["monthly_returns"] = [
+                    float(value) for value in dedicated_returns
+                    if value is not None and math.isfinite(float(value))
+                ]
+            else:
+                result["monthly_returns"] = [
+                    float(value) / 100.0 for value in monthly_profits
+                    if value is not None and math.isfinite(float(value))
+                ]
+        return result
 
     @staticmethod
     def _print_backtest_report(**report):
@@ -1697,7 +1762,9 @@ class TradeEngine:
         remaining_open_equity=None
     ):
 
-        liquid_price_short = entry_price * (1 + 1 / leverage)
+        liquid_price_short = entry_price * (
+            1 + 1 / leverage - self.maintenance_margin_rate
+        )
 
         # --------------------------
         # NOT LIQUIDATED
@@ -1740,7 +1807,12 @@ class TradeEngine:
         pnl = -margin
         pnl_no_fee = -margin
 
-        total_fee = 0
+        notional = margin * leverage
+        total_fee = (
+            notional * self.fee_rate
+            + notional * self.liquidation_fee_rate
+            + self._funding_cost(notional, open_time_value, close_time_value)
+        )
 
         # --------------------------
         # BALANCE UPDATE (same logic as close_long style)

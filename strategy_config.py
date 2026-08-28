@@ -68,6 +68,14 @@ class CapitalConfig:
     save_money: float = 0
     # fee rate.
     fee_rate: float = 0.0005
+    # Adverse market-order price movement applied on every entry and exit.
+    slippage_rate: float = 0.0001
+    # Conservative funding cost charged per eight-hour interval on open notional.
+    funding_rate_per_8h: float = 0.00005
+    # Maintenance-margin fraction used by the simplified liquidation model.
+    maintenance_margin_rate: float = 0.005
+    # Extra notional fee charged when a position is liquidated.
+    liquidation_fee_rate: float = 0.002
 
 
 @dataclass

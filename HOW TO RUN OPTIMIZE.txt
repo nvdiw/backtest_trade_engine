@@ -1,6 +1,25 @@
 NEW SEARCH FROM strategy_config.py:
 python optimize.py --mode smart --profile focused --base-source config --tests 5000 -w 8
 
+TRUSTWORTHY THREE-STEP RESEARCH WORKFLOW (PERSIAN GUIDE: RESEARCH_GUIDE_FA.md):
+Default time firewall: Auto/search uses 2021-07-01..2023-10-01; recent nested OOS
+starts after that and ends before 2025-06-01; the final holdout starts 2025-06-01
+and includes the last candle at 2026-05-31 23:45:00 (exclusive end: 2026-06-01).
+1) Development Auto search; publishes 100 reusable results every 50 cycles:
+python optimize.py --auto --strategy ma --profile full --auto-cycles 50 --snapshot-cycles 50 --snapshot-top 100 -w 8 --output-dir outputs/optimize/ma_campaign
+
+2) Nested chronological walk-forward; OOS is reporting-only:
+python optimize.py --research --strategy ma --profile full --research-seeds outputs/optimize/ma_campaign/snapshots/cycles_000050/top_100.json --research-tests 500 -w 8 --output-dir outputs/optimize/ma_campaign
+
+3) One-time sealed holdout with base/adverse/severe execution costs:
+python optimize.py --sealed-holdout --strategy ma --holdout-params outputs/optimize/ma_campaign/walk_forward_research/walk_forward_recommended_params.json --output-dir outputs/optimize/ma_campaign
+
+SWAP TO THE INCLUDED RSI STRATEGY (NO OPTIMIZER EDITS):
+python optimize.py --auto --strategy rsi --profile full --auto-cycles 50 --snapshot-cycles 50 --snapshot-top 100 -w 8 --output-dir outputs/optimize/rsi_campaign
+
+USE AN EXTERNAL GRID:
+python optimize.py --research --strategy rsi --param-grid param_grids/rsi_quick.json --profile full --research-seeds outputs/optimize/rsi_campaign/snapshots/cycles_000050/top_100.json --research-tests 300 -w 8 --output-dir outputs/optimize/rsi_campaign
+
 CONTINUOUS AUTO SEARCH (STOP WITH CTRL+C):
 python optimize.py --auto -w 16
 Auto mode uses the full profile, successive halving, Extra Trees guidance, and walk-forward validation.
@@ -23,7 +42,7 @@ REFINE THE CURRENT BEST PARAMETERS:
 python optimize.py --mode smart --profile exit --base-source best --base-params outputs/optimize/best_params.json --tests 5000 -w 8 --output-dir outputs/optimize/refine_exit
 
 ROBUST TRAIN + VALIDATION SEARCH:
-python optimize.py --mode smart --profile signal --tests 10000 -w 8 --start 2023-01-01 --end 2025-01-01 --validation-start 2025-01-01 --validation-end 2026-01-01 --min-trades 50 --max-drawdown 35 --output-dir outputs/optimize/validated
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 --start 2021-07-01 --end 2022-10-01 --validation-start 2022-10-01 --validation-end 2023-10-01 --min-trades 50 --max-drawdown 35 --output-dir outputs/optimize/validated
 
 CONTINUE AN INTERRUPTED RUN:
 python optimize.py --mode smart --profile focused --tests 10000 -w 8 --resume

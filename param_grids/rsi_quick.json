@@ -1,0 +1,26 @@
+{
+  "focused": {
+    "period_rsi": [7, 14, 21],
+    "long_entry_rsi": [25.0, 30.0, 35.0],
+    "long_exit_rsi": [50.0, 55.0, 60.0],
+    "short_entry_rsi": [65.0, 70.0, 75.0],
+    "short_exit_rsi": [40.0, 45.0, 50.0]
+  },
+  "full": {
+    "period_rsi": [7, 14, 21],
+    "long_entry_rsi": [25.0, 30.0, 35.0],
+    "long_exit_rsi": [50.0, 55.0, 60.0],
+    "short_entry_rsi": [65.0, 70.0, 75.0],
+    "short_exit_rsi": [40.0, 45.0, 50.0],
+    "trade_amount_percent": [0.25, 0.5],
+    "leverage": [1.0, 2.0, 3.0],
+    "stop_loss_pct": [0.02, 0.04, 0.06],
+    "take_profit_pct": [0.04, 0.08, 0.12],
+    "cooldown_candles": [0, 4, 12],
+    "fee_rate": [0.0005],
+    "slippage_rate": [0.0001],
+    "funding_rate_per_8h": [0.00005],
+    "maintenance_margin_rate": [0.005],
+    "liquidation_fee_rate": [0.002]
+  }
+}

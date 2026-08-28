@@ -1,4 +1,4 @@
-"""Parallel full-grid and budgeted adaptive optimization for ``ma_strategy``.
+"""Strategy-agnostic optimization and research validation.
 
 Examples:
     python optimize.py --auto -w 16
@@ -9,7 +9,9 @@ Examples:
 
 import argparse
 import csv
+from dataclasses import replace
 import gzip
+import hashlib
 import itertools
 import json
 import math
@@ -25,6 +27,27 @@ from pathlib import Path
 
 from ma_strategy import ma_strategy, required_indicator_warmup
 from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
+from strategy_adapter import (
+    StrategyAdapter,
+    load_grid_source,
+    resolve_strategy,
+)
+from research_statistics import (
+    deflated_sharpe_ratio,
+    grid_ordinal_position,
+    moving_block_bootstrap_ci,
+    parameter_plateau_scores,
+    performance_from_returns,
+    probability_of_backtest_overfitting,
+)
+from market_data_audit import (
+    AuditConfig,
+    MarketDataAuditError,
+    audit_market_data,
+    build_run_fingerprints,
+    fingerprint_config,
+    fingerprint_data,
+)
 
 
 # Every key is an existing MAStrategyConfig setting.  Defaults in
@@ -35,6 +58,11 @@ FULL_PARAM_GRID = {
     "balance": [1000],
     "save_money": [0],
     "fee_rate": [0.0005],
+    # Execution assumptions are fixed during signal search and stressed later.
+    "slippage_rate": [0.0001],
+    "funding_rate_per_8h": [0.00005],
+    "maintenance_margin_rate": [0.005],
+    "liquidation_fee_rate": [0.002],
     # Entry context and thresholds
     "entry_score_threshold": [6, 7, 8, 9, 10, 11, 12],
     "exit_score_threshold": [4, 5, 6, 7, 8, 9, 10],
@@ -96,8 +124,8 @@ FULL_PARAM_GRID = {
     "exit_score_opposite_candle": [1, 2, 3],
     "post_cross_penalty_score": [0, 1, 2, 3, 4, 5],
     # Position sizing, safety, monthly controls, and scale-ins
-    "trade_amount_percent": [0.2, 0.3, 0.4, 0.5, 0.6, 0.75, 0.9],
-    "leverage": [1, 2, 3, 4, 5, 7, 10, 12],
+    "trade_amount_percent": [0.2, 0.3, 0.4, 0.5, 0.6],
+    "leverage": [1, 2, 3, 4, 5, 7, 10],
     "safe_leverage_low": [1, 2, 3, 4],
     "safe_leverage_med": [2, 3, 4, 5, 6],
     "safe_leverage_high": [3, 4, 5, 6, 8],
@@ -105,11 +133,11 @@ FULL_PARAM_GRID = {
     "safe_leverage_balance_pct_med": [70, 75, 80, 85],
     "safe_leverage_balance_pct_high": [80, 85, 90, 95],
     "save_money_recover_trigger_pct": [60, 65, 70, 75, 80],
-    "max_open_trades": [1, 2, 3, 4, 5, 8],
+    "max_open_trades": [1, 2, 3, 4],
     "cooldown_after_big_pnl": [0, 4, 8, 12, 24, 48, 96],
     "monthly_profit_percent_stop_trade": [5, 7, 9, 12, 15, 20],
     "monthly_loss_percent_stop_trade": [8, 12, 16, 19, 20, 25, 30],
-    "monthly_compound": [0, 1, 2, 3, 5, 8],
+    "monthly_compound": [3],
     "monthly_profit_close_filter": [False, True],
     "monthly_loss_close_filter": [False, True],
     "consecutive_losses_month_stop_filter": [False, True],
@@ -261,11 +289,71 @@ SURROGATE_MAX_TRAINING_SAMPLES = 10_000
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
 SURROGATE_CACHE_VERSION = 2
 
-_WORKER_START = "2025-01-01"
-_WORKER_END = "2026-02-23"
+_WORKER_START = "2021-07-01"
+_WORKER_END = "2023-10-01"
 _WORKER_BASE_TUNE = {}
 _WORKER_USE_INDICATOR_WARMUP = True
+_WORKER_INDICATOR_WARMUP_CANDLES = None
+_WORKER_STRATEGY_SPEC = "ma"
+_WORKER_RESEARCH = False
 DEFAULT_OUTPUT_DIR = os.path.join("outputs", "optimize")
+
+
+def _adapter_from_spec(specification=None):
+    """Resolve an adapter while preserving tests that patch ``optimize.ma_strategy``."""
+    adapter = resolve_strategy(specification or "ma")
+    if adapter.identifier == "ma_strategy:ma_strategy":
+        adapter = replace(adapter, function=ma_strategy)
+    return adapter
+
+
+def _adapter_from_args(args):
+    cached = getattr(args, "_strategy_adapter", None)
+    if cached is not None:
+        return cached
+    adapter = _adapter_from_spec(getattr(args, "strategy", "ma"))
+    try:
+        args._strategy_adapter = adapter
+    except Exception:
+        pass
+    return adapter
+
+
+def _freeze_strategy_tune(adapter, tune):
+    """Expand a selected delta into a self-contained, reproducible tune object."""
+    tune = dict(tune or {})
+    try:
+        resolved = adapter.default_values(tune)
+    except (KeyError, TypeError, ValueError):
+        # Synthetic test grids and permissive plug-ins may contain parameters
+        # unknown to an otherwise strict config builder. Preserve them while
+        # still freezing every default the strategy can expose.
+        resolved = adapter.default_values({})
+    return {**dict(resolved), **tune}
+
+
+def _profiles_from_args(args):
+    cached = getattr(args, "_parameter_profiles", None)
+    if cached is not None:
+        return cached
+    adapter = _adapter_from_args(args)
+    grid_source = getattr(args, "param_grid", None)
+    if grid_source:
+        profiles = load_grid_source(grid_source)
+    elif adapter.identifier == "ma_strategy:ma_strategy":
+        profiles = PARAMETER_PROFILES
+    else:
+        profiles = adapter.discovered_profiles()
+        if not profiles:
+            raise ValueError(
+                f"strategy {adapter.identifier} does not expose param_grid or "
+                "PARAMETER_PROFILES; provide --param-grid JSON|module:attribute"
+            )
+    try:
+        args._parameter_profiles = profiles
+    except Exception:
+        pass
+    return profiles
 
 
 def grid_size(grid):
@@ -289,8 +377,10 @@ def _nearest_value(values, target):
     return values[0]
 
 
-def is_valid_candidate(candidate):
+def is_valid_candidate(candidate, strategy_adapter=None):
     """Reject combinations that violate basic parameter relationships."""
+    if strategy_adapter is not None and not strategy_adapter.validate_candidate(candidate):
+        return False
     ma_periods = [
         candidate.get("ema_16_period"), candidate.get("ma_50_period"),
         candidate.get("ma_100_period"), candidate.get("ma_200_period"),
@@ -325,6 +415,7 @@ class SmartCandidateGenerator:
         parameter_importance=None,
         mutation_guidance=None,
         refinement_round=1,
+        strategy_adapter=None,
     ):
         if not grid or any(not values for values in grid.values()):
             raise ValueError("param_grid must contain at least one value per parameter")
@@ -334,6 +425,7 @@ class SmartCandidateGenerator:
         self.random = random.Random(seed)
         self.continuous_refinement = bool(continuous_refinement)
         self.refinement_round = max(1, int(refinement_round))
+        self.strategy_adapter = strategy_adapter
         supplied_importance = parameter_importance or {}
         self.parameter_importance = {
             key: max(0.01, float(supplied_importance.get(key, 1.0)))
@@ -347,9 +439,20 @@ class SmartCandidateGenerator:
         self.local_queue = []
         self.local_queued = set()
         self.baseline_attempted = False
-        defaults = build_ma_strategy_config(baseline_params)
+        defaults = (
+            strategy_adapter.default_values(baseline_params)
+            if strategy_adapter is not None
+            else build_ma_strategy_config(baseline_params)
+        )
         self.baseline = {
-            key: _nearest_value(values, getattr(defaults, key, values[0]))
+            key: _nearest_value(
+                values,
+                (
+                    defaults.get(key, values[0])
+                    if isinstance(defaults, dict)
+                    else getattr(defaults, key, values[0])
+                ),
+            )
             for key, values in self.grid.items()
         }
 
@@ -403,6 +506,10 @@ class SmartCandidateGenerator:
                 for key in dependent_keys:
                     if key in candidate:
                         candidate[key] = self.baseline[key]
+        if self.strategy_adapter is not None:
+            candidate = self.strategy_adapter.canonicalize_candidate(
+                candidate, self.baseline
+            )
         return candidate
 
     def _random_candidate(self):
@@ -551,7 +658,7 @@ class SmartCandidateGenerator:
                     if (
                         signature not in self.seen
                         and signature not in self.local_queued
-                        and is_valid_candidate(candidate)
+                        and is_valid_candidate(candidate, self.strategy_adapter)
                     ):
                         self.local_queue.append(candidate)
                         self.local_queued.add(signature)
@@ -576,7 +683,9 @@ class SmartCandidateGenerator:
                 candidate = self._random_candidate()
             candidate = self._canonicalize(candidate)
             signature = self._signature(candidate)
-            if signature in self.seen or not is_valid_candidate(candidate):
+            if signature in self.seen or not is_valid_candidate(
+                candidate, self.strategy_adapter
+            ):
                 continue
             self.seen.add(signature)
             candidates.append(candidate)
@@ -611,7 +720,9 @@ class SmartCandidateGenerator:
                 )
             candidate = self._canonicalize(candidate)
             signature = self._signature(candidate)
-            if signature in self.seen or not is_valid_candidate(candidate):
+            if signature in self.seen or not is_valid_candidate(
+                candidate, self.strategy_adapter
+            ):
                 continue
             self.seen.add(signature)
             candidates.append(candidate)
@@ -630,49 +741,66 @@ def _parse_bound(value):
         return value
 
 
+def _maximum_candidate_warmup(strategy_spec, base_tune, tasks, enabled=True):
+    """Use one shared warmup so worker data/indicator caches hit consistently."""
+    if not enabled:
+        return 0
+    adapter = _adapter_from_spec(strategy_spec)
+    warmups = []
+    for _candidate_id, params in tasks:
+        try:
+            warmups.append(adapter.warmup_candles({**base_tune, **params}))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return max(warmups, default=adapter.warmup_candles(base_tune))
+
+
 def _init_worker(
     start,
     end,
     base_tune=None,
     ignore_keyboard_interrupt=False,
     use_indicator_warmup=True,
+    strategy_spec="ma",
+    research=False,
+    indicator_warmup_candles=None,
 ):
     global _WORKER_START, _WORKER_END, _WORKER_BASE_TUNE
-    global _WORKER_USE_INDICATOR_WARMUP
+    global _WORKER_USE_INDICATOR_WARMUP, _WORKER_INDICATOR_WARMUP_CANDLES
+    global _WORKER_STRATEGY_SPEC, _WORKER_RESEARCH
     if ignore_keyboard_interrupt:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     _WORKER_START = start
     _WORKER_END = end
     _WORKER_BASE_TUNE = dict(base_tune or {})
     _WORKER_USE_INDICATOR_WARMUP = bool(use_indicator_warmup)
-    # Warm the largest repeated I/O cost once per process.
-    from trade_engine import TradeEngine
-    config = build_ma_strategy_config(base_tune)
-    TradeEngine.load_market_data(
-        start=start,
-        end=end,
-        warmup_candles=(
-            required_indicator_warmup(config)
-            if _WORKER_USE_INDICATOR_WARMUP else 0
-        ),
+    _WORKER_INDICATOR_WARMUP_CANDLES = (
+        max(0, int(indicator_warmup_candles))
+        if indicator_warmup_candles is not None else None
+    )
+    _WORKER_STRATEGY_SPEC = strategy_spec or "ma"
+    _WORKER_RESEARCH = bool(research)
+    # Warm the largest repeated I/O cost once per process when the adapter can.
+    _adapter_from_spec(_WORKER_STRATEGY_SPEC).preload(
+        start, end, _WORKER_BASE_TUNE, _WORKER_USE_INDICATOR_WARMUP,
+        _WORKER_INDICATOR_WARMUP_CANDLES,
     )
 
 
 def _evaluate_candidate(
-    index, params, base_tune, start, end, use_indicator_warmup=True
+    index, params, base_tune, start, end, use_indicator_warmup=True,
+    strategy_spec="ma", research=False, indicator_warmup_candles=None,
 ):
     started = time.perf_counter()
     try:
-        strategy_kwargs = {
-            "tune": {**base_tune, **params, "optimize": True},
-            "start": start,
-            "end": end,
-        }
-        # Keep the historical call shape for normal/new runs. The explicit
-        # override is only needed when resuming a pre-warm-up checkpoint.
-        if not use_indicator_warmup:
-            strategy_kwargs["use_indicator_warmup"] = False
-        result = ma_strategy(**strategy_kwargs)
+        result = _adapter_from_spec(strategy_spec).evaluate(
+            tune={**base_tune, **params},
+            start=start,
+            end=end,
+            use_indicator_warmup=use_indicator_warmup,
+            indicator_warmup_candles=indicator_warmup_candles,
+            research=research,
+        )
         error = None
     except Exception as exc:  # return errors to the parent without killing the run
         result = None
@@ -690,18 +818,26 @@ def _evaluate_task(task):
         _WORKER_START,
         _WORKER_END,
         _WORKER_USE_INDICATOR_WARMUP,
+        _WORKER_STRATEGY_SPEC,
+        _WORKER_RESEARCH,
+        _WORKER_INDICATOR_WARMUP_CANDLES,
     )
 
 
 def _evaluate_random_window_task(task):
     """Evaluate one full configuration on one independently selected time window."""
-    test_index, candidate_id, window_id, params, start, end = task
+    if len(task) == 6:
+        test_index, candidate_id, window_id, params, start, end = task
+        strategy_spec = "ma"
+    else:
+        test_index, candidate_id, window_id, params, start, end, strategy_spec = task
     started = time.perf_counter()
     try:
-        result = ma_strategy(
-            tune={**params, "optimize": True},
+        result = _adapter_from_spec(strategy_spec).evaluate(
+            tune=params,
             start=start,
             end=end,
+            research=True,
         )
         error = None
     except Exception as exc:
@@ -1249,8 +1385,8 @@ def _combine_auto_stage_records(stage_records):
     return combined
 
 
-def _latest_market_end():
-    """Return an exclusive timestamp immediately after the last valid candle."""
+def _market_data_coverage():
+    """Return explicit inclusive candle bounds and the exclusive dataset end."""
     from get_candle_index import _open_times
 
     open_times = _open_times().dropna()
@@ -1261,11 +1397,107 @@ def _latest_market_end():
     candle_delta = deltas.median() if not deltas.empty else timedelta(minutes=15)
     if candle_delta <= timedelta(0):
         candle_delta = timedelta(minutes=15)
-    return (open_times.iloc[-1] + candle_delta).strftime("%Y-%m-%d %H:%M:%S")
+    return {
+        "first_candle": open_times.iloc[0].strftime("%Y-%m-%d %H:%M:%S"),
+        "last_candle": open_times.iloc[-1].strftime("%Y-%m-%d %H:%M:%S"),
+        "end_exclusive": (
+            open_times.iloc[-1] + candle_delta
+        ).strftime("%Y-%m-%d %H:%M:%S"),
+        "interval_seconds": float(candle_delta.total_seconds()),
+    }
+
+
+def _latest_market_end():
+    """Return an exclusive timestamp immediately after the last valid candle."""
+    return _market_data_coverage()["end_exclusive"]
 
 
 def _timestamp_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _strategy_data_file(args, adapter=None):
+    explicit = getattr(args, "data_file", None)
+    if explicit:
+        return Path(explicit)
+    adapter = adapter or _adapter_from_args(args)
+    discovered = getattr(adapter.module, "DATA_FILE", None)
+    if discovered:
+        return Path(discovered)
+    if adapter.identifier == "ma_strategy:ma_strategy":
+        from fetch_calculate_data import DATA_FILE
+
+        return Path(DATA_FILE)
+    return None
+
+
+def _run_research_preflight(args, output_dir, resolved_config):
+    """Audit data and fingerprint the exact research environment once per run."""
+    mode = getattr(args, "data_audit", "off")
+    if mode == "off":
+        return None
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    adapter = _adapter_from_args(args)
+    workflow = (
+        "sealed_holdout"
+        if getattr(args, "sealed_holdout", False)
+        else "nested_walk_forward"
+        if getattr(args, "research", False)
+        else "auto_development"
+        if getattr(args, "auto", False)
+        else "standard_development"
+    )
+    data_file = _strategy_data_file(args, adapter)
+    if data_file is None:
+        payload = {
+            "passed": mode != "strict",
+            "warning": (
+                f"strategy {adapter.identifier} exposes no DATA_FILE; use --data-file "
+                "for auditable research"
+            ),
+        }
+        _write_json(output_dir / "market_data_audit.json", payload)
+        if mode == "strict":
+            raise ValueError(payload["warning"])
+        return payload
+    policies = {}
+    if mode == "warn":
+        from market_data_audit import DEFAULT_ISSUE_POLICIES
+
+        policies = {code: "warn" for code in DEFAULT_ISSUE_POLICIES}
+    report = audit_market_data(data_file, AuditConfig(policies=policies))
+    _write_json(output_dir / "market_data_audit.json", report.to_dict())
+    if mode == "strict":
+        report.raise_for_errors()
+    fingerprints = build_run_fingerprints(
+        data_file,
+        Path(__file__).resolve().parent,
+        resolved_config,
+        code_root=Path(__file__).resolve().parent,
+    )
+    manifest = {
+        "created_at": _timestamp_now(),
+        "workflow": workflow,
+        "strategy": adapter.identifier,
+        "data_file": str(data_file.resolve()),
+        "audit_summary": report.summary(),
+        "fingerprints": fingerprints.to_dict(),
+        "resolved_config": resolved_config,
+    }
+    _write_json(output_dir / "research_manifest.json", manifest)
+    manifest_dir = output_dir / "manifests"
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    run_id = fingerprints.combined_sha256[:12]
+    _write_json(
+        manifest_dir / f"{timestamp}_{workflow}_{run_id}.json", manifest
+    )
+    _write_json(
+        manifest_dir / f"{timestamp}_{workflow}_{run_id}_data_audit.json",
+        report.to_dict(),
+    )
+    return manifest
 
 
 def _show_loading_progress(label, completed, total):
@@ -1510,14 +1742,15 @@ def _read_resume_records(path, grid, base_tune):
 def _load_base_tune(args):
     source = getattr(args, "base_source", "config")
     if source == "config":
-        return {}, "strategy_config.py"
+        adapter = _adapter_from_args(args)
+        return {}, f"defaults exposed by {adapter.module_name}"
     path = Path(getattr(args, "base_params", "outputs/optimize/best_params.json"))
     if not path.is_file():
         raise FileNotFoundError(
             f"base parameter file not found: {path}. Run an optimization first or "
             "use --base-source=config."
         )
-    return load_ma_strategy_tune(path), str(path)
+    return _adapter_from_args(args).load_tune(path), str(path)
 
 
 def _validate_top_candidates(records, args, workers, chunksize):
@@ -1535,9 +1768,15 @@ def _validate_top_candidates(records, args, workers, chunksize):
     train_candles = _range_candle_count(args.start, args.end)
     validation_candles = _range_candle_count(validation_start, validation_end)
     tasks = [(record["index"], record["params"]) for record in candidates]
+    strategy_spec = _adapter_from_args(args).identifier
+    fixed_warmup = _maximum_candidate_warmup(strategy_spec, {}, tasks)
     if workers > 1:
         pool = multiprocessing.Pool(
-            workers, initializer=_init_worker, initargs=(start, end, {}, True)
+            workers,
+            initializer=_init_worker,
+            initargs=(
+                start, end, {}, True, True, strategy_spec, True, fixed_warmup,
+            ),
         )
         try:
             evaluated = list(pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize))
@@ -1550,7 +1789,11 @@ def _validate_top_candidates(records, args, workers, chunksize):
             pool.join()
     else:
         evaluated = [
-            _evaluate_candidate(index, params, {}, start, end)
+            _evaluate_candidate(
+                index, params, {}, start, end,
+                strategy_spec=strategy_spec, research=True,
+                indicator_warmup_candles=fixed_warmup,
+            )
             for index, params in tasks
         ]
 
@@ -1656,6 +1899,8 @@ def _auto_configuration(args, profile, grid, base_tune, base_description, resolv
     ranges = _auto_ranges(args, resolved_end)
     _validate_auto_ranges(ranges)
     return {
+        "strategy": _adapter_from_args(args).identifier,
+        "parameter_grid_source": getattr(args, "param_grid", None),
         "profile": profile,
         "parameter_grid": {key: list(values) for key, values in grid.items()},
         "base_source": base_description,
@@ -1665,6 +1910,8 @@ def _auto_configuration(args, profile, grid, base_tune, base_description, resolv
         "stress_top": args.auto_stress_top,
         "final_top": args.auto_final_top,
         "hall_size": args.auto_hall_size,
+        "snapshot_cycles": int(getattr(args, "snapshot_cycles", 50)),
+        "snapshot_top": int(getattr(args, "snapshot_top", 100)),
         "importance_target": args.auto_importance_target,
         "seed": args.seed,
         "minimum_trades": args.min_trades,
@@ -1699,6 +1946,16 @@ def _auto_feature_configuration(args):
 def _restore_auto_resume_args(args, state):
     """Restore persisted search settings before validating a legacy checkpoint."""
     config = state.get("config") or {}
+    saved_strategy = config.get("strategy", "ma_strategy:ma_strategy")
+    requested_strategy = _adapter_from_args(args).identifier
+    if saved_strategy != requested_strategy:
+        raise ValueError(
+            f"checkpoint strategy is {saved_strategy!r}, not {requested_strategy!r}"
+        )
+    args.strategy = saved_strategy
+    args._strategy_adapter = _adapter_from_spec(saved_strategy)
+    if "parameter_grid_source" in config:
+        args.param_grid = config.get("parameter_grid_source")
     if "indicator_warmup" not in config:
         # Checkpoints created before historical warm-up existed must retain their
         # original strategy semantics; otherwise old and new scores get mixed.
@@ -1722,6 +1979,8 @@ def _restore_auto_resume_args(args, state):
         "stress_top": "auto_stress_top",
         "final_top": "auto_final_top",
         "hall_size": "auto_hall_size",
+        "snapshot_cycles": "snapshot_cycles",
+        "snapshot_top": "snapshot_top",
         "importance_target": "auto_importance_target",
         "seed": "seed",
         "minimum_trades": "min_trades",
@@ -1768,7 +2027,7 @@ def _auto_bootstrap(args, grid):
     path = Path(getattr(args, "base_params", "outputs/optimize/best_params.json"))
     if not path.is_file():
         return None
-    saved = load_ma_strategy_tune(path)
+    saved = _adapter_from_args(args).load_tune(path)
     compatible = {key: saved[key] for key in grid if key in saved}
     if not compatible:
         return None
@@ -2649,7 +2908,18 @@ def _write_auto_stage_checkpoint(
     best = _auto_stage_best(records)
     if best is None:
         return None
-    effective_params = {**base_tune, **best["params"]}
+    selected_tune = {**base_tune, **best["params"]}
+    try:
+        checkpoint_adapter = resolve_strategy(
+            (state.get("config") or {}).get("strategy", "ma")
+        )
+    except (ModuleNotFoundError, ValueError):
+        checkpoint_adapter = None
+    effective_params = (
+        _freeze_strategy_tune(checkpoint_adapter, selected_tune)
+        if checkpoint_adapter is not None
+        else selected_tune
+    )
     checkpoint_dir = Path(cycle_dir) / "checkpoints" / stage
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     _write_json(checkpoint_dir / "best_params.json", effective_params)
@@ -2741,6 +3011,14 @@ def _run_auto_stage(
     use_indicator_warmup = bool(
         state["config"].get("indicator_warmup", False)
     )
+    strategy_spec = state["config"].get("strategy", "ma")
+    tasks = [
+        (candidate["candidate_id"], candidate["params"])
+        for candidate in pending
+    ]
+    fixed_warmup = _maximum_candidate_warmup(
+        strategy_spec, base_tune, tasks, use_indicator_warmup
+    )
 
     with results_path.open("a" if append else "w", newline="", encoding="utf-8") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -2755,8 +3033,11 @@ def _run_auto_stage(
                     _parse_bound(range_end),
                     base_tune,
                     True,
-                    use_indicator_warmup,
-                ),
+                     use_indicator_warmup,
+                     strategy_spec,
+                     False,
+                     fixed_warmup,
+                 ),
             )
         else:
             _init_worker(
@@ -2765,12 +3046,11 @@ def _run_auto_stage(
                 base_tune,
                 False,
                 use_indicator_warmup,
+                strategy_spec,
+                False,
+                fixed_warmup,
             )
 
-        tasks = [
-            (candidate["candidate_id"], candidate["params"])
-            for candidate in pending
-        ]
         if pool is not None:
             evaluated = pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize)
         else:
@@ -2782,6 +3062,9 @@ def _run_auto_stage(
                     _parse_bound(range_start),
                     _parse_bound(range_end),
                     use_indicator_warmup,
+                    strategy_spec,
+                    False,
+                    fixed_warmup,
                 )
                 for candidate_id, params in tasks
             )
@@ -3179,7 +3462,9 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
     _write_json(output_dir / "auto_summary.json", summary)
 
 
-def _merge_hall_of_fame(hall, finalists, cycle, keys, base_tune, limit):
+def _merge_hall_of_fame(
+    hall, finalists, cycle, keys, base_tune, limit, strategy_adapter=None
+):
     by_signature = {
         _candidate_signature(record["params"], keys): record for record in hall
     }
@@ -3189,7 +3474,13 @@ def _merge_hall_of_fame(hall, finalists, cycle, keys, base_tune, limit):
         record = {
             **finalist,
             "cycle": cycle,
-            "effective_params": {**base_tune, **finalist["params"]},
+            "effective_params": (
+                _freeze_strategy_tune(
+                    strategy_adapter, {**base_tune, **finalist["params"]}
+                )
+                if strategy_adapter is not None
+                else {**base_tune, **finalist["params"]}
+            ),
         }
         signature = _candidate_signature(record["params"], keys)
         previous = by_signature.get(signature)
@@ -3208,14 +3499,23 @@ def run_auto_optimization(args, grid=None):
     resume_existing = bool(args.resume or state_path.is_file())
     saved_state = _load_json(state_path) if resume_existing and state_path.is_file() else None
     saved_config = _restore_auto_resume_args(args, saved_state) if saved_state else None
-    profile = getattr(args, "profile", None) or "full"
+    profiles = _profiles_from_args(args)
+    profile = getattr(args, "profile", None) or (
+        "full" if "full" in profiles else next(iter(profiles))
+    )
     if saved_config and saved_config.get("parameter_grid"):
         grid = {
             key: list(values)
             for key, values in saved_config["parameter_grid"].items()
         }
     else:
-        grid = PARAMETER_PROFILES[profile] if grid is None else grid
+        if grid is None:
+            if profile not in profiles:
+                raise ValueError(
+                    f"profile {profile!r} is not available for strategy "
+                    f"{_adapter_from_args(args).identifier}; choose from {', '.join(profiles)}"
+                )
+            grid = profiles[profile]
     keys = tuple(grid)
     if saved_config:
         base_tune = dict(saved_config.get("base_tune") or {})
@@ -3239,6 +3539,16 @@ def run_auto_optimization(args, grid=None):
             )
         if state.get("version", 1) not in LEGACY_AUTO_STATE_VERSIONS:
             raise ValueError("auto checkpoint version is not compatible")
+        saved_runtime_config = state.get("config") or {}
+        saved_runtime_config.setdefault("strategy", "ma_strategy:ma_strategy")
+        saved_runtime_config.setdefault("parameter_grid_source", None)
+        saved_runtime_config.setdefault(
+            "snapshot_cycles", int(getattr(args, "snapshot_cycles", 50))
+        )
+        saved_runtime_config.setdefault(
+            "snapshot_top", int(getattr(args, "snapshot_top", 100))
+        )
+        state["config"] = saved_runtime_config
         if state.get("config") != config:
             raise ValueError(
                 "auto checkpoint settings differ from this command; use the original "
@@ -3274,6 +3584,15 @@ def run_auto_optimization(args, grid=None):
             state["migrated_from_version"] = state.get("version", 1)
             state["version"] = AUTO_STATE_VERSION
         hall = _load_json(output_dir / "hall_of_fame.json", []) or []
+        resume_adapter = _adapter_from_args(args)
+        for record in hall:
+            record["effective_params"] = _freeze_strategy_tune(
+                resume_adapter,
+                record.get("effective_params")
+                or {**base_tune, **record.get("params", {})},
+            )
+        if hall:
+            _write_json(output_dir / "hall_of_fame.json", hall)
         importance = _load_json(output_dir / "parameter_importance.json", {}) or {}
         mutation_guidance = _load_json(
             output_dir / "mutation_guidance.json", {}
@@ -3366,6 +3685,28 @@ def run_auto_optimization(args, grid=None):
             f"parameters loaded from {bootstrap['source']}"
         )
 
+    completed_at_resume = int(state.get("cycles_completed", 0) or 0)
+    snapshot_every = max(1, int(getattr(args, "snapshot_cycles", 50)))
+    if (
+        resume_existing
+        and hall
+        and completed_at_resume > 0
+        and completed_at_resume % snapshot_every == 0
+    ):
+        expected_snapshot = (
+            output_dir / "snapshots" / f"cycles_{completed_at_resume:06d}"
+        )
+        if not (expected_snapshot / "manifest.json").is_file():
+            recovered_snapshot = _write_auto_cycle_snapshot(
+                output_dir,
+                hall,
+                completed_at_resume,
+                getattr(args, "snapshot_top", 100),
+                grid,
+                state,
+            )
+            print(f"Recovered missing cycle-boundary snapshot: {recovered_snapshot}")
+
     cycle_limit = max(0, int(args.auto_cycles))
     # Disk history is loaded once per process. Subsequent cycles extend these
     # caches with only their new plans/results instead of rescanning everything.
@@ -3455,6 +3796,7 @@ def run_auto_optimization(args, grid=None):
                     },
                     mutation_guidance=mutation_guidance,
                     refinement_round=max(1, cycle - 1),
+                    strategy_adapter=_adapter_from_args(args),
                 )
                 generator.seen.update(seen_cache)
                 surrogate_ready = (
@@ -3789,7 +4131,13 @@ def run_auto_optimization(args, grid=None):
                     output_dir / "mutation_guidance.json", mutation_guidance
                 )
             hall = _merge_hall_of_fame(
-                hall, finalists, cycle, keys, base_tune, args.auto_hall_size
+                hall,
+                finalists,
+                cycle,
+                keys,
+                base_tune,
+                args.auto_hall_size,
+                _adapter_from_args(args),
             )
             state.update({
                 "cycles_completed": state["cycles_completed"] + 1,
@@ -3804,6 +4152,21 @@ def run_auto_optimization(args, grid=None):
                 output_dir, hall, importance, state, keys,
                 excel_enabled=bool(args.excel_top),
             )
+            completed_cycles = int(state["cycles_completed"])
+            snapshot_every = max(1, int(getattr(args, "snapshot_cycles", 50)))
+            if completed_cycles % snapshot_every == 0:
+                snapshot_dir = _write_auto_cycle_snapshot(
+                    output_dir,
+                    hall,
+                    completed_cycles,
+                    getattr(args, "snapshot_top", 100),
+                    grid,
+                    state,
+                )
+                print(
+                    f"Snapshot published: top {min(len(hall), int(getattr(args, 'snapshot_top', 100)))} "
+                    f"at {snapshot_dir}"
+                )
             _safe_cleanup_completed_cycle(cycle_dir)
             best_text = (
                 f"{hall[0]['robust_score']:.4f}" if hall else "no qualified finalist"
@@ -3968,12 +4331,94 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
     fieldnames = list(rows[0])
     output_dir = Path(output_dir)
     _write_rows_atomic(output_dir / "top_100.csv", fieldnames, rows)
+    _write_json(output_dir / f"top_{max(1, int(top_n))}.json", ranked)
     _write_json(output_dir / "best_params.json", ranked[0]["effective_params"])
     if snapshot_dir is not None:
         snapshot_dir = Path(snapshot_dir)
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         _write_rows_atomic(snapshot_dir / "top_100.csv", fieldnames, rows)
+        _write_json(
+            snapshot_dir / f"top_{max(1, int(top_n))}.json", ranked
+        )
         _write_json(snapshot_dir / "best_params.json", ranked[0]["effective_params"])
+        params_dir = snapshot_dir / "params"
+        params_dir.mkdir(parents=True, exist_ok=True)
+        for rank, record in enumerate(ranked, 1):
+            _write_json(
+                params_dir / f"rank_{rank:03d}_params.json",
+                record["effective_params"],
+            )
+
+
+def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
+    """Publish reusable top candidates at a deterministic cycle boundary."""
+    output_dir = Path(output_dir)
+    snapshot_dir = output_dir / "snapshots" / f"cycles_{int(cycle):06d}"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    top_n = max(1, int(top_n))
+    plateau = parameter_plateau_scores(hall, grid)
+    enriched = []
+    for record in hall:
+        candidate_id = str(record.get("candidate_id", ""))
+        enriched.append({**record, **plateau.get(candidate_id, {})})
+    enriched.sort(
+        key=lambda item: (
+            _finite_number(item.get("plateau_adjusted_score"))
+            if _finite_number(item.get("plateau_adjusted_score")) is not None
+            else -math.inf,
+            _finite_number(item.get("robust_score"))
+            if _finite_number(item.get("robust_score")) is not None
+            else -math.inf,
+        ),
+        reverse=True,
+    )
+    selected = enriched[:top_n]
+    _write_json(snapshot_dir / f"top_{top_n}.json", selected)
+    if selected:
+        rows = [
+            _flatten_hall_record(record, tuple(grid), rank)
+            for rank, record in enumerate(selected, 1)
+        ]
+        for row, record in zip(rows, selected):
+            for metric in (
+                "neighbour_count", "neighbour_method", "median_grid_distance",
+                "median_neighbour_score",
+                "plateau_stability", "plateau_adjusted_score",
+            ):
+                row[metric] = record.get(metric)
+        _write_rows_atomic(snapshot_dir / f"top_{top_n}.csv", list(rows[0]), rows)
+        _write_json(snapshot_dir / "best_params.json", selected[0]["effective_params"])
+        params_dir = snapshot_dir / "params"
+        params_dir.mkdir(parents=True, exist_ok=True)
+        for rank, record in enumerate(selected, 1):
+            _write_json(
+                params_dir / f"rank_{rank:03d}_params.json",
+                record["effective_params"],
+            )
+    run_manifest = _load_json(output_dir / "research_manifest.json", {}) or {}
+    auto_ranges = state.get("config", {}).get("ranges", {}) or {}
+    development_range = auto_ranges.get("final")
+    manifest = {
+        "snapshot_schema_version": 1,
+        "cycle": int(cycle),
+        "requested_top": top_n,
+        "saved_candidates": len(selected),
+        "strategy": state.get("config", {}).get(
+            "strategy", "ma_strategy:ma_strategy"
+        ),
+        "ranking": "plateau_adjusted_score, then robust_score",
+        "development_range": development_range,
+        "development_end_exclusive": (
+            development_range[1]
+            if isinstance(development_range, (list, tuple)) and len(development_range) == 2
+            else None
+        ),
+        "holdout_status": "development results; sealed holdout not consumed",
+        "run_fingerprints": run_manifest.get("fingerprints"),
+        "created_at": _timestamp_now(),
+    }
+    _write_json(snapshot_dir / "manifest.json", manifest)
+    return snapshot_dir
 
 
 def _generate_random_audit_windows(
@@ -4119,6 +4564,7 @@ def _run_random_window_audit(args, candidates, output_dir, block, final_end):
     if candidate_count <= 0 or int(args.random_audit_tests) <= 0:
         return None
     selected = list(candidates)[:candidate_count]
+    strategy_spec = _adapter_from_args(args).identifier
     window_count = max(1, int(args.random_audit_tests) // candidate_count)
     windows = _generate_random_audit_windows(
         args.random_audit_earliest,
@@ -4141,6 +4587,7 @@ def _run_random_window_audit(args, candidates, output_dir, block, final_end):
                 candidate["effective_params"],
                 window["start"],
                 window["end"],
+                strategy_spec,
             ))
     tasks = tasks[:int(args.random_audit_tests)]
     workers = max(1, int(args.workers))
@@ -4245,6 +4692,1256 @@ def _run_random_window_audit(args, candidates, output_dir, block, final_end):
     if summaries:
         _write_json(output_dir / "best_params.json", summaries[0]["effective_params"])
     return summaries[0] if summaries else None
+
+
+def _first_primes(count):
+    primes = []
+    candidate = 2
+    while len(primes) < count:
+        if all(candidate % prime for prime in primes if prime * prime <= candidate):
+            primes.append(candidate)
+        candidate += 1
+    return primes
+
+
+def _van_der_corput(index, base):
+    value = 0.0
+    denominator = 1.0
+    while index:
+        index, remainder = divmod(index, base)
+        denominator *= base
+        value += remainder / denominator
+    return value
+
+
+def _space_filling_candidates(grid, count, baseline, adapter, seed=42):
+    """Deterministic Halton coverage for the unbiased research candidate pool."""
+    generator = SmartCandidateGenerator(
+        grid,
+        seed=seed,
+        baseline_params=baseline,
+        strategy_adapter=adapter,
+    )
+    keys = tuple(grid)
+    primes = _first_primes(len(keys))
+    candidates = []
+    seen = set()
+    baseline_candidate = generator._canonicalize(dict(generator.baseline))
+    if is_valid_candidate(baseline_candidate, adapter):
+        candidates.append(baseline_candidate)
+        seen.add(_candidate_signature(baseline_candidate, keys))
+    index = max(1, int(seed))
+    maximum = max(1000, count * 100)
+    attempts = 0
+    while len(candidates) < count and attempts < maximum:
+        attempts += 1
+        candidate = {}
+        for dimension, key in enumerate(keys):
+            values = list(grid[key])
+            fraction = _van_der_corput(index, primes[dimension])
+            position = min(len(values) - 1, int(fraction * len(values)))
+            candidate[key] = values[position]
+        index += 1
+        candidate = generator._canonicalize(candidate)
+        signature = _candidate_signature(candidate, keys)
+        if signature in seen or not is_valid_candidate(candidate, adapter):
+            continue
+        seen.add(signature)
+        candidates.append(candidate)
+    return candidates
+
+
+def _load_research_seed_candidates(source, grid, baseline, adapter):
+    """Load reusable Auto/snapshot winners into a fixed research candidate pool."""
+    if not source:
+        return []
+    path = Path(source)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, dict) and isinstance(payload.get("candidates"), list):
+        rows = payload["candidates"]
+    elif isinstance(payload, list):
+        rows = payload
+    elif isinstance(payload, dict):
+        rows = [payload]
+    else:
+        raise ValueError("--research-seeds must contain a parameter object or list")
+    generator = SmartCandidateGenerator(
+        grid,
+        baseline_params=baseline,
+        strategy_adapter=adapter,
+    )
+    seeds = []
+    seen = set()
+    keys = tuple(grid)
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        source_params = (
+            row.get("effective_params")
+            or row.get("params")
+            or row
+        )
+        if not isinstance(source_params, dict):
+            continue
+        candidate = {
+            key: source_params.get(key, generator.baseline[key])
+            for key in keys
+        }
+        candidate = generator._canonicalize(candidate)
+        signature = _candidate_signature(candidate, keys)
+        if signature in seen or not is_valid_candidate(candidate, adapter):
+            continue
+        seen.add(signature)
+        seeds.append(candidate)
+    if not seeds:
+        raise ValueError(
+            f"no compatible candidates were found in research seed file: {path}"
+        )
+    return seeds
+
+
+def _research_seed_provenance(source, folds, strategy_identifier):
+    """Verify that performance-selected seeds stopped before the first OOS bar."""
+    first_oos_start = folds[0]["test"][0] if folds else None
+    if not source:
+        return {
+            "status": "no_performance_selected_seeds",
+            "safe_for_oos_claim": True,
+            "source": None,
+            "manifest": None,
+            "seed_development_end": None,
+            "seed_development_end_index": None,
+            "first_oos_start_index": first_oos_start,
+            "strategy_matches": True,
+        }
+
+    source_path = Path(source)
+    manifest_candidates = [
+        source_path.parent / "manifest.json",
+        source_path.parent / "research_manifest.json",
+    ]
+    # Cycle snapshots live under <campaign>/snapshots/cycles_NNNNNN/.
+    if len(source_path.parents) >= 3:
+        manifest_candidates.append(source_path.parents[2] / "research_manifest.json")
+    manifest_path = next((path for path in manifest_candidates if path.is_file()), None)
+    manifest = _load_json(manifest_path, {}) if manifest_path else {}
+    manifest = manifest or {}
+    manifest_strategy = manifest.get("strategy")
+    strategy_matches = (
+        manifest_strategy in (None, strategy_identifier)
+    )
+    development_range = manifest.get("development_range")
+    if not development_range:
+        resolved_config = manifest.get("resolved_config", {}) or {}
+        development_range = (
+            (resolved_config.get("ranges", {}) or {}).get("final")
+            or (resolved_config.get("auto_ranges", {}) or {}).get("final")
+        )
+    development_end = manifest.get("development_end_exclusive")
+    if development_end is None and isinstance(development_range, (list, tuple)):
+        if len(development_range) == 2:
+            development_end = development_range[1]
+
+    development_end_index = None
+    if development_end is not None:
+        try:
+            development_end_index = _bound_index(development_end)
+        except (IndexError, OSError, TypeError, ValueError):
+            development_end_index = None
+
+    if not strategy_matches:
+        status = "strategy_mismatch"
+        safe = False
+    elif development_end_index is None or first_oos_start is None:
+        status = "unverifiable_seed_history"
+        safe = False
+    elif development_end_index <= first_oos_start:
+        status = "verified_pre_oos"
+        safe = True
+    else:
+        status = "overlaps_reporting_oos"
+        safe = False
+    return {
+        "status": status,
+        "safe_for_oos_claim": safe,
+        "source": str(source_path),
+        "manifest": str(manifest_path) if manifest_path else None,
+        "manifest_strategy": manifest_strategy,
+        "seed_development_range": development_range,
+        "seed_development_end": development_end,
+        "seed_development_end_index": development_end_index,
+        "first_oos_start_index": first_oos_start,
+        "strategy_matches": strategy_matches,
+    }
+
+
+def _nested_walk_forward_ranges(
+    start,
+    end,
+    *,
+    train_months=30,
+    validation_months=6,
+    test_months=6,
+    step_months=6,
+    rolling=False,
+    purge_candles=0,
+):
+    """Build chronological train -> validation -> untouched OOS folds."""
+    start_index = _bound_index(start)
+    end_index = _bound_index(end)
+    candles_per_month = round(CANDLES_PER_YEAR_15M / 12)
+    train_width = max(1, round(float(train_months) * candles_per_month))
+    validation_width = max(1, round(float(validation_months) * candles_per_month))
+    test_width = max(1, round(float(test_months) * candles_per_month))
+    step_width = max(1, round(float(step_months) * candles_per_month))
+    purge_candles = max(0, int(purge_candles))
+    test_start = start_index + train_width + validation_width + 2 * purge_candles
+    folds = []
+    while test_start + test_width <= end_index:
+        validation_end = test_start - purge_candles
+        validation_start = validation_end - validation_width
+        train_end = validation_start - purge_candles
+        train_start = max(start_index, train_end - train_width) if rolling else start_index
+        if train_start < train_end and validation_start < validation_end:
+            folds.append({
+                "fold": len(folds) + 1,
+                "train": [train_start, train_end],
+                "validation": [validation_start, validation_end],
+                "test": [test_start, test_start + test_width],
+                "purge_candles": purge_candles,
+            })
+        test_start += step_width
+    return folds
+
+
+def _evaluate_research_candidates(
+    args, candidates, start, end, base_tune, *, research=False
+):
+    if not candidates:
+        return []
+    adapter = _adapter_from_args(args)
+    strategy_spec = adapter.identifier
+    workers = min(max(1, int(args.workers)), len(candidates))
+    chunksize = args.chunksize or max(1, len(candidates) // max(1, workers * 8))
+    tasks = [(candidate["candidate_id"], candidate["params"]) for candidate in candidates]
+    fixed_warmup = _maximum_candidate_warmup(
+        strategy_spec, base_tune, tasks, enabled=True
+    )
+    if workers > 1:
+        pool = multiprocessing.Pool(
+            workers,
+            initializer=_init_worker,
+            initargs=(
+                _parse_bound(start), _parse_bound(end), base_tune, True, True,
+                strategy_spec, research, fixed_warmup,
+            ),
+        )
+        try:
+            evaluated = list(pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize))
+        except BaseException:
+            pool.terminate()
+            pool.join()
+            raise
+        else:
+            pool.close()
+            pool.join()
+    else:
+        _init_worker(
+            _parse_bound(start), _parse_bound(end), base_tune,
+            strategy_spec=strategy_spec, research=research,
+            indicator_warmup_candles=fixed_warmup,
+        )
+        evaluated = [
+            _evaluate_candidate(
+                candidate_id, params, base_tune, _parse_bound(start), _parse_bound(end),
+                strategy_spec=strategy_spec, research=research,
+                indicator_warmup_candles=fixed_warmup,
+            )
+            for candidate_id, params in tasks
+        ]
+    candidate_map = {candidate["candidate_id"]: candidate for candidate in candidates}
+    range_candles = _range_candle_count(start, end)
+    records = []
+    for candidate_id, params, result, duration, error in evaluated:
+        objective = None
+        if not error:
+            research_min_trades = int(
+                getattr(args, "min_fold_trades", 0) or 0
+            )
+            drawdown_limits = [
+                value
+                for value in (
+                    getattr(args, "max_drawdown", None),
+                    getattr(args, "research_max_drawdown", None),
+                )
+                if value is not None
+            ]
+            value = _objective_score(
+                result,
+                min_trades=max(
+                    int(getattr(args, "min_trades", 0) or 0),
+                    research_min_trades,
+                ),
+                max_drawdown=min(drawdown_limits) if drawdown_limits else None,
+            )
+            objective = value if math.isfinite(value) else None
+        records.append({
+            "candidate_id": candidate_id,
+            "params": candidate_map[candidate_id]["params"],
+            "result": dict(result or {}),
+            "objective_score": objective,
+            "range_candles": range_candles,
+            "duration": duration,
+            "error": error,
+        })
+    return records
+
+
+def _research_selection_records(
+    train_records, validation_records, parameter_grid=None
+):
+    train_percentiles = _score_percentiles(
+        train_records, score_getter=lambda row: row.get("objective_score")
+    )
+    validation_percentiles = _score_percentiles(
+        validation_records, score_getter=lambda row: row.get("objective_score")
+    )
+    train_map = {record["candidate_id"]: record for record in train_records}
+    selected = []
+    for record in validation_records:
+        candidate_id = record["candidate_id"]
+        if candidate_id not in train_percentiles or candidate_id not in validation_percentiles:
+            continue
+        train_rank = train_percentiles[candidate_id]
+        validation_rank = validation_percentiles[candidate_id]
+        gap = max(0.0, train_rank - validation_rank)
+        robust = (
+            0.30 * train_rank
+            + 0.50 * validation_rank
+            + 0.20 * min(train_rank, validation_rank)
+            - 0.15 * gap
+        )
+        selected.append({
+            "candidate_id": candidate_id,
+            "params": record["params"],
+            "robust_score": robust,
+            "train_percentile": train_rank,
+            "validation_percentile": validation_rank,
+            "training_result": train_map[candidate_id]["result"],
+            "validation_result": record["result"],
+        })
+    if parameter_grid and selected:
+        plateau = parameter_plateau_scores(
+            selected, parameter_grid, score_key="robust_score"
+        )
+        for record in selected:
+            record.update(plateau.get(record["candidate_id"], {}))
+    selected.sort(
+        key=lambda row: row.get("plateau_adjusted_score", row["robust_score"]),
+        reverse=True,
+    )
+    return selected
+
+
+def _parameter_stability_report(folds, parameter_grid):
+    """Summarize how often fold selection changes each optimized parameter."""
+    selections = [
+        fold.get("selected_params", {})
+        for fold in folds
+        if fold.get("selected_params")
+    ]
+    parameters = {}
+    for key, configured_values in parameter_grid.items():
+        values = [selection.get(key) for selection in selections if key in selection]
+        if not values:
+            continue
+        counts = {}
+        originals = {}
+        for value in values:
+            token = json.dumps(value, sort_keys=True, ensure_ascii=False)
+            counts[token] = counts.get(token, 0) + 1
+            originals[token] = value
+        ordered = sorted(
+            counts,
+            key=lambda token: (-counts[token], token),
+        )
+        mode_token = ordered[0]
+        switches = sum(left != right for left, right in zip(values, values[1:]))
+        positions = [
+            grid_ordinal_position(configured_values, value)
+            for value in values
+        ]
+        finite_positions = [value for value in positions if value is not None]
+        normalized_spread = None
+        if finite_positions and len(configured_values) > 1:
+            normalized_spread = statistics.pstdev(finite_positions) / (
+                len(configured_values) - 1
+            )
+        parameters[key] = {
+            "selection_count": len(values),
+            "consensus_value": originals[mode_token],
+            "consensus_ratio": counts[mode_token] / len(values),
+            "unique_values": len(counts),
+            "switches_between_folds": switches,
+            "normalized_grid_spread": normalized_spread,
+            "value_counts": [
+                {"value": originals[token], "count": counts[token]}
+                for token in ordered
+            ],
+        }
+    consensus = [record["consensus_ratio"] for record in parameters.values()]
+    spreads = [
+        record["normalized_grid_spread"]
+        for record in parameters.values()
+        if record["normalized_grid_spread"] is not None
+    ]
+    mutable_records = [
+        parameters[key]
+        for key, configured_values in parameter_grid.items()
+        if len(configured_values) > 1 and key in parameters
+    ]
+    mutable_consensus = [
+        record["consensus_ratio"] for record in mutable_records
+    ]
+    mutable_spreads = [
+        record["normalized_grid_spread"]
+        for record in mutable_records
+        if record["normalized_grid_spread"] is not None
+    ]
+    return {
+        "selected_fold_count": len(selections),
+        "mean_parameter_consensus": statistics.fmean(consensus) if consensus else None,
+        "mean_normalized_grid_spread": statistics.fmean(spreads) if spreads else None,
+        "mutable_parameter_count": len(mutable_records),
+        "mean_mutable_parameter_consensus": (
+            statistics.fmean(mutable_consensus) if mutable_consensus else None
+        ),
+        "mean_mutable_normalized_grid_spread": (
+            statistics.fmean(mutable_spreads) if mutable_spreads else None
+        ),
+        "parameters": parameters,
+    }
+
+
+def _monthly_sharpe(result):
+    returns = [
+        float(value) for value in (result or {}).get("monthly_returns", [])
+        if _finite_number(value) is not None
+    ]
+    if len(returns) < 2:
+        return None
+    deviation = statistics.stdev(returns)
+    return statistics.fmean(returns) / deviation if deviation > 0 else None
+
+
+def run_nested_walk_forward(args, grid=None):
+    """Run nested chronological selection and publish a stitched OOS report."""
+    profiles = _profiles_from_args(args)
+    profile = args.profile if getattr(args, "profile", None) in profiles else next(iter(profiles))
+    grid = profiles[profile] if grid is None else grid
+    base_tune, base_description = _load_base_tune(args)
+    adapter = _adapter_from_args(args)
+    resolved_end = (
+        _latest_market_end() if args.wf_end == "latest" else args.wf_end
+    )
+    folds = _nested_walk_forward_ranges(
+        args.wf_start,
+        resolved_end,
+        train_months=args.wf_train_months,
+        validation_months=args.wf_validation_months,
+        test_months=args.wf_test_months,
+        step_months=args.wf_step_months,
+        rolling=args.wf_rolling,
+        purge_candles=args.wf_purge_candles,
+    )
+    if not folds:
+        raise ValueError("walk-forward range is too short for the requested windows")
+    output_dir = Path(args.output_dir) / "walk_forward_research"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    requested_candidate_count = max(1, int(args.research_tests))
+    seed_params = _load_research_seed_candidates(
+        getattr(args, "research_seeds", None),
+        grid,
+        base_tune,
+        adapter,
+    )
+    seed_provenance = _research_seed_provenance(
+        getattr(args, "research_seeds", None), folds, adapter.identifier
+    )
+    if seed_params and seed_provenance["status"] == "strategy_mismatch":
+        raise ValueError(
+            "research seed snapshot belongs to another strategy; choose a matching "
+            "snapshot instead of mixing strategy parameter histories"
+        )
+    if seed_params and not seed_provenance["safe_for_oos_claim"]:
+        if not getattr(args, "allow_research_seed_overlap", False):
+            raise ValueError(
+                "research seed history is not verified to end before the first OOS "
+                f"window ({seed_provenance['status']}); use a pre-OOS snapshot or "
+                "--allow-research-seed-overlap for a diagnostic run that can never "
+                "be accepted"
+            )
+        print(
+            "WARNING: research seeds are not independent of OOS; this run is "
+            "marked contaminated and cannot pass all acceptance gates."
+        )
+    halton_params = _space_filling_candidates(
+        grid,
+        min(requested_candidate_count, grid_size(grid)),
+        base_tune,
+        adapter,
+        seed=args.seed,
+    )
+    candidate_params = []
+    seen_candidate_params = set()
+    for params in [*seed_params, *halton_params]:
+        signature = _candidate_signature(params, tuple(grid))
+        if signature in seen_candidate_params:
+            continue
+        seen_candidate_params.add(signature)
+        candidate_params.append(params)
+        if len(candidate_params) >= requested_candidate_count:
+            break
+    seed_signatures = {
+        _candidate_signature(params, tuple(grid)) for params in seed_params
+    }
+    candidates = [
+        {
+            "candidate_id": f"research-{index:06d}",
+            "params": params,
+            "source": (
+                "snapshot_seed"
+                if _candidate_signature(params, tuple(grid)) in seed_signatures
+                else "halton"
+            ),
+        }
+        for index, params in enumerate(candidate_params, 1)
+    ]
+    if not candidates:
+        raise ValueError("research candidate pool is empty after validation")
+    used_seed_count = sum(
+        candidate["source"] == "snapshot_seed" for candidate in candidates
+    )
+    preflight_manifest = _load_json(
+        Path(args.output_dir) / "research_manifest.json", {}
+    ) or {}
+    environment_fingerprints = preflight_manifest.get("fingerprints", {})
+    plan = {
+        "strategy": adapter.identifier,
+        "profile": profile,
+        "base_source": base_description,
+        "base_tune": base_tune,
+        "parameter_grid": {key: list(values) for key, values in grid.items()},
+        "candidate_count": len(candidates),
+        "candidate_pool_sha256": fingerprint_config(candidates),
+        "candidate_generation": (
+            "snapshot seeds followed by deterministic Halton space filling"
+            if seed_params
+            else "deterministic Halton space filling"
+        ),
+        "research_seed_source": getattr(args, "research_seeds", None),
+        "research_seed_sha256": (
+            fingerprint_config(seed_params) if seed_params else None
+        ),
+        "research_seed_loaded_count": len(seed_params),
+        "research_seed_count": used_seed_count,
+        "research_seed_provenance": seed_provenance,
+        "environment_fingerprints": {
+            "data_sha256": environment_fingerprints.get("data_sha256"),
+            "code_sha256": environment_fingerprints.get("code_sha256"),
+        },
+        "folds": folds,
+        "selection_feedback": "train and inner validation only; OOS tests never feed selection",
+        "settings": {
+            "research_tests": args.research_tests,
+            "research_validation_top": args.research_validation_top,
+            "research_pbo_candidates": args.research_pbo_candidates,
+            "min_fold_trades": args.min_fold_trades,
+            "min_total_oos_trades": args.min_total_oos_trades,
+            "max_oos_liquidations": args.max_oos_liquidations,
+            "research_max_drawdown": args.research_max_drawdown,
+            "max_oos_drawdown": args.max_oos_drawdown,
+            "min_oos_folds": args.min_oos_folds,
+            "min_positive_fold_ratio": args.min_positive_fold_ratio,
+            "min_dsr_probability": args.min_dsr_probability,
+            "max_pbo": args.max_pbo,
+            "min_parameter_consensus": args.min_parameter_consensus,
+            "max_parameter_spread": args.max_parameter_spread,
+            "bootstrap_samples": args.bootstrap_samples,
+            "bootstrap_confidence": args.bootstrap_confidence,
+            "require_positive_ci": args.require_positive_ci,
+            "allow_research_seed_overlap": bool(
+                getattr(args, "allow_research_seed_overlap", False)
+            ),
+            "seed": args.seed,
+        },
+    }
+    plan["run_fingerprint"] = fingerprint_config(plan)
+    plan_path = output_dir / "walk_forward_plan.json"
+    saved_plan = _load_json(plan_path)
+    if saved_plan is not None:
+        if not getattr(args, "resume", False):
+            raise FileExistsError(
+                f"walk-forward research already exists in {output_dir}; use "
+                "--resume for the identical plan or choose a new --output-dir"
+            )
+        if saved_plan.get("run_fingerprint") != plan["run_fingerprint"]:
+            raise ValueError(
+                "walk-forward checkpoint settings differ from this command; "
+                "resume with the original strategy, grid, folds, baseline, and gates"
+            )
+    elif getattr(args, "resume", False):
+        raise FileNotFoundError(
+            f"walk-forward checkpoint not found: {plan_path}"
+        )
+    else:
+        _write_json(plan_path, plan)
+        _write_json(output_dir / "candidate_pool.json", candidates)
+    checkpoint_dir = output_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / "research_state.json"
+    _write_json(state_path, {
+        "status": "running",
+        "run_fingerprint": plan["run_fingerprint"],
+        "updated_at": _timestamp_now(),
+    })
+
+    fold_summaries = []
+    pbo_ids = {candidate["candidate_id"] for candidate in candidates[:args.research_pbo_candidates]}
+    pbo_by_candidate = {candidate_id: [] for candidate_id in pbo_ids}
+    validation_sharpes = {}
+    winner_counts = {}
+    winner_selection_scores = {}
+    trial_ledger = {
+        "unique_candidate_configurations": len(candidates),
+        "fold_count": len(folds),
+        "train_evaluations": 0,
+        "inner_validation_evaluations": 0,
+        "reporting_only_oos_evaluations": 0,
+        "failed_evaluations": 0,
+        "oos_evaluations_used_for_selection": 0,
+    }
+    checkpoint_counter_keys = (
+        "train_evaluations",
+        "inner_validation_evaluations",
+        "reporting_only_oos_evaluations",
+        "failed_evaluations",
+    )
+
+    def save_fold_checkpoint(
+        fold, summary, fold_pbo_values, fold_validation_sharpes, before
+    ):
+        trial_delta = {
+            key: trial_ledger[key] - before[key]
+            for key in checkpoint_counter_keys
+        }
+        payload = {
+            "run_fingerprint": plan["run_fingerprint"],
+            "fold": fold["fold"],
+            "summary": summary,
+            "pbo_values": fold_pbo_values,
+            "validation_sharpes": fold_validation_sharpes,
+            "trial_delta": trial_delta,
+            "completed_at": _timestamp_now(),
+        }
+        _write_json(
+            checkpoint_dir / f"fold_{fold['fold']:02d}.json", payload
+        )
+        _write_json(state_path, {
+            "status": "running",
+            "run_fingerprint": plan["run_fingerprint"],
+            "completed_folds": len(fold_summaries),
+            "updated_at": _timestamp_now(),
+        })
+
+    for fold in folds:
+        fold_checkpoint_path = checkpoint_dir / f"fold_{fold['fold']:02d}.json"
+        if getattr(args, "resume", False) and fold_checkpoint_path.is_file():
+            checkpoint = _load_json(fold_checkpoint_path)
+            if checkpoint.get("run_fingerprint") != plan["run_fingerprint"]:
+                raise ValueError(
+                    f"fold {fold['fold']} checkpoint belongs to another research plan"
+                )
+            summary = checkpoint["summary"]
+            fold_summaries.append(summary)
+            for candidate_id in pbo_ids:
+                value = checkpoint.get("pbo_values", {}).get(candidate_id)
+                pbo_by_candidate[candidate_id].append(
+                    float(value) if _finite_number(value) is not None else math.nan
+                )
+            for candidate_id, value in checkpoint.get(
+                "validation_sharpes", {}
+            ).items():
+                if _finite_number(value) is not None:
+                    validation_sharpes.setdefault(candidate_id, []).append(
+                        float(value)
+                    )
+            selected_id = summary.get("selected_candidate_id")
+            if selected_id:
+                winner_counts[selected_id] = winner_counts.get(selected_id, 0) + 1
+                selection_score = _finite_number(summary.get("selection_score"))
+                if selection_score is not None:
+                    winner_selection_scores.setdefault(selected_id, []).append(
+                        selection_score
+                    )
+            for key in checkpoint_counter_keys:
+                trial_ledger[key] += int(
+                    checkpoint.get("trial_delta", {}).get(key, 0) or 0
+                )
+            print(
+                f"Nested WF fold {fold['fold']}/{len(folds)} restored from checkpoint"
+            )
+            continue
+        trial_before = {
+            key: trial_ledger[key] for key in checkpoint_counter_keys
+        }
+        fold_pbo_values = {}
+        fold_validation_sharpes = {}
+        print(
+            f"Nested WF fold {fold['fold']}/{len(folds)} | "
+            f"train {fold['train'][0]}->{fold['train'][1]} | "
+            f"validation {fold['validation'][0]}->{fold['validation'][1]} | "
+            f"OOS {fold['test'][0]}->{fold['test'][1]}"
+        )
+        train_records = _evaluate_research_candidates(
+            args, candidates, *fold["train"], base_tune, research=False
+        )
+        trial_ledger["train_evaluations"] += len(train_records)
+        trial_ledger["failed_evaluations"] += sum(
+            bool(record.get("error")) for record in train_records
+        )
+        train_records.sort(
+            key=lambda row: row["objective_score"] if row["objective_score"] is not None else -math.inf,
+            reverse=True,
+        )
+        top_ids = {
+            record["candidate_id"]
+            for record in train_records[: int(args.research_validation_top)]
+        } | pbo_ids
+        validation_candidates = [candidate for candidate in candidates if candidate["candidate_id"] in top_ids]
+        validation_records = _evaluate_research_candidates(
+            args, validation_candidates, *fold["validation"], base_tune, research=True
+        )
+        trial_ledger["inner_validation_evaluations"] += len(validation_records)
+        trial_ledger["failed_evaluations"] += sum(
+            bool(record.get("error")) for record in validation_records
+        )
+        for record in validation_records:
+            candidate_id = record["candidate_id"]
+            if candidate_id in pbo_ids:
+                value = (record.get("result") or {}).get("total_profit_percent")
+                value = float(value) if _finite_number(value) is not None else math.nan
+                pbo_by_candidate[candidate_id].append(value)
+                fold_pbo_values[candidate_id] = value
+            sharpe = _monthly_sharpe(record.get("result"))
+            if sharpe is not None:
+                validation_sharpes.setdefault(candidate_id, []).append(sharpe)
+                fold_validation_sharpes[candidate_id] = sharpe
+        ranked = _research_selection_records(
+            train_records, validation_records, parameter_grid=grid
+        )
+        if not ranked:
+            summary = {**fold, "status": "no_qualified_candidate"}
+            fold_summaries.append(summary)
+            _write_json(output_dir / f"fold_{fold['fold']:02d}.json", summary)
+            save_fold_checkpoint(
+                fold,
+                summary,
+                fold_pbo_values,
+                fold_validation_sharpes,
+                trial_before,
+            )
+            continue
+        winner = ranked[0]
+        winner_counts[winner["candidate_id"]] = winner_counts.get(winner["candidate_id"], 0) + 1
+        winner_selection_scores.setdefault(winner["candidate_id"], []).append(
+            float(winner["robust_score"])
+        )
+        test_record = _evaluate_research_candidates(
+            args,
+            [{"candidate_id": winner["candidate_id"], "params": winner["params"]}],
+            *fold["test"],
+            base_tune,
+            research=True,
+        )[0]
+        trial_ledger["reporting_only_oos_evaluations"] += 1
+        trial_ledger["failed_evaluations"] += bool(test_record.get("error"))
+        summary = {
+            **fold,
+            "status": "complete" if test_record.get("objective_score") is not None else "oos_failed_gates",
+            "selected_candidate_id": winner["candidate_id"],
+            "selected_params": {**base_tune, **winner["params"]},
+            "selection_score": winner["robust_score"],
+            "plateau_adjusted_selection_score": winner.get(
+                "plateau_adjusted_score", winner["robust_score"]
+            ),
+            "plateau_stability": winner.get("plateau_stability"),
+            "plateau_neighbour_count": winner.get("neighbour_count", 0),
+            "plateau_neighbour_method": winner.get("neighbour_method"),
+            "plateau_median_grid_distance": winner.get("median_grid_distance"),
+            "train_percentile": winner["train_percentile"],
+            "validation_percentile": winner["validation_percentile"],
+            "training_result": winner["training_result"],
+            "validation_result": winner["validation_result"],
+            "oos_result": test_record["result"],
+            "oos_objective_score": test_record["objective_score"],
+            "oos_error": test_record.get("error"),
+            "oos_duration_seconds": test_record.get("duration"),
+        }
+        fold_summaries.append(summary)
+        _write_json(output_dir / f"fold_{fold['fold']:02d}.json", summary)
+        save_fold_checkpoint(
+            fold,
+            summary,
+            fold_pbo_values,
+            fold_validation_sharpes,
+            trial_before,
+        )
+
+    completed = [
+        fold for fold in fold_summaries
+        if fold.get("oos_result") and not fold.get("oos_error")
+    ]
+    stitched_monthly = [
+        float(value)
+        for fold in completed
+        for value in fold["oos_result"].get("monthly_returns", [])
+        if _finite_number(value) is not None
+    ]
+    if not stitched_monthly:
+        stitched_monthly = [
+            float(fold["oos_result"].get("total_profit_percent", 0.0)) / 100.0
+            for fold in completed
+        ]
+        periods_per_year = 12.0 / max(1.0, float(args.wf_test_months))
+    else:
+        periods_per_year = 12.0
+    oos_metrics = performance_from_returns(stitched_monthly, periods_per_year)
+    bootstrap = moving_block_bootstrap_ci(
+        stitched_monthly,
+        samples=args.bootstrap_samples,
+        confidence=args.bootstrap_confidence,
+        seed=args.seed,
+    )
+    observed_monthly_sharpe = _monthly_sharpe({"monthly_returns": stitched_monthly})
+    # One aggregate validation Sharpe per unique configuration is a more honest
+    # multiple-testing count than treating every fold repeat as a new strategy.
+    trial_sharpes = [
+        statistics.fmean(values)
+        for values in validation_sharpes.values()
+        if values
+    ]
+    dsr = (
+        deflated_sharpe_ratio(
+            observed_monthly_sharpe,
+            len(stitched_monthly),
+            trial_sharpes,
+            skewness=(
+                float(oos_metrics["skewness"])
+                if _finite_number(oos_metrics.get("skewness")) is not None
+                else 0.0
+            ),
+            kurtosis=(
+                float(oos_metrics["kurtosis"])
+                if _finite_number(oos_metrics.get("kurtosis")) is not None
+                else 3.0
+            ),
+        )
+        if observed_monthly_sharpe is not None
+        else {"deflated_sharpe_probability": None, "trial_count": len(trial_sharpes)}
+    )
+    pbo_rows = [
+        values for values in pbo_by_candidate.values() if len(values) == len(folds)
+    ]
+    # CSCV requires an even block count. The newest unmatched fold is withheld.
+    if pbo_rows and len(folds) % 2:
+        pbo_rows = [values[:-1] for values in pbo_rows]
+    pbo = probability_of_backtest_overfitting(pbo_rows) if pbo_rows else {
+        "pbo": None, "combinations": 0, "configurations": 0, "blocks": 0
+    }
+    positive_ratio = (
+        statistics.fmean(
+            float(fold["oos_result"].get("total_profit_percent", 0.0) > 0)
+            for fold in completed
+        )
+        if completed else 0.0
+    )
+    fold_returns = [
+        float(fold["oos_result"].get("total_profit_percent", 0.0))
+        for fold in completed
+    ]
+    total_oos_trades = sum(
+        int(fold["oos_result"].get("closed_trades", 0) or 0)
+        for fold in completed
+    )
+    total_oos_liquidations = sum(
+        int(fold["oos_result"].get("liquidations", 0) or 0)
+        for fold in completed
+    )
+    qualified_oos = [fold for fold in completed if fold.get("status") == "complete"]
+    trial_ledger.update({
+        "total_backtest_evaluations": (
+            trial_ledger["train_evaluations"]
+            + trial_ledger["inner_validation_evaluations"]
+            + trial_ledger["reporting_only_oos_evaluations"]
+        ),
+        "effective_dsr_trials": len(trial_sharpes),
+        "pbo_configuration_count": len(pbo_rows),
+        "completed_oos_evaluations": len(completed),
+        "qualified_oos_evaluations": len(qualified_oos),
+        "selection_sources": ["train", "inner_validation"],
+        "reporting_only_sources": ["oos"],
+    })
+    parameter_stability = _parameter_stability_report(completed, grid)
+    gates = {
+        "research_seed_provenance": bool(
+            seed_provenance.get("safe_for_oos_claim")
+        ),
+        "minimum_completed_folds": len(completed) >= args.min_oos_folds,
+        "minimum_qualified_folds": len(qualified_oos) >= args.min_oos_folds,
+        "minimum_total_oos_trades": (
+            total_oos_trades >= args.min_total_oos_trades
+        ),
+        "maximum_oos_liquidations": (
+            total_oos_liquidations <= args.max_oos_liquidations
+        ),
+        "positive_fold_ratio": positive_ratio >= args.min_positive_fold_ratio,
+        "maximum_stitched_oos_drawdown": (
+            oos_metrics.get("maximum_drawdown") is not None
+            and abs(float(oos_metrics["maximum_drawdown"])) * 100.0
+            <= args.max_oos_drawdown
+        ),
+        "bootstrap_mean_lower_positive": (
+            bootstrap.get("lower") is not None and bootstrap["lower"] > 0
+        ),
+        "deflated_sharpe": (
+            dsr.get("deflated_sharpe_probability") is not None
+            and dsr["deflated_sharpe_probability"] >= args.min_dsr_probability
+        ),
+        "pbo": pbo.get("pbo") is not None and pbo["pbo"] <= args.max_pbo,
+        "parameter_consensus": (
+            parameter_stability["mutable_parameter_count"] == 0
+            or (
+                parameter_stability["mean_mutable_parameter_consensus"] is not None
+                and parameter_stability["mean_mutable_parameter_consensus"]
+                >= args.min_parameter_consensus
+            )
+        ),
+        "parameter_spread": (
+            parameter_stability["mutable_parameter_count"] == 0
+            or (
+                parameter_stability["mean_mutable_normalized_grid_spread"] is not None
+                and parameter_stability["mean_mutable_normalized_grid_spread"]
+                <= args.max_parameter_spread
+            )
+        ),
+    }
+    if not args.require_positive_ci:
+        gates["bootstrap_mean_lower_positive"] = True
+    recommendation_id = max(
+        winner_counts,
+        key=lambda candidate_id: (
+            winner_counts[candidate_id],
+            statistics.median(winner_selection_scores.get(candidate_id, [-math.inf])),
+            -int(candidate_id.rsplit("-", 1)[-1]),
+        ),
+    ) if winner_counts else None
+    recommendation = next(
+        (candidate for candidate in candidates if candidate["candidate_id"] == recommendation_id),
+        None,
+    )
+    recommended_params = (
+        _freeze_strategy_tune(
+            adapter, {**base_tune, **recommendation["params"]}
+        )
+        if recommendation
+        else None
+    )
+    report = {
+        "protocol": "nested chronological walk-forward",
+        "strategy": adapter.identifier,
+        "fold_count": len(folds),
+        "completed_oos_folds": len(completed),
+        "qualified_oos_folds": len(qualified_oos),
+        "positive_oos_fold_ratio": positive_ratio,
+        "total_oos_trades": total_oos_trades,
+        "total_oos_liquidations": total_oos_liquidations,
+        "oos_fold_return_percent": {
+            "values": fold_returns,
+            "median": statistics.median(fold_returns) if fold_returns else None,
+            "worst": min(fold_returns) if fold_returns else None,
+            "best": max(fold_returns) if fold_returns else None,
+        },
+        "oos_metrics": oos_metrics,
+        "oos_bootstrap": bootstrap,
+        "deflated_sharpe": dsr,
+        "probability_of_backtest_overfitting": pbo,
+        "research_seed_provenance": seed_provenance,
+        "trial_ledger": trial_ledger,
+        "parameter_stability": parameter_stability,
+        "acceptance_gates": gates,
+        "accepted": all(gates.values()),
+        "holdout_ready": bool(recommendation and all(gates.values())),
+        "recommended_candidate_id": recommendation_id,
+        "recommended_candidate_source": (
+            recommendation.get("source") if recommendation else None
+        ),
+        "recommended_selection_frequency": (
+            winner_counts.get(recommendation_id, 0) if recommendation_id else 0
+        ),
+        "recommended_median_selection_score": (
+            statistics.median(winner_selection_scores[recommendation_id])
+            if recommendation_id and winner_selection_scores.get(recommendation_id)
+            else None
+        ),
+        "recommended_params": recommended_params,
+        "folds": fold_summaries,
+        "warning": "OOS results are reporting-only and were not used to select fold winners.",
+    }
+    _write_json(output_dir / "walk_forward_report.json", report)
+    _write_json(output_dir / "trial_ledger.json", trial_ledger)
+    _write_json(output_dir / "parameter_stability.json", parameter_stability)
+    _write_json(output_dir / "research_decision.json", {
+        "accepted": report["accepted"],
+        "holdout_ready": report["holdout_ready"],
+        "candidate_params": (
+            str(output_dir / "walk_forward_candidate_params.json")
+            if recommendation
+            else None
+        ),
+        "recommended_params": (
+            str(output_dir / "walk_forward_recommended_params.json")
+            if report["holdout_ready"]
+            else None
+        ),
+        "failed_gates": [
+            name for name, passed in gates.items() if not passed
+        ],
+    })
+    if recommendation:
+        _write_json(
+            output_dir / "walk_forward_candidate_params.json",
+            recommended_params,
+        )
+        if report["accepted"]:
+            _write_json(
+                output_dir / "walk_forward_recommended_params.json",
+                recommended_params,
+            )
+    _write_json(state_path, {
+        "status": "complete",
+        "run_fingerprint": plan["run_fingerprint"],
+        "completed_folds": len(fold_summaries),
+        "accepted": report["accepted"],
+        "report": str(output_dir / "walk_forward_report.json"),
+        "updated_at": _timestamp_now(),
+    })
+    print(
+        f"Nested walk-forward complete | accepted={report['accepted']} | "
+        f"positive OOS folds={positive_ratio:.1%} | report={output_dir / 'walk_forward_report.json'}"
+    )
+    return report
+
+
+DEFAULT_EXECUTION_SCENARIOS = {
+    "base": {},
+    "adverse": {
+        "fee_rate": 0.0007,
+        "slippage_rate": 0.0002,
+        "funding_rate_per_8h": 0.0001,
+        "maintenance_margin_rate": 0.005,
+        "liquidation_fee_rate": 0.002,
+    },
+    "severe": {
+        "fee_rate": 0.0010,
+        "slippage_rate": 0.0005,
+        "funding_rate_per_8h": 0.0003,
+        "maintenance_margin_rate": 0.010,
+        "liquidation_fee_rate": 0.005,
+    },
+}
+
+
+def _load_execution_scenarios(args, adapter):
+    source = getattr(args, "cost_scenarios", None)
+    if source:
+        payload = json.loads(Path(source).read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or not all(
+            isinstance(value, dict) for value in payload.values()
+        ):
+            raise ValueError("cost scenario JSON must map scenario names to tune objects")
+        return {str(name): dict(values) for name, values in payload.items()}
+    module_scenarios = getattr(adapter.module, "EXECUTION_SCENARIOS", None)
+    if isinstance(module_scenarios, dict):
+        return {str(name): dict(values) for name, values in module_scenarios.items()}
+    if adapter.identifier == "ma_strategy:ma_strategy":
+        return {name: dict(values) for name, values in DEFAULT_EXECUTION_SCENARIOS.items()}
+    return {"base": {}}
+
+
+def _default_holdout_params_path(output_dir):
+    output_dir = Path(output_dir)
+    return output_dir / "walk_forward_research" / "walk_forward_recommended_params.json"
+
+
+def run_sealed_holdout(args):
+    """Consume a frozen date range once without feeding any optimizer state."""
+    adapter = _adapter_from_args(args)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    params_path = Path(
+        args.holdout_params or _default_holdout_params_path(output_dir)
+    )
+    if not params_path.is_file():
+        raise FileNotFoundError(
+            f"frozen holdout params not found: {params_path}; run --research or supply "
+            "--holdout-params"
+        )
+    params = _freeze_strategy_tune(adapter, adapter.load_tune(params_path))
+    holdout_end = (
+        _latest_market_end() if args.holdout_end == "latest" else args.holdout_end
+    )
+    scenarios = _load_execution_scenarios(args, adapter)
+    data_file = _strategy_data_file(args, adapter)
+    data_sha = fingerprint_data(data_file) if data_file is not None else "unavailable"
+    range_payload = {
+        "strategy": adapter.identifier,
+        "data_sha256": data_sha,
+        "start": args.holdout_start,
+        "end": holdout_end,
+    }
+    holdout_key = fingerprint_config({
+        "strategy": adapter.identifier,
+        "start": args.holdout_start,
+        "end": holdout_end,
+    })
+    range_fingerprint = fingerprint_config(range_payload)
+    run_payload = {
+        **range_payload,
+        "params": params,
+        "scenarios": scenarios,
+    }
+    run_fingerprint = fingerprint_config(run_payload)
+    ledger_path = output_dir / "holdout_ledger.json"
+    ledger = _load_json(ledger_path, []) or []
+    prior = [
+        entry for entry in ledger
+        if entry.get("holdout_key") == holdout_key
+        or entry.get("range_fingerprint") == range_fingerprint
+    ]
+    contaminated = bool(prior)
+    if contaminated and not args.allow_holdout_repeat:
+        raise PermissionError(
+            "this data range has already been consumed as a sealed holdout; changing "
+            "parameters after seeing it makes it development data. Use new future data, "
+            "or --allow-holdout-repeat to run an explicitly contaminated diagnostic."
+        )
+
+    scenario_results = {}
+    for scenario_name, overrides in scenarios.items():
+        effective_tune = {**params, **overrides}
+        _, _, result, duration, error = _evaluate_candidate(
+            f"holdout-{scenario_name}",
+            {},
+            effective_tune,
+            _parse_bound(args.holdout_start),
+            _parse_bound(holdout_end),
+            True,
+            adapter.identifier,
+            True,
+        )
+        objective = _objective_score(
+            result,
+            min_trades=args.holdout_min_trades,
+            max_drawdown=args.holdout_max_drawdown,
+        ) if not error else -math.inf
+        monthly_returns = list((result or {}).get("monthly_returns", []))
+        scenario_results[scenario_name] = {
+            "overrides": overrides,
+            "effective_params": effective_tune,
+            "result": result or {},
+            "objective_score": objective if math.isfinite(objective) else None,
+            "monthly_statistics": performance_from_returns(monthly_returns, 12.0),
+            "monthly_bootstrap": moving_block_bootstrap_ci(
+                monthly_returns,
+                samples=args.bootstrap_samples,
+                confidence=args.bootstrap_confidence,
+                seed=args.seed,
+            ),
+            "duration_seconds": duration,
+            "error": error,
+        }
+    base = scenario_results.get("base") or next(iter(scenario_results.values()))
+    scenario_gates = {
+        name: (
+            record["error"] is None
+            and record["objective_score"] is not None
+            and int(record["result"].get("closed_trades", 0) or 0)
+            >= int(args.holdout_min_trades)
+            and float(record["result"].get("total_profit_percent", 0.0)) > 0
+            and int(record["result"].get("liquidations", 0) or 0) == 0
+            and (
+                not args.require_positive_ci
+                or (
+                    record["monthly_bootstrap"].get("lower") is not None
+                    and record["monthly_bootstrap"]["lower"] > 0
+                )
+            )
+        )
+        for name, record in scenario_results.items()
+    }
+    report = {
+        "protocol": "sealed holdout",
+        "status": "contaminated_repeat" if contaminated else "first_and_only_peek",
+        "created_at": _timestamp_now(),
+        "strategy": adapter.identifier,
+        "params_source": str(params_path),
+        "range": [args.holdout_start, holdout_end],
+        "data_sha256": data_sha,
+        "range_fingerprint": range_fingerprint,
+        "holdout_key": holdout_key,
+        "run_fingerprint": run_fingerprint,
+        "scenario_gates": scenario_gates,
+        "accepted": bool(
+            not contaminated
+            and base["objective_score"] is not None
+            and all(scenario_gates.values())
+        ),
+        "acceptance_requirements": {
+            "minimum_trades_per_scenario": int(args.holdout_min_trades),
+            "maximum_drawdown_percent": float(args.holdout_max_drawdown),
+            "positive_total_return": True,
+            "zero_liquidations": True,
+            "positive_bootstrap_lower_bound": bool(args.require_positive_ci),
+            "first_peek_only": True,
+        },
+        "scenario_results": scenario_results,
+        "feedback_policy": "results are never written to Hall of Fame, surrogate history, or seeds",
+    }
+    run_dir = output_dir / "sealed_holdout" / run_fingerprint[:16]
+    if run_dir.exists() and contaminated:
+        run_dir = output_dir / "sealed_holdout" / (
+            run_fingerprint[:12]
+            + "_repeat_"
+            + datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        )
+    run_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(run_dir / "holdout_report.json", report)
+    ledger.append({
+        "created_at": report["created_at"],
+        "range_fingerprint": range_fingerprint,
+        "holdout_key": holdout_key,
+        "run_fingerprint": run_fingerprint,
+        "status": report["status"],
+        "accepted": report["accepted"],
+        "report": str(run_dir / "holdout_report.json"),
+    })
+    _write_json(ledger_path, ledger)
+    print(
+        f"Sealed holdout consumed | accepted={report['accepted']} | "
+        f"status={report['status']} | report={run_dir / 'holdout_report.json'}"
+    )
+    return report
 
 
 def run_staged_optimization(args):
@@ -4446,6 +6143,25 @@ def run_staged_optimization(args):
                     key: value for key, value in audit_best.items()
                     if key != "effective_params"
                 }
+            development_end = (
+                _latest_market_end() if args.auto_end == "latest" else args.auto_end
+            )
+            run_manifest = _load_json(
+                output_dir / "research_manifest.json", {}
+            ) or {}
+            _write_json(snapshot_dir / "manifest.json", {
+                "snapshot_schema_version": 1,
+                "cycle": int(state["cycles_completed"]),
+                "requested_top": int(args.snapshot_top),
+                "saved_candidates": min(len(archive), int(args.snapshot_top)),
+                "strategy": "ma_strategy:ma_strategy",
+                "ranking": "random-window audit when available, then robust score",
+                "development_range": [args.auto_stress_start, development_end],
+                "development_end_exclusive": development_end,
+                "holdout_status": "development results; later data not consumed",
+                "run_fingerprints": run_manifest.get("fingerprints"),
+                "created_at": _timestamp_now(),
+            })
             state["block"] = block + 1
             state["phase_index"] = 0
             if audit_best:
@@ -4466,8 +6182,16 @@ def run_staged_optimization(args):
 
 
 def run_optimization(args, grid=None):
-    profile = getattr(args, "profile", None) or "focused"
-    grid = PARAMETER_PROFILES[profile] if grid is None else grid
+    profiles = _profiles_from_args(args)
+    profile = getattr(args, "profile", None) or (
+        "focused" if "focused" in profiles else next(iter(profiles))
+    )
+    if grid is None:
+        if profile not in profiles:
+            raise ValueError(
+                f"profile {profile!r} is unavailable; choose from {', '.join(profiles)}"
+            )
+        grid = profiles[profile]
     keys = tuple(grid)
     base_tune, base_description = _load_base_tune(args)
     output_dir = Path(args.output_dir)
@@ -4495,6 +6219,9 @@ def run_optimization(args, grid=None):
     ranked = []
     min_trades = getattr(args, "min_trades", 0)
     max_drawdown = getattr(args, "max_drawdown", None)
+    strategy_adapter = _adapter_from_args(args)
+    strategy_spec = strategy_adapter.identifier
+    fixed_warmup = strategy_adapter.maximum_optimizer_warmup(grid, base_tune)
 
     def objective(result):
         return _objective_score(result, min_trades=min_trades, max_drawdown=max_drawdown)
@@ -4503,6 +6230,10 @@ def run_optimization(args, grid=None):
     resume_signatures = set()
     if resume and results_path.is_file():
         ranked = _read_resume_records(results_path, grid, base_tune)
+        for record in ranked:
+            record["params"] = _freeze_strategy_tune(
+                strategy_adapter, record["params"]
+            )
         completed = len(ranked)
         resume_signatures = {
             tuple(record["params"][key] for key in keys) for record in ranked
@@ -4525,10 +6256,12 @@ def run_optimization(args, grid=None):
         candidate_source = (
             candidate for candidate in iter_grid_candidates(grid)
             if tuple(candidate[key] for key in keys) not in seen_signatures
-            and is_valid_candidate({**base_tune, **candidate})
+            and is_valid_candidate({**base_tune, **candidate}, strategy_adapter)
         )
 
     run_metadata = {
+        "strategy": strategy_spec,
+        "parameter_grid_source": getattr(args, "param_grid", None),
         "profile": profile,
         "optimized_parameters": list(keys),
         "base_source": base_description,
@@ -4552,18 +6285,29 @@ def run_optimization(args, grid=None):
             pool = multiprocessing.Pool(
                 workers,
                 initializer=_init_worker,
-                initargs=(start, end, base_tune, True),
+                initargs=(
+                    start, end, base_tune, True, True, strategy_spec, False,
+                    fixed_warmup,
+                ),
             )
         else:
             # Warm cached market data once in the parent for serial searches.
-            _init_worker(start, end, base_tune)
+            _init_worker(
+                start, end, base_tune,
+                strategy_spec=strategy_spec,
+                indicator_warmup_candles=fixed_warmup,
+            )
 
         def evaluate(batch):
             tasks = [(offset, candidate) for offset, candidate in batch]
             if pool is not None:
                 return pool.imap_unordered(_evaluate_task, tasks, chunksize=chunksize)
             return (
-                _evaluate_candidate(index, params, base_tune, start, end)
+                _evaluate_candidate(
+                    index, params, base_tune, start, end,
+                    strategy_spec=strategy_spec,
+                    indicator_warmup_candles=fixed_warmup,
+                )
                 for index, params in tasks
             )
 
@@ -4575,7 +6319,9 @@ def run_optimization(args, grid=None):
                     failed += 1
                     print(f"[{completed}/{requested_tests}] test {index} failed: {error}")
                     continue
-                effective_params = {**base_tune, **params}
+                effective_params = _freeze_strategy_tune(
+                    strategy_adapter, {**base_tune, **params}
+                )
                 result_objective = objective(result)
                 writer.writerow(_result_row(
                     keys, index, effective_params, result, duration,
@@ -4625,6 +6371,7 @@ def run_optimization(args, grid=None):
             else:
                 generator = SmartCandidateGenerator(
                     grid, seed=args.seed, baseline_params=base_tune,
+                    strategy_adapter=_adapter_from_args(args),
                 )
                 generator.seen.update(seen_signatures)
                 while completed < requested_tests:
@@ -4748,13 +6495,13 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog="optimize.py",
         formatter_class=_OptimizerHelpFormatter,
-        description="""Search for robust ma_strategy parameters.
+        description="""Search and validate robust strategy parameters.
 
 Choose one search path:
   smart  Budgeted adaptive search (recommended for normal experiments).
   grid   Every combination in a profile; usually only practical for tiny grids.
-  auto   Continuous model-guided search with successive halving, walk-forward
-         validation, stress tests, and full-history finalists. Existing state is
+  auto   Continuous model-guided development search with successive halving,
+         walk-forward validation, stress tests, and development-period finalists. Existing state is
          resumed automatically. It runs until Ctrl+C unless --auto-cycles is set.
 
 Dates are inclusive at START and exclusive at END. A candle index may be used
@@ -4768,10 +6515,10 @@ instead of a YYYY-MM-DD date.""",
     python optimize.py --mode smart --profile focused --base-source config `
       --tests 5000 -w 8 --output-dir outputs/optimize/focused_run
 
-  Train on one period and validate the best 30 candidates on unseen data:
+  Train on one period and use the next period as inner validation:
     python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-      --start 2023-01-01 --end 2025-01-01 `
-      --validation-start 2025-01-01 --validation-end 2026-01-01 `
+      --start 2021-07-01 --end 2022-10-01 `
+      --validation-start 2022-10-01 --validation-end 2023-10-01 `
       --validation-top 30 --min-trades 50 --max-drawdown 35 `
       --output-dir outputs/optimize/validated_signal
 
@@ -4797,7 +6544,9 @@ Tips:
   * Use a new --output-dir for a new experiment; use --resume only for the same run.
   * Plain --auto detects and resumes a compatible checkpoint in --output-dir.
   * A new campaign warm-starts from a compatible existing --base-params winner.
-  * For trustworthy selection, keep validation/stress data outside the search range.
+  * Candidate-search defaults end at 2023-10-01; nested OOS then covers recent data through 2025-06-01.
+  * Data from 2025-06-01 onward is reserved for --sealed-holdout.
+  * For trustworthy selection, use --research, freeze its recommendation, then peek once with --sealed-holdout.
   * Raw score is preserved; cross-range comparisons use a candle-count annualized score.
   * Auto learns from normalized Discovery ranks and later funnel outcomes, not raw scale.
   * Candidate selection balances predicted quality, uncertainty, diversity, and randomness.
@@ -4806,6 +6555,20 @@ Tips:
     )
 
     search = parser.add_argument_group("search mode and parameter scope")
+    search.add_argument(
+        "--strategy", default="ma", metavar="NAME|MODULE:FUNCTION",
+        help=(
+            "strategy callable (built-in alias 'ma', or module:function; the callable "
+            "must accept tune/start/end and return result metrics)"
+        ),
+    )
+    search.add_argument(
+        "--param-grid", metavar="JSON|MODULE:ATTRIBUTE",
+        help=(
+            "external parameter grid or profile collection; otherwise the strategy's "
+            "param_grid/PARAMETER_PROFILES is discovered"
+        ),
+    )
     search.add_argument(
         "--auto", action="store_true",
         help="use the resumable staged auto campaign (overrides --mode)",
@@ -4819,8 +6582,8 @@ Tips:
         help="candidate budget in smart mode; ignored by grid and auto",
     )
     search.add_argument(
-        "--profile", choices=tuple(PARAMETER_PROFILES), default=None,
-        help="parameter group (default: full in auto mode, focused otherwise)",
+        "--profile", default=None, metavar="NAME",
+        help="parameter profile name (default: full in auto mode, focused otherwise)",
     )
     search.add_argument(
         "--base-source", choices=("config", "best", "file"), default="config",
@@ -4852,27 +6615,35 @@ Tips:
         "--seed", type=int, default=42, metavar="N",
         help="random seed for reproducible smart/auto candidate generation",
     )
+    execution.add_argument(
+        "--data-file", metavar="PATH",
+        help="market CSV used for audit/fingerprinting (auto-discovered for ma)",
+    )
+    execution.add_argument(
+        "--data-audit", choices=("strict", "warn", "off"), default="strict",
+        help="pre-run market-data gate; gaps/zero volume remain warnings in strict mode",
+    )
 
     ranges = parser.add_argument_group("standard search ranges and robustness")
     ranges.add_argument(
-        "--start", default="2025-01-01", metavar="DATE|INDEX",
+        "--start", default="2021-07-01", metavar="DATE|INDEX",
         help="inclusive training start",
     )
     ranges.add_argument(
-        "--end", default="2026-02-23", metavar="DATE|INDEX",
-        help="exclusive training end",
+        "--end", default="2023-10-01", metavar="DATE|INDEX",
+        help="exclusive search end; later dates are reserved for walk-forward/holdout",
     )
     ranges.add_argument(
         "--validation-start", metavar="DATE|INDEX",
-        help="inclusive out-of-sample start; requires --validation-end",
+        help="inclusive inner-validation start; requires --validation-end",
     )
     ranges.add_argument(
         "--validation-end", metavar="DATE|INDEX",
-        help="exclusive out-of-sample end; requires --validation-start",
+        help="exclusive inner-validation end; requires --validation-start",
     )
     ranges.add_argument(
         "--validation-top", type=int, default=20, metavar="N",
-        help="training finalists re-tested out-of-sample",
+        help="training finalists re-tested on inner validation (used for selection)",
     )
     ranges.add_argument(
         "--overfit-penalty", type=float, default=0.25, metavar="FLOAT",
@@ -4905,6 +6676,135 @@ Tips:
     output.add_argument("--dry-run", action="store_true",
                         help="print the resolved plan without running backtests")
 
+    research = parser.add_argument_group(
+        "nested walk-forward research (reporting-only OOS validation)"
+    )
+    research.add_argument(
+        "--research", action="store_true",
+        help="run nested chronological walk-forward instead of a normal/auto search",
+    )
+    research.add_argument(
+        "--wf-start", default="2021-07-01", metavar="DATE|INDEX",
+        help="earliest nested walk-forward training candle",
+    )
+    research.add_argument(
+        "--wf-end", default="2025-06-01", metavar="DATE|INDEX|latest",
+        help=(
+            "exclusive development end, not the dataset end; later candles "
+            "through --holdout-end stay sealed"
+        ),
+    )
+    research.add_argument("--wf-train-months", type=float, default=24.0, metavar="N")
+    research.add_argument("--wf-validation-months", type=float, default=3.0, metavar="N")
+    research.add_argument("--wf-test-months", type=float, default=2.0, metavar="N")
+    research.add_argument("--wf-step-months", type=float, default=2.0, metavar="N")
+    research.add_argument(
+        "--wf-rolling", action="store_true",
+        help="use a fixed rolling train window instead of anchored expanding history",
+    )
+    research.add_argument(
+        "--wf-purge-candles", type=int, default=0, metavar="N",
+        help="unused candles between train/validation/test boundaries",
+    )
+    research.add_argument(
+        "--research-tests", type=int, default=500, metavar="N",
+        help="fixed candidate pool evaluated independently inside every fold",
+    )
+    research.add_argument(
+        "--research-seeds", metavar="JSON",
+        help=(
+            "optional Auto snapshot/top-results JSON; compatible winners are "
+            "inserted before deterministic Halton candidates"
+        ),
+    )
+    research.add_argument(
+        "--allow-research-seed-overlap", action="store_true",
+        help=(
+            "allow unverifiable/overlapping seed history for diagnostics; the "
+            "research_seed_provenance gate remains false"
+        ),
+    )
+    research.add_argument(
+        "--research-validation-top", type=int, default=50, metavar="N",
+        help="training finalists evaluated on each inner validation window",
+    )
+    research.add_argument(
+        "--research-pbo-candidates", type=int, default=20, metavar="N",
+        help="fixed candidates retained across validation blocks for CSCV/PBO",
+    )
+    research.add_argument("--bootstrap-samples", type=int, default=1000, metavar="N")
+    research.add_argument("--bootstrap-confidence", type=float, default=0.95, metavar="RATIO")
+    research.add_argument("--min-oos-folds", type=int, default=4, metavar="N")
+    research.add_argument(
+        "--min-fold-trades", type=int, default=5, metavar="N",
+        help="minimum closed trades required in every train/validation/OOS evaluation",
+    )
+    research.add_argument(
+        "--min-total-oos-trades", type=int, default=30, metavar="N",
+        help="minimum closed trades across the stitched reporting-only OOS folds",
+    )
+    research.add_argument(
+        "--max-oos-liquidations", type=int, default=0, metavar="N",
+        help="maximum liquidations allowed across all reporting-only OOS folds",
+    )
+    research.add_argument(
+        "--research-max-drawdown", type=float, default=40.0, metavar="PERCENT",
+        help="per-window drawdown gate used during nested selection",
+    )
+    research.add_argument(
+        "--max-oos-drawdown", type=float, default=40.0, metavar="PERCENT",
+        help="maximum drawdown allowed on the stitched OOS return series",
+    )
+    research.add_argument("--min-positive-fold-ratio", type=float, default=0.60, metavar="RATIO")
+    research.add_argument("--min-dsr-probability", type=float, default=0.95, metavar="RATIO")
+    research.add_argument("--max-pbo", type=float, default=0.20, metavar="RATIO")
+    research.add_argument(
+        "--min-parameter-consensus", type=float, default=0.50, metavar="RATIO",
+        help="minimum mean modal frequency across mutable parameters and fold winners",
+    )
+    research.add_argument(
+        "--max-parameter-spread", type=float, default=0.35, metavar="RATIO",
+        help="maximum mean normalized grid spread across mutable parameters",
+    )
+    research.add_argument(
+        "--require-positive-ci", action="store_true",
+        help="require the bootstrap lower bound of periodic OOS return to exceed zero",
+    )
+    research.add_argument(
+        "--allow-nonpositive-ci", dest="require_positive_ci", action="store_false",
+        help="diagnostic override: do not reject a result whose bootstrap lower bound is non-positive",
+    )
+    research.set_defaults(require_positive_ci=True)
+    research.add_argument(
+        "--sealed-holdout", action="store_true",
+        help="evaluate frozen parameters once on the sealed range and record its consumption",
+    )
+    research.add_argument("--holdout-params", metavar="PATH")
+    research.add_argument(
+        "--holdout-start", default="2025-06-01", metavar="DATE|INDEX",
+        help="inclusive sealed range start; by default this is also --wf-end",
+    )
+    research.add_argument(
+        "--holdout-end", default="latest", metavar="DATE|INDEX|latest",
+        help="exclusive sealed range end; latest means one interval after the final candle",
+    )
+    research.add_argument(
+        "--holdout-min-trades", type=int, default=20, metavar="N",
+        help="minimum closed trades required in every sealed cost scenario",
+    )
+    research.add_argument(
+        "--holdout-max-drawdown", type=float, default=30.0, metavar="PERCENT",
+        help="maximum absolute drawdown allowed in every sealed cost scenario",
+    )
+    research.add_argument(
+        "--cost-scenarios", metavar="JSON",
+        help="scenario-name to strategy-tune overrides; MA gets base/adverse/severe defaults",
+    )
+    research.add_argument(
+        "--allow-holdout-repeat", action="store_true",
+        help="allow a repeat but mark it contaminated and never call it unseen",
+    )
+
     auto = parser.add_argument_group("auto campaign (used only with --auto)")
     auto.add_argument(
         "--auto-tests", type=int, default=2000,
@@ -4924,7 +6824,7 @@ Tips:
     auto.add_argument(
         "--auto-final-top", type=int, default=100,
         metavar="N",
-        help="stress finalists tested on the complete market range",
+        help="stress finalists tested on the complete development range",
     )
     auto.add_argument(
         "--auto-hall-size", type=int, default=100,
@@ -4937,24 +6837,27 @@ Tips:
         help="stop after N completed cycles (0 runs until Ctrl+C)",
     )
     auto.add_argument(
-        "--auto-discovery-start", default="2025-01-01",
+        "--auto-discovery-start", default="2022-10-01",
         metavar="DATE|INDEX",
         help="start of the recent discovery range",
     )
     auto.add_argument(
-        "--auto-validation-start", default="2023-01-01",
+        "--auto-validation-start", default="2022-04-01",
         metavar="DATE|INDEX",
         help="start of validation; it ends at auto-discovery-start",
     )
     auto.add_argument(
-        "--auto-stress-start", default="2019-01-01",
+        "--auto-stress-start", default="2021-07-01",
         metavar="DATE|INDEX",
         help="start of stress testing and the complete final range",
     )
     auto.add_argument(
-        "--auto-end", default="latest",
+        "--auto-end", default="2023-10-01",
         metavar="DATE|INDEX|latest",
-        help="exclusive campaign end or 'latest' to detect the final candle",
+        help=(
+            "exclusive candidate-search end; later data is reserved for nested "
+            "walk-forward and the final sealed holdout"
+        ),
     )
     auto.add_argument(
         "--auto-importance-target",
@@ -5013,11 +6916,11 @@ Tips:
     )
     auto.add_argument(
         "--snapshot-cycles", type=int, default=50, metavar="N",
-        help="completed staged cycles between top-candidate snapshots",
+        help="completed auto cycles between ranked Top-N snapshots (default: 50)",
     )
     auto.add_argument(
         "--snapshot-top", type=int, default=100, metavar="N",
-        help="ranked candidates retained in each staged snapshot and next block",
+        help="ranked candidates and standalone parameter JSON files per snapshot",
     )
     auto.add_argument(
         "--random-audit-tests", type=int, default=500, metavar="N",
@@ -5028,11 +6931,11 @@ Tips:
         help="staged finalists compared on identical random windows",
     )
     auto.add_argument(
-        "--random-audit-earliest", default="2019-01-01", metavar="DATE|INDEX",
+        "--random-audit-earliest", default="2021-07-01", metavar="DATE|INDEX",
         help="earliest allowed random-window candle",
     )
     auto.add_argument(
-        "--random-audit-recent-start", default="2024-01-01", metavar="DATE|INDEX",
+        "--random-audit-recent-start", default="2022-10-01", metavar="DATE|INDEX",
         help="start boundary used for the recent-window quota",
     )
     auto.add_argument(
@@ -5052,9 +6955,23 @@ Tips:
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    args.profile = args.profile or ("full" if args.auto else "focused")
+    try:
+        args._strategy_adapter = _adapter_from_spec(args.strategy)
+        args._parameter_profiles = _profiles_from_args(args)
+    except (FileNotFoundError, ModuleNotFoundError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    default_profile = "full" if args.auto else "focused"
+    if default_profile not in args._parameter_profiles:
+        default_profile = next(iter(args._parameter_profiles))
+    args.profile = args.profile or default_profile
+    if args.profile not in args._parameter_profiles:
+        raise SystemExit(
+            f"unknown profile {args.profile!r}; available profiles: "
+            + ", ".join(args._parameter_profiles)
+        )
     if args.list_profiles:
-        for name, grid in PARAMETER_PROFILES.items():
+        print(f"Strategy: {args._strategy_adapter.identifier}")
+        for name, grid in args._parameter_profiles.items():
             print(f"{name}: {len(grid)} parameters | {grid_size(grid):,} grid combinations")
         return
     if args.tests <= 0:
@@ -5073,6 +6990,43 @@ def main(argv=None):
         raise SystemExit("--top-n must be greater than zero")
     if args.excel_top < 0:
         raise SystemExit("--excel-top cannot be negative")
+    if sum(bool(value) for value in (args.research, args.sealed_holdout, args.auto)) > 1:
+        raise SystemExit("--research, --sealed-holdout, and --auto are separate workflows")
+    if args.research:
+        if args.research_seeds and not Path(args.research_seeds).is_file():
+            raise SystemExit(f"research seed JSON not found: {args.research_seeds}")
+        if min(
+            args.wf_train_months, args.wf_validation_months,
+            args.wf_test_months, args.wf_step_months,
+        ) <= 0:
+            raise SystemExit("walk-forward month windows must be greater than zero")
+        if args.wf_purge_candles < 0:
+            raise SystemExit("--wf-purge-candles cannot be negative")
+        if min(
+            args.research_tests, args.research_validation_top,
+            args.research_pbo_candidates, args.bootstrap_samples,
+            args.min_oos_folds,
+        ) <= 0:
+            raise SystemExit("research counts must be greater than zero")
+        if min(
+            args.min_fold_trades,
+            args.min_total_oos_trades,
+            args.max_oos_liquidations,
+        ) < 0:
+            raise SystemExit("research trade-count gates cannot be negative")
+        if min(args.research_max_drawdown, args.max_oos_drawdown) <= 0:
+            raise SystemExit("research drawdown gates must be greater than zero")
+        for name in (
+            "bootstrap_confidence", "min_positive_fold_ratio",
+            "min_dsr_probability", "max_pbo", "min_parameter_consensus",
+            "max_parameter_spread",
+        ):
+            if not 0 < getattr(args, name) <= 1:
+                raise SystemExit(f"--{name.replace('_', '-')} must be in (0, 1]")
+    if args.holdout_min_trades < 0:
+        raise SystemExit("--holdout-min-trades cannot be negative")
+    if args.holdout_max_drawdown <= 0:
+        raise SystemExit("--holdout-max-drawdown must be greater than zero")
     if args.auto_tests <= 0:
         raise SystemExit("--auto-tests must be greater than zero")
     if min(
@@ -5118,9 +7072,17 @@ def main(argv=None):
         )
     if args.auto_walk_forward_stability_penalty < 0:
         raise SystemExit("--auto-walk-forward-stability-penalty cannot be negative")
+    if args.auto and min(args.snapshot_cycles, args.snapshot_top) <= 0:
+        raise SystemExit("--snapshot-cycles and --snapshot-top must be greater than zero")
     if args.staged:
         if not args.auto:
             raise SystemExit("--staged requires --auto")
+        if args._strategy_adapter.identifier != "ma_strategy:ma_strategy":
+            raise SystemExit(
+                "--staged uses MA-specific signal/exit/risk/RSI/scale groups; "
+                "for any plug-in strategy use --auto, which still publishes "
+                "Top-N snapshots every --snapshot-cycles"
+            )
         if min(args.stage_cycles, args.snapshot_cycles, args.snapshot_top) <= 0:
             raise SystemExit("staged cycle and snapshot settings must be greater than zero")
         if min(args.random_audit_tests, args.random_audit_top) <= 0:
@@ -5145,7 +7107,139 @@ def main(argv=None):
     if bool(args.validation_start) != bool(args.validation_end):
         raise SystemExit("--validation-start and --validation-end must be used together")
     if args.dry_run:
-        selected_grid = PARAMETER_PROFILES[args.profile]
+        selected_grid = args._parameter_profiles[args.profile]
+        if args.sealed_holdout:
+            coverage = _market_data_coverage()
+            holdout_end = (
+                coverage["end_exclusive"] if args.holdout_end == "latest"
+                else args.holdout_end
+            )
+            params_path = Path(
+                args.holdout_params
+                or _default_holdout_params_path(args.output_dir)
+            )
+            scenarios = _load_execution_scenarios(
+                args, args._strategy_adapter
+            )
+            print(
+                f"Mode: sealed holdout | strategy: "
+                f"{args._strategy_adapter.identifier}"
+            )
+            print(
+                f"Dataset candles: {coverage['first_candle']} -> "
+                f"{coverage['last_candle']} (inclusive)"
+            )
+            print(f"Dataset end: {coverage['end_exclusive']} (exclusive)")
+            print(f"Frozen params: {params_path}")
+            print(f"Holdout range: {args.holdout_start} -> {holdout_end} (exclusive)")
+            print("Execution scenarios: " + ", ".join(scenarios))
+            print(
+                f"Gates per scenario: trades >= {args.holdout_min_trades}, "
+                f"drawdown <= {args.holdout_max_drawdown:.1f}%, positive return, "
+                "zero liquidations, bootstrap lower bound "
+                + ("must be positive" if args.require_positive_ci else "diagnostic override")
+            )
+            print(
+                "Repeat policy: "
+                + (
+                    "allowed but marked contaminated"
+                    if args.allow_holdout_repeat
+                    else "blocked after the first peek"
+                )
+            )
+            return
+        if args.research:
+            coverage = _market_data_coverage()
+            resolved_end = (
+                coverage["end_exclusive"] if args.wf_end == "latest" else args.wf_end
+            )
+            folds = _nested_walk_forward_ranges(
+                args.wf_start, resolved_end,
+                train_months=args.wf_train_months,
+                validation_months=args.wf_validation_months,
+                test_months=args.wf_test_months,
+                step_months=args.wf_step_months,
+                rolling=args.wf_rolling,
+                purge_candles=args.wf_purge_candles,
+            )
+            if not folds:
+                raise SystemExit(
+                    "walk-forward range is too short for the requested train, "
+                    "validation, and OOS windows"
+                )
+            base_tune, _ = _load_base_tune(args)
+            seed_params = _load_research_seed_candidates(
+                args.research_seeds,
+                selected_grid,
+                base_tune,
+                args._strategy_adapter,
+            )
+            seed_provenance = _research_seed_provenance(
+                args.research_seeds, folds, args._strategy_adapter.identifier
+            )
+            if seed_params and seed_provenance["status"] == "strategy_mismatch":
+                raise SystemExit(
+                    "research seed snapshot belongs to another strategy"
+                )
+            if seed_params and not seed_provenance["safe_for_oos_claim"]:
+                if not args.allow_research_seed_overlap:
+                    raise SystemExit(
+                        "research seed history is not verified to end before the "
+                        f"first OOS window ({seed_provenance['status']})"
+                    )
+            halton_params = _space_filling_candidates(
+                selected_grid,
+                min(args.research_tests, grid_size(selected_grid)),
+                base_tune,
+                args._strategy_adapter,
+                seed=args.seed,
+            )
+            pool_signatures = []
+            seen_pool = set()
+            for params in [*seed_params, *halton_params]:
+                signature = _candidate_signature(params, tuple(selected_grid))
+                if signature in seen_pool:
+                    continue
+                seen_pool.add(signature)
+                pool_signatures.append(signature)
+                if len(pool_signatures) >= args.research_tests:
+                    break
+            print(f"Mode: nested walk-forward research | strategy: {args._strategy_adapter.identifier}")
+            print(
+                f"Dataset candles: {coverage['first_candle']} -> "
+                f"{coverage['last_candle']} (inclusive)"
+            )
+            print(f"Development end: {resolved_end} (exclusive)")
+            try:
+                has_reserved_holdout = (
+                    _bound_index(resolved_end)
+                    < _bound_index(coverage["end_exclusive"])
+                )
+            except (IndexError, OSError, TypeError, ValueError):
+                has_reserved_holdout = False
+            if has_reserved_holdout:
+                print(
+                    f"Reserved sealed holdout: {resolved_end} -> "
+                    f"{coverage['end_exclusive']} (exclusive; last candle "
+                    f"{coverage['last_candle']})"
+                )
+            print(
+                f"Candidate pool: {len(pool_signatures):,} | "
+                f"snapshot seeds loaded: {len(seed_params):,} | "
+                "remaining capacity: deterministic Halton"
+            )
+            print(
+                "Research-seed provenance: "
+                f"{seed_provenance['status']} | acceptance-safe: "
+                f"{seed_provenance['safe_for_oos_claim']}"
+            )
+            print(f"Folds: {len(folds)} | OOS feedback: disabled")
+            for fold in folds:
+                print(
+                    f"Fold {fold['fold']}: train {fold['train']} -> "
+                    f"validation {fold['validation']} -> OOS {fold['test']}"
+                )
+            return
         if args.auto:
             resolved_end = _latest_market_end() if args.auto_end == "latest" else args.auto_end
             ranges = _auto_ranges(args, resolved_end)
@@ -5155,14 +7249,10 @@ def main(argv=None):
                 print(
                     "Phase schedule: "
                     + " -> ".join(
-                        f"{name} ({len(PARAMETER_PROFILES[profile])} params, "
+                        f"{name} ({len(args._parameter_profiles[profile])} params, "
                         f"{args.stage_cycles} cycles)"
                         for name, profile in STAGED_AUTO_PHASES
                     )
-                )
-                print(
-                    f"Snapshot: top {args.snapshot_top} every "
-                    f"{args.snapshot_cycles} completed cycles"
                 )
                 audit_windows = args.random_audit_tests // args.random_audit_top
                 print(
@@ -5174,6 +7264,10 @@ def main(argv=None):
                 )
             else:
                 print(f"Profile: {args.profile} ({len(selected_grid)} parameters)")
+            print(
+                f"Snapshot: top {args.snapshot_top} every "
+                f"{args.snapshot_cycles} completed cycles"
+            )
             print(
                 f"Funnel per cycle: {args.auto_tests:,} -> "
                 f"{args.auto_validation_top} -> {args.auto_stress_top} -> "
@@ -5209,16 +7303,49 @@ def main(argv=None):
         print(f"Range: {args.start} -> {args.end}")
         return
     multiprocessing.freeze_support()
-    if args.auto:
-        if args.output_dir == DEFAULT_OUTPUT_DIR:
-            args.output_dir = os.path.join(
-                DEFAULT_OUTPUT_DIR, "staged" if args.staged else "auto"
+    if args.auto and args.output_dir == DEFAULT_OUTPUT_DIR:
+        args.output_dir = os.path.join(
+            DEFAULT_OUTPUT_DIR, "staged" if args.staged else "auto"
+        )
+    resolved_cli_config = {
+        key: value for key, value in vars(args).items() if not key.startswith("_")
+    }
+    resolved_cli_config["resolved_strategy"] = args._strategy_adapter.identifier
+    resolved_cli_config["resolved_parameter_profiles"] = args._parameter_profiles
+    if args.sealed_holdout:
+        _run_research_preflight(args, args.output_dir, resolved_cli_config)
+        run_sealed_holdout(args)
+    elif args.research:
+        _run_research_preflight(args, args.output_dir, resolved_cli_config)
+        run_nested_walk_forward(args)
+    elif args.auto:
+        if not args.staged:
+            saved_auto_state = _load_json(
+                Path(args.output_dir) / "auto_state.json"
             )
+            if saved_auto_state is not None:
+                saved_auto_config = _restore_auto_resume_args(
+                    args, saved_auto_state
+                )
+                resolved_cli_config = {
+                    key: value
+                    for key, value in vars(args).items()
+                    if not key.startswith("_")
+                }
+                resolved_cli_config["resolved_strategy"] = (
+                    args._strategy_adapter.identifier
+                )
+                resolved_cli_config["resolved_parameter_profiles"] = {
+                    saved_auto_config.get("profile", args.profile):
+                    saved_auto_config.get("parameter_grid", {})
+                }
+        _run_research_preflight(args, args.output_dir, resolved_cli_config)
         if args.staged:
             run_staged_optimization(args)
         else:
             run_auto_optimization(args)
     else:
+        _run_research_preflight(args, args.output_dir, resolved_cli_config)
         run_optimization(args)
 
 

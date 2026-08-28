@@ -8,6 +8,7 @@ from argparse import Namespace
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 from openpyxl import load_workbook
 
 from optimize import (
@@ -15,7 +16,8 @@ from optimize import (
     _aggregate_random_audit, _aggregate_walk_forward_records, _auto_bootstrap,
     _compact_auto_candidate_plans, _generate_random_audit_windows,
     _annotate_discovery_learning_scores, _apply_funnel_learning_scores,
-    _learn_mutation_guidance, _learn_parameter_importance, _open_csv_text,
+    _latest_market_end, _learn_mutation_guidance, _learn_parameter_importance,
+    _market_data_coverage, _open_csv_text,
     _resolve_csv_path,
     _read_candidate_plan, _read_surrogate_history_cache,
     _representative_surrogate_history, _run_random_window_audit,
@@ -32,6 +34,22 @@ from trade_engine import TradeEngine
 
 
 class OptimizerSearchTests(unittest.TestCase):
+    def test_latest_market_end_includes_the_final_candle(self):
+        open_times = pd.Series(pd.to_datetime([
+            "2026-05-31 23:15:00",
+            "2026-05-31 23:30:00",
+            "2026-05-31 23:45:00",
+        ]))
+
+        with patch("get_candle_index._open_times", return_value=open_times):
+            coverage = _market_data_coverage()
+            latest_end = _latest_market_end()
+
+        self.assertEqual(coverage["last_candle"], "2026-05-31 23:45:00")
+        self.assertEqual(coverage["end_exclusive"], "2026-06-01 00:00:00")
+        self.assertEqual(latest_end, "2026-06-01 00:00:00")
+        self.assertEqual(coverage["interval_seconds"], 900.0)
+
     def test_legacy_auto_checkpoint_restores_saved_defaults_before_resume(self):
         args = build_parser().parse_args(["--auto"])
         args.profile = "full"
@@ -235,7 +253,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertIn("standard search ranges and robustness:", help_text)
         self.assertIn("auto campaign (used only with --auto):", help_text)
         self.assertIn("recommended examples:", help_text)
-        self.assertIn("--validation-start 2025-01-01", help_text)
+        self.assertIn("--validation-start 2022-10-01", help_text)
         self.assertIn("--auto --auto-cycles 2", help_text)
         self.assertIn("--resume", help_text)
 
@@ -392,10 +410,18 @@ class OptimizerSearchTests(unittest.TestCase):
             best = json.loads((output / "best_params.json").read_text(encoding="utf-8"))
             with (snapshot / "top_100.csv").open(encoding="utf-8") as csv_file:
                 rows = list(csv.DictReader(csv_file))
+            ranked_json = json.loads(
+                (snapshot / "top_100.json").read_text(encoding="utf-8")
+            )
+            individual_params_exists = (
+                snapshot / "params" / "rank_001_params.json"
+            ).is_file()
 
         self.assertEqual(best["entry_score_threshold"], 11)
         self.assertEqual(rows[0]["phase"], "signal")
         self.assertEqual(rows[0]["robust_score"], "99")
+        self.assertEqual(ranked_json[0]["candidate_id"], "best")
+        self.assertTrue(individual_params_exists)
 
     def test_staged_campaign_locks_each_phase_winner_and_writes_block_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -443,6 +469,9 @@ class OptimizerSearchTests(unittest.TestCase):
             snapshot = output / "snapshots" / "cycles_000005"
             snapshot_csv_exists = (snapshot / "top_100.csv").is_file()
             snapshot_best_exists = (snapshot / "best_params.json").is_file()
+            snapshot_manifest = json.loads(
+                (snapshot / "manifest.json").read_text(encoding="utf-8")
+            )
 
         self.assertEqual(len(observed_baselines), 5)
         self.assertTrue(observed_baselines[1])
@@ -451,6 +480,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(state["baseline_params"]["leverage"], 3)
         self.assertTrue(snapshot_csv_exists)
         self.assertTrue(snapshot_best_exists)
+        self.assertEqual(snapshot_manifest["development_end_exclusive"], "2023-10-01")
 
     def test_grid_is_complete_and_deterministic(self):
         grid = {"a": [1, 2], "b": ["x", "y", "z"]}
@@ -706,10 +736,48 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(state["cycles_completed"], 1)
         self.assertEqual(state["status"], "completed")
         self.assertEqual(state["config"]["profile"], "full")
-        self.assertEqual(saved, {"x": 4})
+        self.assertEqual(saved["x"], 4)
+        self.assertEqual(saved["slippage_rate"], 0.0001)
         self.assertEqual(best["params"], {"x": 4})
         self.assertEqual(auto_sheets, ["Hall of Fame", "Parameter Importance"])
         self.assertTrue(completed_checkpoints_removed)
+
+    def test_auto_resume_recovers_a_missing_cycle_boundary_snapshot(self):
+        args = build_parser().parse_args([
+            "--auto", "--auto-tests", "2", "--auto-validation-top", "1",
+            "--auto-stress-top", "1", "--auto-final-top", "1",
+            "--auto-cycles", "1", "--snapshot-cycles", "1",
+            "--snapshot-top", "2", "--auto-stress-start", "0",
+            "--auto-validation-start", "20", "--auto-discovery-start", "30",
+            "--auto-end", "40", "--workers", "1", "--log-every", "0",
+            "--excel-top", "0",
+        ])
+
+        def fake_strategy(tune, start, end):
+            value = tune["x"]
+            return {
+                "score": value, "total_profit": value, "closed_trades": 5,
+                "maximum_drawdown": -1,
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            args.output_dir = temp_dir
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=fake_strategy
+            ):
+                run_auto_optimization(args, grid={"x": [1, 2]})
+            manifest = (
+                Path(temp_dir) / "snapshots" / "cycles_000001" / "manifest.json"
+            )
+            manifest.unlink()
+            args.resume = True
+            with patch("optimize._init_worker"), patch(
+                "optimize.ma_strategy", side_effect=fake_strategy
+            ):
+                run_auto_optimization(args, grid={"x": [1, 2]})
+            recovered = manifest.is_file()
+
+        self.assertTrue(recovered)
 
     def test_next_auto_cycle_continues_from_hall_of_fame_winner(self):
         args = build_parser().parse_args([
@@ -896,8 +964,9 @@ class OptimizerSearchTests(unittest.TestCase):
             sheet_names = workbook.sheetnames
             workbook.close()
 
-        self.assertEqual(best["params"], {"x": 3})
-        self.assertEqual(saved, {"x": 3})
+        self.assertEqual(best["params"]["x"], 3)
+        self.assertEqual(saved["x"], 3)
+        self.assertEqual(saved["funding_rate_per_8h"], 0.00005)
         self.assertIn("Core Metrics", sheet_names)
         self.assertIn("RSI Metrics", sheet_names)
         self.assertIn("Scale Metrics", sheet_names)

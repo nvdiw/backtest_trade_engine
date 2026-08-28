@@ -154,6 +154,67 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertEqual(liquid_account.total_losses, 1)
         self.assertEqual(liquid_account.profits_lst, [-100.0])
 
+    def test_slippage_is_adverse_on_both_sides_of_a_round_trip(self):
+        baseline = TradeEngine(optimize=True, verbose=False, slippage_rate=0.0)
+        adverse = TradeEngine(optimize=True, verbose=False, slippage_rate=0.01)
+
+        baseline_account = AccountState(balance=100.0)
+        baseline_position = self.make_position(
+            baseline.open_long(0, [10.0], [OPEN_TIME], baseline_account)
+        )
+        baseline_close = baseline.close_long(
+            0, [11.0], [CLOSE_TIME], baseline_position, baseline_account,
+            fee_rate=0.0, cooldown_after_big_pnl=12,
+        )
+
+        adverse_account = AccountState(balance=100.0)
+        adverse_position = self.make_position(
+            adverse.open_long(0, [10.0], [OPEN_TIME], adverse_account)
+        )
+        adverse_close = adverse.close_long(
+            0, [11.0], [CLOSE_TIME], adverse_position, adverse_account,
+            fee_rate=0.0, cooldown_after_big_pnl=12,
+        )
+
+        self.assertGreater(adverse_position.entry_price, baseline_position.entry_price)
+        self.assertLess(adverse_close["close_price"], baseline_close["close_price"])
+        self.assertLess(adverse_close["profit"], baseline_close["profit"])
+
+    def test_funding_and_maintenance_margin_are_accounted_for(self):
+        funding_engine = TradeEngine(
+            optimize=True, verbose=False, funding_rate_per_8h=0.001
+        )
+        account = AccountState(balance=100.0)
+        position = self.make_position(
+            funding_engine.open_long(0, [10.0], [OPEN_TIME], account)
+        )
+        closed = funding_engine.close_long(
+            0,
+            [10.0],
+            ["2026-01-01 08:00:00"],
+            position,
+            account,
+            fee_rate=0.0,
+            cooldown_after_big_pnl=12,
+        )
+        self.assertAlmostEqual(closed["total_fee"], 0.1)
+        self.assertAlmostEqual(account.balance, 99.9)
+
+        maintenance_engine = TradeEngine(
+            optimize=True, verbose=False, maintenance_margin_rate=0.10
+        )
+        liquid_account = AccountState(balance=100.0)
+        liquid_position = self.make_position(
+            maintenance_engine.open_long(
+                0, [10.0], [OPEN_TIME], liquid_account, leverage=2
+            )
+        )
+        result = maintenance_engine.check_liquidation_long(
+            0, [5.5], [CLOSE_TIME], liquid_position, liquid_account
+        )
+        self.assertTrue(result["liquidated"])
+        self.assertAlmostEqual(result["close_price"], 6.0)
+
 
 class MarketDataWarmupTests(unittest.TestCase):
     @staticmethod

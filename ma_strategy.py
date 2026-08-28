@@ -71,6 +71,29 @@ def required_indicator_warmup(config):
     )
 
 
+def maximum_optimizer_warmup(parameter_grid, base_tune=None):
+    """Resolve one fixed warmup shared by every candidate in an optimizer pool."""
+    config = build_ma_strategy_config(base_tune)
+
+    def largest(name):
+        values = parameter_grid.get(name, ())
+        return max([getattr(config, name), *values]) if values else getattr(config, name)
+
+    return max(
+        largest("ema_16_period"),
+        largest("ma_50_period"),
+        largest("ma_100_period"),
+        largest("ma_200_period"),
+        largest("period_adx") * 2,
+        largest("period_atr") + largest("period_atr_ma"),
+        largest("period_vol_avg"),
+        largest("period_rsi") + max(
+            largest("lowest_rsi_last_n_value"),
+            largest("highest_rsi_last_n_value"),
+        ),
+    )
+
+
 def _get_cached_indicator(kind, range_key, indicator_key, builder):
     """Keep reusable indicator arrays in each optimizer worker process."""
     cache = _INDICATOR_CACHE[kind]
@@ -98,6 +121,8 @@ def ma_strategy(
     write_excel=True,
     output_dir="outputs",
     use_indicator_warmup=True,
+    indicator_warmup_candles=None,
+    research=False,
 ):
     """Run the MA strategy over ``start`` (inclusive) to ``end`` (exclusive).
 
@@ -119,7 +144,11 @@ def ma_strategy(
     cfg = build_ma_strategy_config(tune)
     # Load preceding candles only to seed rolling/Wilder indicators. They are
     # excluded from trading, reporting, charts, and performance statistics.
-    indicator_warmup = required_indicator_warmup(cfg) if use_indicator_warmup else 0
+    required_warmup = required_indicator_warmup(cfg)
+    indicator_warmup = (
+        max(required_warmup, int(indicator_warmup_candles or 0))
+        if use_indicator_warmup else 0
+    )
     market = TradeEngine.load_market_data(
         start=start, end=end, warmup_candles=indicator_warmup
     )
@@ -242,6 +271,10 @@ def ma_strategy(
     exit_score_opposite_candle = cfg.exit_score_opposite_candle
     post_cross_penalty_score = cfg.post_cross_penalty_score
     fee_rate = cfg.fee_rate
+    slippage_rate = cfg.slippage_rate
+    funding_rate_per_8h = cfg.funding_rate_per_8h
+    maintenance_margin_rate = cfg.maintenance_margin_rate
+    liquidation_fee_rate = cfg.liquidation_fee_rate
     rsi_trade_monthly_filter_on = cfg.rsi_trade_monthly_filter_on
     rsi_long_open_monthly_profit = cfg.rsi_long_open_monthly_profit
     rsi_long_close_monthly_profit = cfg.rsi_long_close_monthly_profit
@@ -389,6 +422,7 @@ def ma_strategy(
 
     equity_curve = []
     profits_lst = []
+    research_month_end_equity = {}
     chart_state = TradeEngine.create_chart_state(
         optimize=optimize,
         plot_penalties=plot_post_cross_penalty_markers,
@@ -482,6 +516,11 @@ def ma_strategy(
         write_excel=write_excel,
         output_dir=output_dir,
         track_equity_curve=render_chart,
+        fee_rate=fee_rate,
+        slippage_rate=slippage_rate,
+        funding_rate_per_8h=funding_rate_per_8h,
+        maintenance_margin_rate=maintenance_margin_rate,
+        liquidation_fee_rate=liquidation_fee_rate,
     )
 
     def capture_account_state():
@@ -718,7 +757,9 @@ def ma_strategy(
             if p.side == "long":
                 # Avoid constructing AccountState and a result dict on virtually
                 # every candle when the liquidation condition is not reachable.
-                if low_prices[i] > p.entry_price * (1 - 1 / p.leverage):
+                if low_prices[i] > p.entry_price * (
+                    1 - 1 / p.leverage + trade_engine.maintenance_margin_rate
+                ):
                     continue
                 remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
                 remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
@@ -759,7 +800,9 @@ def ma_strategy(
                             )
                             long_close_reasons[i] = liq_reason_text
             elif p.side == "short":
-                if high_prices[i] < p.entry_price * (1 + 1 / p.leverage):
+                if high_prices[i] < p.entry_price * (
+                    1 + 1 / p.leverage - trade_engine.maintenance_margin_rate
+                ):
                     continue
                 remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
                 remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
@@ -2056,9 +2099,44 @@ def ma_strategy(
 
                 pending_monthly_stop_reason = monthly_stop_reason
                 pending_monthly_stop_value = monthly_stop_value
-                
+
+        if research:
+            # Keep a compact, strategy-control-independent month-end equity
+            # series.  Open positions are marked with adverse exit slippage and
+            # accrued execution costs so statistical reports do not depend on
+            # the monthly stop feature being enabled.
+            marked_equity = balance + save_money
+            for position in open_positions:
+                mark_price = close_prices[i] * (
+                    1.0 - slippage_rate
+                    if position.side == "long"
+                    else 1.0 + slippage_rate
+                )
+                marked_equity += trade_engine.position_equity(position, mark_price)
+                marked_equity -= (
+                    position.entry_price * position.position_size * fee_rate
+                    + mark_price * position.position_size * fee_rate
+                    + trade_engine._funding_cost(
+                        position.entry_price * position.position_size,
+                        position.open_time_value,
+                        close_times[i],
+                    )
+                )
+            research_month_end_equity[str(open_times[i])[:7]] = marked_equity
+
+    research_monthly_returns = []
+    previous_research_equity = first_balance
+    for month_end_equity in research_month_end_equity.values():
+        research_monthly_returns.append(
+            month_end_equity / previous_research_equity - 1.0
+            if previous_research_equity > 0
+            else 0.0
+        )
+        previous_research_equity = month_end_equity
+
     return trade_engine.finalize_backtest(
         optimize=optimize,
+        research=bool(research),
         show_chart=render_chart,
         ending_mark_price=close_prices[-1],
         balance=balance,
@@ -2084,6 +2162,7 @@ def ma_strategy(
         total_liquids=total_liquids,
         lst_profit_percent_per_month=lst_profit_percent_per_month,
         monthly_stop_reasons=monthly_stop_reasons,
+        research_monthly_returns=research_monthly_returns,
         long_profit_scale_entry_attempts=long_profit_scale_entry_attempts,
         long_loss_scale_entry_attempts=long_loss_scale_entry_attempts,
         long_filtered_profit_scale_entries=long_filtered_profit_scale_entries,

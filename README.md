@@ -1,5 +1,7 @@
 # Backtest Trade Engine
 
+[Research workflow: nested walk-forward, sealed holdout, Top 100 snapshots, and strategy plug-ins](RESEARCH_GUIDE_FA.md)
+
 [راهنمای فارسی](README_FA.md)
 
 A candle-by-candle BTC backtesting and parameter-optimization project. It supports long/short positions, leverage, fees, liquidation, scale-ins, monthly controls, MA/EMA/ADX/ATR/volume/RSI scoring, interactive chart review, multiprocessing optimization, checkpoints, and out-of-sample validation.
@@ -220,11 +222,11 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `--chunksize N` | `0` | Multiprocessing task chunk; `0` is automatic. |
 | `--elite-size N` | `20` | Top candidates guiding smart mutations. |
 | `--seed N` | `42` | Reproducible smart-search seed. |
-| `--start VALUE` | `2025-01-01` | Inclusive training date/index. |
-| `--end VALUE` | `2026-02-23` | Exclusive training date/index. |
-| `--validation-start VALUE` | — | Inclusive out-of-sample start; pair with end. |
-| `--validation-end VALUE` | — | Exclusive out-of-sample end; pair with start. |
-| `--validation-top N` | `20` | Training finalists evaluated out of sample. |
+| `--start VALUE` | `2021-07-01` | Inclusive candidate-search date/index. |
+| `--end VALUE` | `2023-10-01` | Exclusive search end; newer data is reserved for OOS/holdout. |
+| `--validation-start VALUE` | — | Inclusive inner-validation start; pair with end. |
+| `--validation-end VALUE` | — | Exclusive inner-validation end; pair with start. |
+| `--validation-top N` | `20` | Training finalists evaluated on inner validation. |
 | `--overfit-penalty X` | `0.25` | Penalty when train score exceeds validation score. |
 | `--min-trades N` | `0` | Disqualify candidates with too few closed trades. |
 | `--max-drawdown X` | — | Disqualify candidates above this absolute drawdown %. |
@@ -260,25 +262,29 @@ Sequential profile refinement is normally more efficient and easier to validate 
 ```powershell
 # Focused search from Python defaults
 python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
-  --start 2023-01-01 --end 2025-01-01 `
+  --start 2021-07-01 --end 2023-10-01 `
   --output-dir outputs/optimize/focused_01
 
 # Refine exits around an existing winner
 python optimize.py --mode smart --profile exit --tests 5000 -w 8 `
   --base-source file --base-params outputs/optimize/focused_01/best_params.json `
-  --start 2023-01-01 --end 2025-01-01 `
+  --start 2021-07-01 --end 2023-10-01 `
   --output-dir outputs/optimize/exit_01
 
-# Non-overlapping out-of-sample validation
+# Non-overlapping inner validation (not the final unseen holdout)
 python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-  --start 2023-01-01 --end 2025-01-01 `
-  --validation-start 2025-01-01 --validation-end 2026-01-01 `
+  --start 2021-07-01 --end 2022-10-01 `
+  --validation-start 2022-10-01 --validation-end 2023-10-01 `
   --validation-top 30 --overfit-penalty 0.35 `
   --min-trades 50 --max-drawdown 35 `
   --output-dir outputs/optimize/signal_validated
 
 # Resume the same compatible run
 python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+  --start 2021-07-01 --end 2022-10-01 `
+  --validation-start 2022-10-01 --validation-end 2023-10-01 `
+  --validation-top 30 --overfit-penalty 0.35 `
+  --min-trades 50 --max-drawdown 35 `
   --output-dir outputs/optimize/signal_validated --resume
 
 # Run the selected winner
@@ -303,7 +309,7 @@ best_params.json              final selected winner
 optimization_summary.json     metadata and winner metrics
 top_results.json              top --top-n candidates
 best_training_params.json     training winner with validation
-validation_results.json       out-of-sample finalist details
+validation_results.json       inner-validation finalist details
 ```
 
 JSON writes are atomic. CSV is flushed after each batch for reliable resume. Workers receive the base parameter set once at startup and only candidate deltas are transferred per task. Smart mode combines exploration and crossover with deterministic one-step refinement around elite candidates while suppressing duplicate effective configurations.
@@ -312,15 +318,17 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 
 `--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. An existing compatible checkpoint in the output directory is resumed automatically, even when `--resume` is omitted. A new campaign also warm-starts from compatible values in `--base-params` when that file exists.
 
-The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final full-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 30 reach Validation, 10 reach Stress/walk-forward, and 3 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 1,024 deterministic score-quantile samples so startup cost stays bounded. A compact `surrogate_history_cache.json.gz` is bootstrapped from a blend of whole-history and recent cycles, updated incrementally, and reused after restart; continuous runs keep both candidate and surrogate history in memory. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. The default ranges are:
+The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final search-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 500 reach Validation, 250 reach Stress, 150 reach the internal walk-forward, and 100 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 10,000 deterministic score-quantile samples so startup cost stays bounded. A compact `surrogate_history_cache.json.gz` is bootstrapped from a blend of whole-history and recent cycles, updated incrementally, and reused after restart; continuous runs keep both candidate and surrogate history in memory. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. Auto is intentionally restricted to the pre-OOS search zone by default:
 
 ```text
-Discovery    2025-01-01 -> latest candle
-Validation   2023-01-01 -> 2025-01-01
-Stress       2019-01-01 -> 2023-01-01
-Walk-forward three disjoint folds between 2019-01-01 and 2025-01-01
-Final        2019-01-01 -> latest candle
+Discovery    2022-10-01 -> 2023-10-01
+Validation   2022-04-01 -> 2022-10-01
+Stress       2021-07-01 -> 2022-04-01
+Walk-forward three disjoint folds inside 2021-07-01 -> 2023-10-01
+Final        2021-07-01 -> 2023-10-01
 ```
+
+Nested research then reports two-month OOS folds from 2023-10-01 through the boundary at 2025-06-01. That date is the holdout boundary, not the dataset end: the sealed range includes every candle through 2026-05-31 23:45:00 and therefore has an exclusive end of 2026-06-01 00:00:00. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
 
 ```powershell
 # Start an unlimited campaign; default output is outputs/optimize/auto
@@ -354,8 +362,8 @@ next block.
 
 Every 50-cycle snapshot also runs a deterministic random-window audit. By
 default, the best 10 finalists are evaluated on the same 50 random 6-12 month
-windows (500 backtests total). All windows begin on or after 2019-01-01 and 70%
-begin on or after 2024-01-01. The audit ranks consistency using per-window
+windows (500 backtests total). All windows begin on or after 2021-07-01 and 70%
+begin on or after 2022-10-01. The audit ranks consistency using per-window
 percentiles, median performance, the worst decile, positive-window ratio, failed
 windows, and score dispersion. Its most robust candidate becomes the snapshot's
 final `best_params.json`.
@@ -384,10 +392,10 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-final-top N` | `100` | Stress finalists sent to the full-range test. |
 | `--auto-hall-size N` | `100` | Winners retained across cycles. |
 | `--auto-cycles N` | `0` | Completed-cycle limit; `0` means until `Ctrl+C`. |
-| `--auto-discovery-start VALUE` | `2025-01-01` | Recent discovery start. |
-| `--auto-validation-start VALUE` | `2023-01-01` | Validation start; ends at discovery start. |
-| `--auto-stress-start VALUE` | `2019-01-01` | Stress and complete-history start. |
-| `--auto-end VALUE` | `latest` | Exclusive end; `latest` detects the dataset automatically. |
+| `--auto-discovery-start VALUE` | `2022-10-01` | Recent discovery start. |
+| `--auto-validation-start VALUE` | `2022-04-01` | Validation start; ends at discovery start. |
+| `--auto-stress-start VALUE` | `2021-07-01` | Stress and development-history start. |
+| `--auto-end VALUE` | `2023-10-01` | Exclusive search end; later data remains forward/OOS. |
 | `--auto-importance-target METRIC` | `objective_score` | Importance target: objective score, profit, or profit %. |
 | `--auto-halving-rungs N` | `2` | Cheap expanding Discovery rungs; `0` disables them. |
 | `--auto-halving-keep RATIO` | `0.25` | Fraction promoted after every cheap rung. |
@@ -401,8 +409,8 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--snapshot-top N` | `100` | Winners written and reused at each snapshot. |
 | `--random-audit-tests N` | `500` | Total random-period tests after each snapshot. |
 | `--random-audit-top N` | `10` | Finalists compared on shared random periods. |
-| `--random-audit-earliest VALUE` | `2019-01-01` | Earliest allowed audit candle. |
-| `--random-audit-recent-start VALUE` | `2024-01-01` | Boundary for recent audit windows. |
+| `--random-audit-earliest VALUE` | `2021-07-01` | Earliest allowed audit candle. |
+| `--random-audit-recent-start VALUE` | `2022-10-01` | Boundary for recent audit windows. |
 | `--random-audit-recent-ratio X` | `0.70` | Required share of recent windows. |
 | `--random-audit-min-months N` | `6` | Minimum random-window duration. |
 | `--random-audit-max-months N` | `12` | Maximum random-window duration. |
