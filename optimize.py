@@ -289,8 +289,20 @@ SURROGATE_MAX_TRAINING_SAMPLES = 10_000
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
 SURROGATE_CACHE_VERSION = 2
 
-_WORKER_START = "2021-07-01"
-_WORKER_END = "2023-10-01"
+# The default protocol deliberately follows the newest complete market regimes
+# while keeping 2026 sealed.  These constants are also used as harmless worker
+# bootstrap values before each task supplies its exact stage range.
+DEFAULT_DEVELOPMENT_START = "2023-01-01"
+DEFAULT_AUTO_VALIDATION_START = "2023-07-01"
+DEFAULT_AUTO_DISCOVERY_START = "2024-01-01"
+DEFAULT_DEVELOPMENT_END = "2025-04-01"
+DEFAULT_RESEARCH_END = "2026-01-01"
+DEFAULT_HOLDOUT_START = "2026-01-01"
+DEFAULT_AUTO_CAMPAIGN_DIR = "auto_2023_2026"
+DEFAULT_STAGED_CAMPAIGN_DIR = "staged_2023_2026"
+
+_WORKER_START = DEFAULT_DEVELOPMENT_START
+_WORKER_END = DEFAULT_DEVELOPMENT_END
 _WORKER_BASE_TUNE = {}
 _WORKER_USE_INDICATOR_WARMUP = True
 _WORKER_INDICATOR_WARMUP_CANDLES = None
@@ -6517,8 +6529,8 @@ instead of a YYYY-MM-DD date.""",
 
   Train on one period and use the next period as inner validation:
     python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-      --start 2021-07-01 --end 2022-10-01 `
-      --validation-start 2022-10-01 --validation-end 2023-10-01 `
+      --start 2023-01-01 --end 2024-01-01 `
+      --validation-start 2024-01-01 --validation-end 2025-04-01 `
       --validation-top 30 --min-trades 50 --max-drawdown 35 `
       --output-dir outputs/optimize/validated_signal
 
@@ -6544,8 +6556,8 @@ Tips:
   * Use a new --output-dir for a new experiment; use --resume only for the same run.
   * Plain --auto detects and resumes a compatible checkpoint in --output-dir.
   * A new campaign warm-starts from a compatible existing --base-params winner.
-  * Candidate-search defaults end at 2023-10-01; nested OOS then covers recent data through 2025-06-01.
-  * Data from 2025-06-01 onward is reserved for --sealed-holdout.
+  * Candidate-search defaults use 2023-01-01 through 2025-04-01.
+  * Nested OOS then covers the rest of 2025; 2026-01-01 onward stays sealed.
   * For trustworthy selection, use --research, freeze its recommendation, then peek once with --sealed-holdout.
   * Raw score is preserved; cross-range comparisons use a candle-count annualized score.
   * Auto learns from normalized Discovery ranks and later funnel outcomes, not raw scale.
@@ -6626,11 +6638,11 @@ Tips:
 
     ranges = parser.add_argument_group("standard search ranges and robustness")
     ranges.add_argument(
-        "--start", default="2021-07-01", metavar="DATE|INDEX",
+        "--start", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
         help="inclusive training start",
     )
     ranges.add_argument(
-        "--end", default="2023-10-01", metavar="DATE|INDEX",
+        "--end", default=DEFAULT_DEVELOPMENT_END, metavar="DATE|INDEX",
         help="exclusive search end; later dates are reserved for walk-forward/holdout",
     )
     ranges.add_argument(
@@ -6684,11 +6696,11 @@ Tips:
         help="run nested chronological walk-forward instead of a normal/auto search",
     )
     research.add_argument(
-        "--wf-start", default="2021-07-01", metavar="DATE|INDEX",
+        "--wf-start", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
         help="earliest nested walk-forward training candle",
     )
     research.add_argument(
-        "--wf-end", default="2025-06-01", metavar="DATE|INDEX|latest",
+        "--wf-end", default=DEFAULT_RESEARCH_END, metavar="DATE|INDEX|latest",
         help=(
             "exclusive development end, not the dataset end; later candles "
             "through --holdout-end stay sealed"
@@ -6781,7 +6793,7 @@ Tips:
     )
     research.add_argument("--holdout-params", metavar="PATH")
     research.add_argument(
-        "--holdout-start", default="2025-06-01", metavar="DATE|INDEX",
+        "--holdout-start", default=DEFAULT_HOLDOUT_START, metavar="DATE|INDEX",
         help="inclusive sealed range start; by default this is also --wf-end",
     )
     research.add_argument(
@@ -6837,22 +6849,22 @@ Tips:
         help="stop after N completed cycles (0 runs until Ctrl+C)",
     )
     auto.add_argument(
-        "--auto-discovery-start", default="2022-10-01",
+        "--auto-discovery-start", default=DEFAULT_AUTO_DISCOVERY_START,
         metavar="DATE|INDEX",
         help="start of the recent discovery range",
     )
     auto.add_argument(
-        "--auto-validation-start", default="2022-04-01",
+        "--auto-validation-start", default=DEFAULT_AUTO_VALIDATION_START,
         metavar="DATE|INDEX",
         help="start of validation; it ends at auto-discovery-start",
     )
     auto.add_argument(
-        "--auto-stress-start", default="2021-07-01",
+        "--auto-stress-start", default=DEFAULT_DEVELOPMENT_START,
         metavar="DATE|INDEX",
         help="start of stress testing and the complete final range",
     )
     auto.add_argument(
-        "--auto-end", default="2023-10-01",
+        "--auto-end", default=DEFAULT_DEVELOPMENT_END,
         metavar="DATE|INDEX|latest",
         help=(
             "exclusive candidate-search end; later data is reserved for nested "
@@ -6931,11 +6943,11 @@ Tips:
         help="staged finalists compared on identical random windows",
     )
     auto.add_argument(
-        "--random-audit-earliest", default="2021-07-01", metavar="DATE|INDEX",
+        "--random-audit-earliest", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
         help="earliest allowed random-window candle",
     )
     auto.add_argument(
-        "--random-audit-recent-start", default="2022-10-01", metavar="DATE|INDEX",
+        "--random-audit-recent-start", default=DEFAULT_AUTO_DISCOVERY_START, metavar="DATE|INDEX",
         help="start boundary used for the recent-window quota",
     )
     auto.add_argument(
@@ -7305,7 +7317,8 @@ def main(argv=None):
     multiprocessing.freeze_support()
     if args.auto and args.output_dir == DEFAULT_OUTPUT_DIR:
         args.output_dir = os.path.join(
-            DEFAULT_OUTPUT_DIR, "staged" if args.staged else "auto"
+            DEFAULT_OUTPUT_DIR,
+            DEFAULT_STAGED_CAMPAIGN_DIR if args.staged else DEFAULT_AUTO_CAMPAIGN_DIR,
         )
     resolved_cli_config = {
         key: value for key, value in vars(args).items() if not key.startswith("_")

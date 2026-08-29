@@ -253,7 +253,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertIn("standard search ranges and robustness:", help_text)
         self.assertIn("auto campaign (used only with --auto):", help_text)
         self.assertIn("recommended examples:", help_text)
-        self.assertIn("--validation-start 2022-10-01", help_text)
+        self.assertIn("--validation-start 2024-01-01", help_text)
         self.assertIn("--auto --auto-cycles 2", help_text)
         self.assertIn("--resume", help_text)
 
@@ -277,6 +277,15 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(auto_args.auto_hall_size, 100)
         self.assertEqual(auto_args.auto_surrogate_trees, 64)
         self.assertEqual(auto_args.auto_surrogate_max_samples, 10_000)
+        self.assertEqual(auto_args.auto_stress_start, "2023-01-01")
+        self.assertEqual(auto_args.auto_validation_start, "2023-07-01")
+        self.assertEqual(auto_args.auto_discovery_start, "2024-01-01")
+        self.assertEqual(auto_args.auto_end, "2025-04-01")
+
+        research_args = build_parser().parse_args(["--research"])
+        self.assertEqual(research_args.wf_start, "2023-01-01")
+        self.assertEqual(research_args.wf_end, "2026-01-01")
+        self.assertEqual(research_args.holdout_start, "2026-01-01")
 
         staged = build_parser().parse_args(["--auto", "--staged"])
         self.assertTrue(staged.staged)
@@ -480,7 +489,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(state["baseline_params"]["leverage"], 3)
         self.assertTrue(snapshot_csv_exists)
         self.assertTrue(snapshot_best_exists)
-        self.assertEqual(snapshot_manifest["development_end_exclusive"], "2023-10-01")
+        self.assertEqual(snapshot_manifest["development_end_exclusive"], "2025-04-01")
 
     def test_grid_is_complete_and_deterministic(self):
         grid = {"a": [1, 2], "b": ["x", "y", "z"]}

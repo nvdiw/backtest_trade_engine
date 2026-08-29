@@ -8,11 +8,11 @@
 
 پیش‌فرض‌های پروژه عمداً داده را سه‌قسمت می‌کنند:
 
-- Candidate search و ساخت Top 100: از `2021-07-01` تا قبل از `2023-10-01`، با تمرکز Discovery روی `2022-10-01` به بعد
-- Nested walk-forward: train از `2021-07-01` رشد می‌کند و OOSهای دوماهه از `2023-10-01` تا مرز `2025-06-01` را پوشش می‌دهند
-- Sealed holdout: از `2025-06-01` تا آخرین کندل موجود یعنی `2026-05-31 23:45:00`
+- Candidate search و ساخت Top 100: از `2023-01-01` تا قبل از `2025-04-01`، با تمرکز Discovery روی `2024-01-01` به بعد
+- Nested walk-forward: train از `2023-01-01` رشد می‌کند و چهار OOS دوماهه‌ی بعد از مرز Development را تا ابتدای دسامبر ۲۰۲۵ پوشش می‌دهد؛ باقیمانده‌ی دسامبر Embargo است
+- Sealed holdout: از `2026-01-01` تا آخرین کندل موجود یعنی `2026-05-31 23:45:00`
 
-توجه: `2025-06-01` آخر دیتاست نیست؛ مرز شروع داده‌ی کاملاً unseen است. چون `end` در موتور exclusive است، انتهای واقعی دیتاست به شکل `2026-06-01 00:00:00` نمایش داده می‌شود و در نتیجه کندل `2026-05-31 23:45:00` نیز داخل Holdout قرار دارد.
+توجه: `2026-01-01` مرز شروع داده‌ی کاملاً unseen است. چون `end` در موتور exclusive است، انتهای واقعی دیتاست به شکل `2026-06-01 00:00:00` نمایش داده می‌شود و در نتیجه کندل `2026-05-31 23:45:00` نیز داخل Holdout قرار دارد.
 
 ### محاسبه و cache اندیکاتورها
 
@@ -26,10 +26,10 @@
 
 ```powershell
 python optimize.py --auto --strategy ma --profile full `
-  --auto-stress-start 2021-07-01 --auto-validation-start 2022-04-01 `
-  --auto-discovery-start 2022-10-01 --auto-end 2023-10-01 `
+  --auto-stress-start 2023-01-01 --auto-validation-start 2023-07-01 `
+  --auto-discovery-start 2024-01-01 --auto-end 2025-04-01 `
   --auto-cycles 50 --snapshot-cycles 50 --snapshot-top 100 `
-  -w 8 --output-dir outputs/optimize/ma_campaign
+  -w 8 --output-dir outputs/optimize/ma_campaign_2023_2026
 ```
 
 برای ادامه‌ی همان کمپین:
@@ -37,13 +37,13 @@ python optimize.py --auto --strategy ma --profile full `
 ```powershell
 python optimize.py --auto --strategy ma --profile full `
   --auto-cycles 100 --snapshot-cycles 50 --snapshot-top 100 `
-  -w 8 --output-dir outputs/optimize/ma_campaign --resume
+  -w 8 --output-dir outputs/optimize/ma_campaign_2023_2026 --resume
 ```
 
 اگر `--auto-cycles 0` باشد، اجرا تا `Ctrl+C` ادامه دارد. در cycleهای ۵۰، ۱۰۰، ۱۵۰ و ... خروجی زیر ساخته می‌شود:
 
 ```text
-outputs/optimize/ma_campaign/snapshots/cycles_000050/
+outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/
 ├── top_100.json
 ├── top_100.csv
 ├── best_params.json
@@ -64,13 +64,11 @@ outputs/optimize/ma_campaign/snapshots/cycles_000050/
 ```powershell
 python optimize.py --research --strategy ma --profile full `
   --base-source best `
-  --base-params outputs/optimize/ma_campaign/snapshots/cycles_000050/best_params.json `
-  --research-seeds outputs/optimize/ma_campaign/snapshots/cycles_000050/top_100.json `
-  --wf-start 2021-07-01 --wf-end 2025-06-01 `
+  --base-params outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/best_params.json `
+  --research-seeds outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/top_100.json `
+  --wf-start 2023-01-01 --wf-end 2026-01-01 `
   --wf-train-months 24 --wf-validation-months 3 `
   --wf-test-months 2 --wf-step-months 2 `
-  --wf-train-months 30 --wf-validation-months 6 `
-  --wf-test-months 6 --wf-step-months 6 `
   --research-tests 500 --research-validation-top 50 `
   --research-pbo-candidates 20 --bootstrap-samples 1000 `
   --min-fold-trades 5 --min-total-oos-trades 30 `
@@ -78,7 +76,7 @@ python optimize.py --research --strategy ma --profile full `
   --min-oos-folds 4 --min-positive-fold-ratio 0.60 `
   --min-dsr-probability 0.95 --max-pbo 0.20 `
   --min-parameter-consensus 0.50 --max-parameter-spread 0.35 `
-  -w 8 --output-dir outputs/optimize/ma_campaign
+  -w 8 --output-dir outputs/optimize/ma_campaign_2023_2026
 ```
 
 فایل `--research-seeds` اختیاری است. وقتی داده شود، candidateهای سازگارِ Top 100 با همان ترتیب snapshot در ابتدای pool ثابت research قرار می‌گیرند و بقیه‌ی ظرفیت با Halton deterministic پر می‌شود. optimizer تأیید می‌کند که `development_end_exclusive` آن snapshot قبل از اولین OOS است. منشأ candidate پیشنهادی در `recommended_candidate_source` و وضعیت زمانی seed در `research_seed_provenance` ثبت می‌شود؛ نتیجه‌های OOS همچنان هیچ نقشی در انتخاب ندارند.
@@ -104,10 +102,10 @@ python optimize.py --research --strategy ma --profile full `
 
 ```powershell
 python optimize.py --sealed-holdout --strategy ma `
-  --holdout-params outputs/optimize/ma_campaign/walk_forward_research/walk_forward_recommended_params.json `
-  --holdout-start 2025-06-01 --holdout-end latest `
+  --holdout-params outputs/optimize/ma_campaign_2023_2026/walk_forward_research/walk_forward_recommended_params.json `
+  --holdout-start 2026-01-01 --holdout-end latest `
   --holdout-min-trades 20 --holdout-max-drawdown 30 `
-  --output-dir outputs/optimize/ma_campaign
+  --output-dir outputs/optimize/ma_campaign_2023_2026
 ```
 
 برای MA و RSI سه سناریوی هزینه اجرا می‌شود:

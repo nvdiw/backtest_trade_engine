@@ -222,8 +222,8 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `--chunksize N` | `0` | Multiprocessing task chunk; `0` is automatic. |
 | `--elite-size N` | `20` | Top candidates guiding smart mutations. |
 | `--seed N` | `42` | Reproducible smart-search seed. |
-| `--start VALUE` | `2021-07-01` | Inclusive candidate-search date/index. |
-| `--end VALUE` | `2023-10-01` | Exclusive search end; newer data is reserved for OOS/holdout. |
+| `--start VALUE` | `2023-01-01` | Inclusive candidate-search date/index. |
+| `--end VALUE` | `2025-04-01` | Exclusive search end; newer data is reserved for OOS/holdout. |
 | `--validation-start VALUE` | — | Inclusive inner-validation start; pair with end. |
 | `--validation-end VALUE` | — | Exclusive inner-validation end; pair with start. |
 | `--validation-top N` | `20` | Training finalists evaluated on inner validation. |
@@ -262,27 +262,27 @@ Sequential profile refinement is normally more efficient and easier to validate 
 ```powershell
 # Focused search from Python defaults
 python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
-  --start 2021-07-01 --end 2023-10-01 `
+  --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/focused_01
 
 # Refine exits around an existing winner
 python optimize.py --mode smart --profile exit --tests 5000 -w 8 `
   --base-source file --base-params outputs/optimize/focused_01/best_params.json `
-  --start 2021-07-01 --end 2023-10-01 `
+  --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/exit_01
 
 # Non-overlapping inner validation (not the final unseen holdout)
 python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-  --start 2021-07-01 --end 2022-10-01 `
-  --validation-start 2022-10-01 --validation-end 2023-10-01 `
+  --start 2023-01-01 --end 2024-01-01 `
+  --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
   --min-trades 50 --max-drawdown 35 `
   --output-dir outputs/optimize/signal_validated
 
 # Resume the same compatible run
 python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-  --start 2021-07-01 --end 2022-10-01 `
-  --validation-start 2022-10-01 --validation-end 2023-10-01 `
+  --start 2023-01-01 --end 2024-01-01 `
+  --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
   --min-trades 50 --max-drawdown 35 `
   --output-dir outputs/optimize/signal_validated --resume
@@ -321,17 +321,17 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final search-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 500 reach Validation, 250 reach Stress, 150 reach the internal walk-forward, and 100 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 10,000 deterministic score-quantile samples so startup cost stays bounded. A compact `surrogate_history_cache.json.gz` is bootstrapped from a blend of whole-history and recent cycles, updated incrementally, and reused after restart; continuous runs keep both candidate and surrogate history in memory. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. Auto is intentionally restricted to the pre-OOS search zone by default:
 
 ```text
-Discovery    2022-10-01 -> 2023-10-01
-Validation   2022-04-01 -> 2022-10-01
-Stress       2021-07-01 -> 2022-04-01
-Walk-forward three disjoint folds inside 2021-07-01 -> 2023-10-01
-Final        2021-07-01 -> 2023-10-01
+Discovery    2024-01-01 -> 2025-04-01
+Validation   2023-07-01 -> 2024-01-01
+Stress       2023-01-01 -> 2023-07-01
+Walk-forward three disjoint folds inside 2023-01-01 -> 2024-01-01
+Final        2023-01-01 -> 2025-04-01
 ```
 
-Nested research then reports two-month OOS folds from 2023-10-01 through the boundary at 2025-06-01. That date is the holdout boundary, not the dataset end: the sealed range includes every candle through 2026-05-31 23:45:00 and therefore has an exclusive end of 2026-06-01 00:00:00. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
+Nested research starts from 2023-01-01 and reports four two-month OOS folds after the 2025-04-01 development boundary through early December 2025. The remaining December gap is an embargo before the sealed range begins at 2026-01-01. The holdout includes every candle through 2026-05-31 23:45:00, so its exclusive end is 2026-06-01 00:00:00. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
 
 ```powershell
-# Start an unlimited campaign; default output is outputs/optimize/auto
+# Start an unlimited campaign; default output is outputs/optimize/auto_2023_2026
 python .\optimize.py --auto -w 16
 
 # Stop safely
@@ -362,8 +362,8 @@ next block.
 
 Every 50-cycle snapshot also runs a deterministic random-window audit. By
 default, the best 10 finalists are evaluated on the same 50 random 6-12 month
-windows (500 backtests total). All windows begin on or after 2021-07-01 and 70%
-begin on or after 2022-10-01. The audit ranks consistency using per-window
+windows (500 backtests total). All windows begin on or after 2023-01-01 and 70%
+begin on or after 2024-01-01. The audit ranks consistency using per-window
 percentiles, median performance, the worst decile, positive-window ratio, failed
 windows, and score dispersion. Its most robust candidate becomes the snapshot's
 final `best_params.json`.
@@ -392,10 +392,10 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-final-top N` | `100` | Stress finalists sent to the full-range test. |
 | `--auto-hall-size N` | `100` | Winners retained across cycles. |
 | `--auto-cycles N` | `0` | Completed-cycle limit; `0` means until `Ctrl+C`. |
-| `--auto-discovery-start VALUE` | `2022-10-01` | Recent discovery start. |
-| `--auto-validation-start VALUE` | `2022-04-01` | Validation start; ends at discovery start. |
-| `--auto-stress-start VALUE` | `2021-07-01` | Stress and development-history start. |
-| `--auto-end VALUE` | `2023-10-01` | Exclusive search end; later data remains forward/OOS. |
+| `--auto-discovery-start VALUE` | `2024-01-01` | Recent discovery start. |
+| `--auto-validation-start VALUE` | `2023-07-01` | Validation start; ends at discovery start. |
+| `--auto-stress-start VALUE` | `2023-01-01` | Stress and development-history start. |
+| `--auto-end VALUE` | `2025-04-01` | Exclusive search end; later data remains forward/OOS. |
 | `--auto-importance-target METRIC` | `objective_score` | Importance target: objective score, profit, or profit %. |
 | `--auto-halving-rungs N` | `2` | Cheap expanding Discovery rungs; `0` disables them. |
 | `--auto-halving-keep RATIO` | `0.25` | Fraction promoted after every cheap rung. |
@@ -409,8 +409,8 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--snapshot-top N` | `100` | Winners written and reused at each snapshot. |
 | `--random-audit-tests N` | `500` | Total random-period tests after each snapshot. |
 | `--random-audit-top N` | `10` | Finalists compared on shared random periods. |
-| `--random-audit-earliest VALUE` | `2021-07-01` | Earliest allowed audit candle. |
-| `--random-audit-recent-start VALUE` | `2022-10-01` | Boundary for recent audit windows. |
+| `--random-audit-earliest VALUE` | `2023-01-01` | Earliest allowed audit candle. |
+| `--random-audit-recent-start VALUE` | `2024-01-01` | Boundary for recent audit windows. |
 | `--random-audit-recent-ratio X` | `0.70` | Required share of recent windows. |
 | `--random-audit-min-months N` | `6` | Minimum random-window duration. |
 | `--random-audit-max-months N` | `12` | Maximum random-window duration. |

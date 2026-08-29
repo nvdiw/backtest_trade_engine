@@ -236,8 +236,8 @@ optimizer هنگام ارزیابی کاندیدها چارت، پیام‌ها�
 | `--chunksize N` | `0` | اندازه chunk پردازش چندپردازه؛ صفر یعنی خودکار. |
 | `--elite-size N` | `20` | تعداد گزینه‌های برتر برای هدایت smart search. |
 | `--seed N` | `42` | seed برای تکرارپذیری جستجوی smart. |
-| `--start VALUE` | `2021-07-01` | شروع inclusive بازه‌ی جست‌وجوی candidate. |
-| `--end VALUE` | `2023-10-01` | پایان exclusive جست‌وجو؛ داده‌ی جدیدتر برای OOS و Holdout رزرو می‌شود. |
+| `--start VALUE` | `2023-01-01` | شروع inclusive بازه‌ی جست‌وجوی candidate. |
+| `--end VALUE` | `2025-04-01` | پایان exclusive جست‌وجو؛ داده‌ی جدیدتر برای OOS و Holdout رزرو می‌شود. |
 | `--validation-start VALUE` | — | شروع inclusive inner-validation؛ همراه end لازم است. |
 | `--validation-end VALUE` | — | پایان exclusive inner-validation؛ همراه start لازم است. |
 | `--validation-top N` | `20` | تعداد finalistهای train برای inner-validation. |
@@ -276,27 +276,27 @@ python optimize.py --profile risk --mode grid --dry-run
 ```powershell
 # جستجوی focused از تنظیمات اصلی
 python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
-  --start 2021-07-01 --end 2023-10-01 `
+  --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/focused_01
 
 # بهینه‌سازی خروج با حفظ سایر پارامترهای برنده قبلی
 python optimize.py --mode smart --profile exit --tests 5000 -w 8 `
   --base-source file --base-params outputs/optimize/focused_01/best_params.json `
-  --start 2021-07-01 --end 2023-10-01 `
+  --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/exit_01
 
 # inner-validation جدا؛ این بازه holdout نهایی و unseen نیست
 python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-  --start 2021-07-01 --end 2022-10-01 `
-  --validation-start 2022-10-01 --validation-end 2023-10-01 `
+  --start 2023-01-01 --end 2024-01-01 `
+  --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
   --min-trades 50 --max-drawdown 35 `
   --output-dir outputs/optimize/signal_validated
 
 # ادامه همان اجرای سازگار
 python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
-  --start 2021-07-01 --end 2022-10-01 `
-  --validation-start 2022-10-01 --validation-end 2023-10-01 `
+  --start 2023-01-01 --end 2024-01-01 `
+  --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
   --min-trades 50 --max-drawdown 35 `
   --output-dir outputs/optimize/signal_validated --resume
@@ -335,16 +335,16 @@ validation_results.json       جزئیات finalistهای inner-validation
 گزینه `--auto` یک کمپین قابل‌ادامه را تا زمان زدن `Ctrl+C` اجرا می‌کند. این حالت به‌صورت پیش‌فرض از grid اصلی `full` استفاده می‌کند؛ فقط برای جست‌وجوی عمداً کوچک‌تر `--profile focused` بدهید. هر چرخه دارای قیف پایداری با بازه‌های مستقل است: ۲۰۰۰ تست Discovery، سپس ۵۰۰ مورد برای Validation، ۲۵۰ مورد برای Stress، ۱۵۰ مورد برای Walk-forward داخلی و ۱۰۰ مورد برای Final. Auto عمداً فقط از ناحیه‌ی پیش از OOS استفاده می‌کند:
 
 ```text
-Discovery    2022-10-01 -> 2023-10-01
-Validation   2022-04-01 -> 2022-10-01
-Stress       2021-07-01 -> 2022-04-01
-Final        2021-07-01 -> 2023-10-01
+Discovery    2024-01-01 -> 2025-04-01
+Validation   2023-07-01 -> 2024-01-01
+Stress       2023-01-01 -> 2023-07-01
+Final        2023-01-01 -> 2025-04-01
 ```
 
-Nested research سپس foldهای OOS دوماهه را از `2023-10-01` تا قبل از `2025-06-01` گزارش می‌کند و داده‌ی بعد از آن برای holdout یک‌باره بسته می‌ماند. `2025-06-01` آخر دیتاست نیست؛ Holdout تا آخرین کندل `2026-05-31 23:45:00` ادامه دارد و پایان exclusive آن `2026-06-01 00:00:00` است. manifest هر snapshot پایان exclusive داده‌ی مصرف‌شده را نگه می‌دارد؛ seed هم‌پوشان یا بدون provenance فقط به‌صورت تشخیصی اجرا می‌شود و نمی‌تواند همه‌ی gateها را پاس کند.
+Nested research از `2023-01-01` شروع می‌شود و چهار Fold دوماهه‌ی OOS را از بعد مرز Development تا ابتدای دسامبر ۲۰۲۵ گزارش می‌کند. باقیمانده‌ی دسامبر نقش Embargo را دارد و داده‌ی `2026-01-01` به بعد برای Holdout یک‌باره بسته می‌ماند؛ Holdout تا آخرین کندل `2026-05-31 23:45:00` ادامه دارد و پایان exclusive آن `2026-06-01 00:00:00` است. manifest هر snapshot پایان exclusive داده‌ی مصرف‌شده را نگه می‌دارد؛ seed هم‌پوشان یا بدون provenance فقط به‌صورت تشخیصی اجرا می‌شود و نمی‌تواند همه‌ی gateها را پاس کند.
 
 ```powershell
-# شروع اجرای نامحدود؛ خروجی پیش‌فرض outputs/optimize/auto است
+# شروع اجرای نامحدود؛ خروجی پیش‌فرض outputs/optimize/auto_2023_2026 است
 python .\optimize.py --auto -w 16
 
 # برای توقف امن یک‌بار Ctrl+C بزنید
@@ -407,10 +407,10 @@ Auto از نتایج Discovery یاد می‌گیرد کدام پارامتره�
 | `--auto-final-top N` | `100` | تعداد برندگان Stress برای تست کل تاریخچه. |
 | `--auto-hall-size N` | `100` | تعداد برندگان نگه‌داری‌شده بین چرخه‌ها. |
 | `--auto-cycles N` | `0` | محدودیت چرخه؛ صفر یعنی ادامه تا `Ctrl+C`. |
-| `--auto-discovery-start VALUE` | `2022-10-01` | شروع بازه جدید Discovery. |
-| `--auto-validation-start VALUE` | `2022-04-01` | شروع Validation؛ پایان آن شروع Discovery است. |
-| `--auto-stress-start VALUE` | `2021-07-01` | شروع Stress و تاریخچه development. |
-| `--auto-end VALUE` | `2023-10-01` | پایان exclusive جست‌وجو؛ داده‌ی بعدی forward/OOS می‌ماند. |
+| `--auto-discovery-start VALUE` | `2024-01-01` | شروع بازه جدید Discovery. |
+| `--auto-validation-start VALUE` | `2023-07-01` | شروع Validation؛ پایان آن شروع Discovery است. |
+| `--auto-stress-start VALUE` | `2023-01-01` | شروع Stress و تاریخچه development. |
+| `--auto-end VALUE` | `2025-04-01` | پایان exclusive جست‌وجو؛ داده‌ی بعدی forward/OOS می‌ماند. |
 | `--auto-importance-target METRIC` | `objective_score` | معیار اهمیت: امتیاز نهایی، سود یا درصد سود. |
 
 نتیجه هر تست بلافاصله flush می‌شود و برای هر چرخه و مرحله checkpoint جدا وجود دارد. برای Resume باید profile، grid، پارامتر پایه، بازه‌ها، اندازه قیف و محدودیت‌های ریسک یکسان بمانند؛ تعداد worker و فاصله گزارش را می‌توان تغییر داد.
