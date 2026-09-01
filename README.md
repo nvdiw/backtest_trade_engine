@@ -1,5 +1,7 @@
 # Backtest Trade Engine
 
+[Build a strategy with its own dataset and timeframe](STRATEGY_PLUGIN_GUIDE_FA.md) — includes the copy-ready `example_strategy.py` configured for `data_candle/btc_1m_data.csv`.
+
 [Research workflow: nested walk-forward, sealed holdout, Top 100 snapshots, and strategy plug-ins](RESEARCH_GUIDE_FA.md)
 
 [راهنمای فارسی](README_FA.md)
@@ -222,8 +224,9 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `--chunksize N` | `0` | Multiprocessing task chunk; `0` is automatic. |
 | `--elite-size N` | `20` | Top candidates guiding smart mutations. |
 | `--seed N` | `42` | Reproducible smart-search seed. |
-| `--start VALUE` | `2023-01-01` | Inclusive candidate-search date/index. |
-| `--end VALUE` | `2025-04-01` | Exclusive search end; newer data is reserved for OOS/holdout. |
+| `--date-policy auto\|fixed` | `auto` | Derive recent ranges from the latest candle or preserve explicit dates. |
+| `--start VALUE` | auto-derived | Inclusive candidate-search date/index; fixed fallback is `2023-01-01`. |
+| `--end VALUE` | auto-derived | Exclusive search end; fixed fallback is `2025-04-01`. |
 | `--validation-start VALUE` | — | Inclusive inner-validation start; pair with end. |
 | `--validation-end VALUE` | — | Exclusive inner-validation end; pair with start. |
 | `--validation-top N` | `20` | Training finalists evaluated on inner validation. |
@@ -261,18 +264,18 @@ Sequential profile refinement is normally more efficient and easier to validate 
 
 ```powershell
 # Focused search from Python defaults
-python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
+python optimize.py --mode smart --profile focused --tests 5000 -w 8 --date-policy fixed `
   --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/focused_01
 
 # Refine exits around an existing winner
-python optimize.py --mode smart --profile exit --tests 5000 -w 8 `
+python optimize.py --mode smart --profile exit --tests 5000 -w 8 --date-policy fixed `
   --base-source file --base-params outputs/optimize/focused_01/best_params.json `
   --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/exit_01
 
 # Non-overlapping inner validation (not the final unseen holdout)
-python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 --date-policy fixed `
   --start 2023-01-01 --end 2024-01-01 `
   --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
@@ -280,7 +283,7 @@ python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
   --output-dir outputs/optimize/signal_validated
 
 # Resume the same compatible run
-python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 --date-policy fixed `
   --start 2023-01-01 --end 2024-01-01 `
   --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
@@ -318,20 +321,24 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 
 `--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. An existing compatible checkpoint in the output directory is resumed automatically, even when `--resume` is omitted. A new campaign also warm-starts from compatible values in `--base-params` when that file exists.
 
+Date handling defaults to `--date-policy auto`. A new campaign works backwards from the latest valid candle, reserves the latest five calendar months as sealed Holdout, inserts a one-month Embargo, reserves the preceding eight months for reporting-only Research OOS, and uses the preceding 27 months for Auto Development. Resolved dates are frozen in campaign state and manifests, so appending candles never moves a resumed experiment. Use `--date-policy fixed` to preserve explicit `--auto-*`, `--wf-*`, and `--holdout-*` boundaries.
+
+With the current dataset ending at `2026-08-01 00:00:00` exclusive, Auto resolves to Stress `2023-03-01 -> 2023-09-01`, Validation `2023-09-01 -> 2024-03-01`, Discovery `2024-03-01 -> 2025-06-01`, Research through `2026-02-01`, Embargo through `2026-03-01`, and sealed Holdout through `2026-08-01`.
+
 The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final search-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 500 reach Validation, 250 reach Stress, 150 reach the internal walk-forward, and 100 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 10,000 deterministic score-quantile samples so startup cost stays bounded. A compact `surrogate_history_cache.json.gz` is bootstrapped from a blend of whole-history and recent cycles, updated incrementally, and reused after restart; continuous runs keep both candidate and surrogate history in memory. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. Auto is intentionally restricted to the pre-OOS search zone by default:
 
 ```text
-Discovery    2024-01-01 -> 2025-04-01
-Validation   2023-07-01 -> 2024-01-01
-Stress       2023-01-01 -> 2023-07-01
-Walk-forward three disjoint folds inside 2023-01-01 -> 2024-01-01
-Final        2023-01-01 -> 2025-04-01
+Discovery    2024-03-01 -> 2025-06-01
+Validation   2023-09-01 -> 2024-03-01
+Stress       2023-03-01 -> 2023-09-01
+Walk-forward three disjoint folds inside 2023-03-01 -> 2024-03-01
+Final        2023-03-01 -> 2025-06-01
 ```
 
-Nested research starts from 2023-01-01 and reports four two-month OOS folds after the 2025-04-01 development boundary through early December 2025. The remaining December gap is an embargo before the sealed range begins at 2026-01-01. The holdout includes every candle through 2026-05-31 23:45:00, so its exclusive end is 2026-06-01 00:00:00. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
+Nested research starts from the rolling Development start and reports four two-month OOS folds after the `2025-06-01` boundary through `2026-02-01`. February is the Embargo; the sealed range begins at `2026-03-01` and currently includes every candle through `2026-07-31 23:45:00`. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
 
 ```powershell
-# Start an unlimited campaign; default output is outputs/optimize/auto_2023_2026
+# Start an unlimited campaign; its dated output directory is selected automatically
 python .\optimize.py --auto -w 16
 
 # Stop safely
@@ -362,8 +369,8 @@ next block.
 
 Every 50-cycle snapshot also runs a deterministic random-window audit. By
 default, the best 10 finalists are evaluated on the same 50 random 6-12 month
-windows (500 backtests total). All windows begin on or after 2023-01-01 and 70%
-begin on or after 2024-01-01. The audit ranks consistency using per-window
+windows (500 backtests total). Their earliest and recent boundaries are derived
+from the rolling Development and Discovery starts. The audit ranks consistency using per-window
 percentiles, median performance, the worst decile, positive-window ratio, failed
 windows, and score dispersion. Its most robust candidate becomes the snapshot's
 final `best_params.json`.
@@ -376,11 +383,13 @@ python optimize.py --auto --staged --dry-run -w 16
 
 Successive halving evaluates every selected candidate on a short recent range, promotes the best fraction to a larger range, and only then runs full Discovery. Minimum-trade constraints are scaled to rung length. Walk-forward evaluates fixed finalists on disjoint chronological folds; its score combines median, mean, worst-fold performance, and a variation penalty. Every fold has its own resumable CSV checkpoint.
 
-Cross-range ranking never compares raw scores directly. Auto preserves `objective_score`, records the exact `range_candles`, and calculates `time_normalized_score = objective_score × 35,064 / range_candles` (the annual 15-minute-candle rate). Thus a score of 100 over 30 days is approximately 1,217.5/year and does not incorrectly beat a score of 2,000 over a year. Stage percentiles remain duration-neutral, while transformed-quality, walk-forward stability, and normal train/validation comparisons use the normalized rate. Version-1 stage CSV files receive these columns atomically before resume.
+Cross-range ranking never compares raw scores directly. Auto preserves `objective_score`, records the exact `range_candles`, and calculates `time_normalized_score = objective_score × candles_per_year / range_candles`. `candles_per_year` is inferred from the selected strategy's own `TIMEFRAME` and dataset (35,064 for 15m and 525,960 for 1m). Stage percentiles remain duration-neutral, while transformed-quality, walk-forward stability, and normal train/validation comparisons use the normalized rate. Version-1 stage CSV files receive these columns atomically before resume.
 
 The optimization hot path skips allocation for non-triggered liquidation checks, uses direct slotted position access, caches cross-window calculations, and avoids repeated empty-position work. On the included 2025-01-01 to 2026-02-23 range, a warm single-process backtest dropped to roughly 0.15 seconds while all 59 saved winner metrics remained bit-for-bit/numerically identical. Multi-worker throughput can be substantially higher; 0.01-second single-test latency is not promised because every candle still has to be simulated.
 
 Every new cycle records its parent in `training_parent.json`. After the first complete cycle, the best Hall-of-Fame parameters become the next cycle's baseline and mutation parent, so training continues along the strongest known path while retaining random exploration.
+
+Candidate reports put decisions and critical risk/performance metrics before parameter columns. `candidate_catalog.csv/json` provides the reusable ranking, while `candidates/rank_NNN_params.json` and the matching summary file make every finalist directly inspectable. `ACCEPT` means eligible for independent Research, `WATCH` means promising but below one or more Auto thresholds, and `REJECT` prevents a fragile high-score result from becoming `best_params.json`.
 
 | Auto option | Default | Meaning |
 |---|---:|---|
@@ -392,10 +401,10 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--auto-final-top N` | `100` | Stress finalists sent to the full-range test. |
 | `--auto-hall-size N` | `100` | Winners retained across cycles. |
 | `--auto-cycles N` | `0` | Completed-cycle limit; `0` means until `Ctrl+C`. |
-| `--auto-discovery-start VALUE` | `2024-01-01` | Recent discovery start. |
-| `--auto-validation-start VALUE` | `2023-07-01` | Validation start; ends at discovery start. |
-| `--auto-stress-start VALUE` | `2023-01-01` | Stress and development-history start. |
-| `--auto-end VALUE` | `2025-04-01` | Exclusive search end; later data remains forward/OOS. |
+| `--auto-discovery-start VALUE` | auto-derived | Recent Discovery start; honored directly in fixed mode. |
+| `--auto-validation-start VALUE` | auto-derived | Validation start; honored directly in fixed mode. |
+| `--auto-stress-start VALUE` | auto-derived | Stress/development start; honored directly in fixed mode. |
+| `--auto-end VALUE` | auto-derived | Exclusive Development end; honored directly in fixed mode. |
 | `--auto-importance-target METRIC` | `objective_score` | Importance target: objective score, profit, or profit %. |
 | `--auto-halving-rungs N` | `2` | Cheap expanding Discovery rungs; `0` disables them. |
 | `--auto-halving-keep RATIO` | `0.25` | Fraction promoted after every cheap rung. |
@@ -409,8 +418,8 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 | `--snapshot-top N` | `100` | Winners written and reused at each snapshot. |
 | `--random-audit-tests N` | `500` | Total random-period tests after each snapshot. |
 | `--random-audit-top N` | `10` | Finalists compared on shared random periods. |
-| `--random-audit-earliest VALUE` | `2023-01-01` | Earliest allowed audit candle. |
-| `--random-audit-recent-start VALUE` | `2024-01-01` | Boundary for recent audit windows. |
+| `--random-audit-earliest VALUE` | auto-derived | Earliest allowed audit candle. |
+| `--random-audit-recent-start VALUE` | auto-derived | Boundary for recent audit windows. |
 | `--random-audit-recent-ratio X` | `0.70` | Required share of recent windows. |
 | `--random-audit-min-months N` | `6` | Minimum random-window duration. |
 | `--random-audit-max-months N` | `12` | Maximum random-window duration. |
@@ -455,6 +464,8 @@ python -m py_compile ma_strategy.py optimize.py trade_engine.py chart_renderer.p
 
 ```text
 ma_strategy.py          strategy, CLI, and signal flow
+example_strategy.py     copy-ready strategy plug-in with its own 1m dataset
+market_data.py          strategy-owned data, timeframe, coverage, and indices
 trade_engine.py         execution, accounting, liquidation, reports
 trade_csv_logger.py     CSV and optional XLSX writer
 chart_renderer.py       interactive/exportable chart

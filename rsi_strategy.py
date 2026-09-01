@@ -22,6 +22,7 @@ from indicators import Indicator
 from trade_engine import TradeEngine, trade_duration
 
 
+TIMEFRAME = "15m"
 _RSI_CACHE_LIMIT = 64
 _RSI_CACHE = OrderedDict()
 
@@ -243,6 +244,8 @@ def preload_optimizer_data(
             max(required_warmup, int(indicator_warmup_candles or 0))
             if use_indicator_warmup else 0
         ),
+        data_file=DATA_FILE,
+        timeframe=TIMEFRAME,
     )
 
 
@@ -313,7 +316,13 @@ def rsi_strategy(
         max(required_warmup, int(indicator_warmup_candles or 0))
         if use_indicator_warmup else 0
     )
-    market = TradeEngine.load_market_data(start=start, end=end, warmup_candles=warmup)
+    market = TradeEngine.load_market_data(
+        start=start,
+        end=end,
+        warmup_candles=warmup,
+        data_file=DATA_FILE,
+        timeframe=TIMEFRAME,
+    )
     open_prices = market["open_prices"]
     close_prices = market["close_prices"]
     low_prices = market["low_prices"]

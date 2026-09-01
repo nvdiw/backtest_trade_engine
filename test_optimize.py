@@ -14,9 +14,11 @@ from openpyxl import load_workbook
 from optimize import (
     ExtraTreesSurrogate, SmartCandidateGenerator, STAGED_AUTO_PHASES,
     _aggregate_random_audit, _aggregate_walk_forward_records, _auto_bootstrap,
+    _apply_date_policy, _auto_candidate_decision,
     _compact_auto_candidate_plans, _generate_random_audit_windows,
     _annotate_discovery_learning_scores, _apply_funnel_learning_scores,
     _latest_market_end, _learn_mutation_guidance, _learn_parameter_importance,
+    _load_frozen_date_protocol,
     _market_data_coverage, _open_csv_text,
     _resolve_csv_path,
     _read_candidate_plan, _read_surrogate_history_cache,
@@ -49,6 +51,78 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(coverage["end_exclusive"], "2026-06-01 00:00:00")
         self.assertEqual(latest_end, "2026-06-01 00:00:00")
         self.assertEqual(coverage["interval_seconds"], 900.0)
+
+    def test_auto_date_policy_rolls_back_from_latest_candle(self):
+        args = build_parser().parse_args(["--auto"])
+        protocol = _apply_date_policy(args, coverage={
+            "first_candle": "2018-01-01 00:00:00",
+            "last_candle": "2026-07-31 23:45:00",
+            "end_exclusive": "2026-08-01 00:00:00",
+            "interval_seconds": 900.0,
+        })
+
+        self.assertEqual(protocol["development_start"], "2023-03-01")
+        self.assertEqual(protocol["validation_start"], "2023-09-01")
+        self.assertEqual(protocol["discovery_start"], "2024-03-01")
+        self.assertEqual(protocol["development_end"], "2025-06-01")
+        self.assertEqual(protocol["research_end"], "2026-02-01")
+        self.assertEqual(protocol["holdout_start"], "2026-03-01")
+        self.assertEqual(protocol["holdout_end"], "2026-08-01")
+        self.assertEqual(args.auto_end, "2025-06-01")
+        self.assertEqual(args.wf_end, "2026-02-01")
+        self.assertEqual(args.holdout_start, "2026-03-01")
+
+    def test_fixed_date_policy_preserves_manual_boundaries(self):
+        args = build_parser().parse_args([
+            "--auto", "--date-policy", "fixed",
+            "--auto-stress-start", "10", "--auto-validation-start", "20",
+            "--auto-discovery-start", "30", "--auto-end", "40",
+        ])
+
+        protocol = _apply_date_policy(args)
+
+        self.assertEqual(protocol["policy"], "fixed")
+        self.assertEqual(args.auto_stress_start, "10")
+        self.assertEqual(args.auto_validation_start, "20")
+        self.assertEqual(args.auto_discovery_start, "30")
+        self.assertEqual(args.auto_end, "40")
+
+    def test_campaign_protocol_is_reused_across_research_and_holdout(self):
+        protocol = {
+            "policy": "auto", "development_start": "2023-03-01",
+            "development_end": "2025-06-01", "research_end": "2026-02-01",
+            "holdout_start": "2026-03-01", "holdout_end": "2026-08-01",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir:
+            report_dir = Path(temp_dir) / "walk_forward_research"
+            report_dir.mkdir()
+            (report_dir / "walk_forward_report.json").write_text(
+                json.dumps({"date_protocol": protocol}), encoding="utf-8"
+            )
+
+            loaded = _load_frozen_date_protocol(temp_dir)
+
+        self.assertEqual(loaded, protocol)
+
+    def test_auto_decision_explains_accept_watch_and_reject(self):
+        stable = {
+            "robust_score": 90, "recency_score": 85,
+            "stage_consistency_score": 90, "worst_stage_percentile": 0.7,
+            "stage_metrics": {
+                stage: {"total_profit_percent": 10, "maximum_drawdown": 10, "liquidations": 0}
+                for stage in ("discovery", "validation", "stress", "walk_forward", "final")
+            },
+        }
+        rejected = {
+            **stable,
+            "stage_metrics": {**stable["stage_metrics"], "final": {
+                "total_profit_percent": -5, "maximum_drawdown": 15, "liquidations": 0,
+            }},
+        }
+
+        self.assertEqual(_auto_candidate_decision(stable)["decision"], "ACCEPT")
+        self.assertEqual(_auto_candidate_decision(rejected)["decision"], "REJECT")
+        self.assertIn("non-positive final return", _auto_candidate_decision(rejected)["decision_reasons"])
 
     def test_legacy_auto_checkpoint_restores_saved_defaults_before_resume(self):
         args = build_parser().parse_args(["--auto"])
@@ -425,12 +499,19 @@ class OptimizerSearchTests(unittest.TestCase):
             individual_params_exists = (
                 snapshot / "params" / "rank_001_params.json"
             ).is_file()
+            individual_summary_exists = (
+                snapshot / "summaries" / "rank_001_summary.json"
+            ).is_file()
 
         self.assertEqual(best["entry_score_threshold"], 11)
         self.assertEqual(rows[0]["phase"], "signal")
         self.assertEqual(rows[0]["robust_score"], "99")
         self.assertEqual(ranked_json[0]["candidate_id"], "best")
         self.assertTrue(individual_params_exists)
+        self.assertTrue(individual_summary_exists)
+        self.assertEqual(list(rows[0])[0:4], [
+            "rank", "decision", "decision_reasons", "decision_scope",
+        ])
 
     def test_staged_campaign_locks_each_phase_winner_and_writes_block_snapshot(self):
         with tempfile.TemporaryDirectory() as temp_dir:

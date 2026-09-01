@@ -9,6 +9,7 @@ import sys
 import numpy as np
 
 from indicators import Indicator
+from fetch_calculate_data import DATA_FILE
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
 from strategy_config import (
@@ -19,6 +20,7 @@ from strategy_config import (
 
 
 DEFAULT_BEST_PARAMS_PATH = Path("outputs") / "optimize" / "best_params.json"
+TIMEFRAME = "15m"
 
 
 def resolve_parameter_source(source="config", *, params_file=None,
@@ -150,7 +152,11 @@ def ma_strategy(
         if use_indicator_warmup else 0
     )
     market = TradeEngine.load_market_data(
-        start=start, end=end, warmup_candles=indicator_warmup
+        start=start,
+        end=end,
+        warmup_candles=indicator_warmup,
+        data_file=DATA_FILE,
+        timeframe=TIMEFRAME,
     )
     start = market["start"]
     end = market["end"]

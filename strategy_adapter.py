@@ -27,6 +27,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable, Mapping
 
+from market_data import MarketDataSource
+
 
 StrategyCallable = Callable[..., Mapping[str, Any]]
 
@@ -78,6 +80,20 @@ class StrategyAdapter:
     @property
     def identifier(self) -> str:
         return f"{self.module_name}:{self.function_name}"
+
+    @property
+    def data_file(self) -> Path | None:
+        value = getattr(self.module, "DATA_FILE", None)
+        return Path(value) if value else None
+
+    @property
+    def timeframe(self) -> str | None:
+        value = getattr(self.module, "TIMEFRAME", None)
+        return str(value) if value else None
+
+    def market_data_source(self, override=None) -> MarketDataSource | None:
+        path = Path(override) if override else self.data_file
+        return MarketDataSource(path, self.timeframe) if path else None
 
     def default_values(self, tune: Mapping[str, Any] | None = None) -> dict[str, Any]:
         if self.config_builder is None:
@@ -166,6 +182,18 @@ class StrategyAdapter:
             if _callable_accepts(custom, "indicator_warmup_candles"):
                 kwargs["indicator_warmup_candles"] = warmup
             custom(**kwargs)
+            return
+        source = self.market_data_source()
+        if source is not None:
+            from trade_engine import TradeEngine
+
+            TradeEngine.load_market_data(
+                start=start,
+                end=end,
+                warmup_candles=warmup,
+                data_file=source.data_file,
+                timeframe=source.timeframe,
+            )
             return
         if self.module_name == "ma_strategy":
             from trade_engine import TradeEngine

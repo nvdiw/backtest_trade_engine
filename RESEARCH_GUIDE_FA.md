@@ -6,19 +6,20 @@
 
 ## تقسیم امن داده
 
-پیش‌فرض‌های پروژه عمداً داده را سه‌قسمت می‌کنند:
+حالت پیش‌فرض `--date-policy auto` است و بازه‌ها را از آخرین کندل معتبر به عقب می‌سازد. با دیتاست فعلی:
 
-- Candidate search و ساخت Top 100: از `2023-01-01` تا قبل از `2025-04-01`، با تمرکز Discovery روی `2024-01-01` به بعد
-- Nested walk-forward: train از `2023-01-01` رشد می‌کند و چهار OOS دوماهه‌ی بعد از مرز Development را تا ابتدای دسامبر ۲۰۲۵ پوشش می‌دهد؛ باقیمانده‌ی دسامبر Embargo است
-- Sealed holdout: از `2026-01-01` تا آخرین کندل موجود یعنی `2026-05-31 23:45:00`
+- Candidate search و Top 100: از `2023-03-01` تا قبل از `2025-06-01`، با Discovery از `2024-03-01`
+- Nested walk-forward: چهار OOS دوماهه از مرز Development تا `2026-02-01`
+- Embargo: از `2026-02-01` تا `2026-03-01`
+- Sealed Holdout: از `2026-03-01` تا آخرین کندل `2026-07-31 23:45:00` با پایان exclusive برابر `2026-08-01 00:00:00`
 
-توجه: `2026-01-01` مرز شروع داده‌ی کاملاً unseen است. چون `end` در موتور exclusive است، انتهای واقعی دیتاست به شکل `2026-06-01 00:00:00` نمایش داده می‌شود و در نتیجه کندل `2026-05-31 23:45:00` نیز داخل Holdout قرار دارد.
+این تاریخ‌ها هنگام ساخت کمپین قفل می‌شوند. با اضافه‌شدن داده، کمپین جدید بازه‌ی تازه می‌گیرد اما Resume همان مرزهای قبلی را حفظ می‌کند. برای تاریخ دستی، `--date-policy fixed` بدهید.
 
 ### محاسبه و cache اندیکاتورها
 
 در هر بازه، استراتژی فقط کندل‌های همان بازه به‌علاوه‌ی warmup لازم برای بزرگ‌ترین period موجود در pool را بارگذاری می‌کند؛ از ابتدای ۲۰۱۸ دوباره معامله یا امتیاز محاسبه نمی‌شود. کندل‌های warmup واقعاً برای seed کردن MA، RSI، ATR و ADX مصرف می‌شوند اما از معامله، سود و آمار حذف هستند. هر worker یک warmup ثابت دارد تا همه‌ی candidateها یک slice مشترک بگیرند؛ آرایه‌های MA/RSI و سایر اندیکاتورهای همسان نیز با کلید بازه و period cache می‌شوند و فقط هنگام تغییر واقعی period دوباره ساخته می‌شوند.
 
-این جداسازی مهم است: snapshot پیش از اولین OOS تمام می‌شود، پس Top 100 آینده‌ی foldهای گزارشی را ندیده است. `manifest.json` بازه‌ی مصرف‌شده‌ی snapshot را ذخیره می‌کند و research آن را کنترل می‌کند. seed هم‌پوشان یا بدون provenance به‌صورت پیش‌فرض رد می‌شود. گزینه‌ی `--allow-research-seed-overlap` فقط اجرای تشخیصی را ممکن می‌کند و gate مربوط را `false` نگه می‌دارد؛ چنین اجرايی هرگز `accepted=true` نمی‌شود. اگر `--auto-end` را جلو ببرید، مسئولیت حفظ همین مرز زمانی با شماست.
+این جداسازی مهم است: snapshot پیش از اولین OOS تمام می‌شود، پس Top 100 آینده‌ی foldهای گزارشی را ندیده است. `manifest.json` بازه‌ی مصرف‌شده‌ی snapshot را ذخیره می‌کند و research آن را کنترل می‌کند. seed هم‌پوشان یا بدون provenance به‌صورت پیش‌فرض رد می‌شود. گزینه‌ی `--allow-research-seed-overlap` فقط اجرای تشخیصی را ممکن می‌کند و gate مربوط را `false` نگه می‌دارد؛ چنین اجرايی هرگز `accepted=true` نمی‌شود. اگر در حالت `--date-policy fixed` مرزها را جلو ببرید، مسئولیت حفظ همین جداسازی با شماست.
 
 ## مرحله ۱: جست‌وجوی توسعه و Top 100 هر ۵۰ cycle
 
@@ -26,10 +27,8 @@
 
 ```powershell
 python optimize.py --auto --strategy ma --profile full `
-  --auto-stress-start 2023-01-01 --auto-validation-start 2023-07-01 `
-  --auto-discovery-start 2024-01-01 --auto-end 2025-04-01 `
   --auto-cycles 50 --snapshot-cycles 50 --snapshot-top 100 `
-  -w 8 --output-dir outputs/optimize/ma_campaign_2023_2026
+  -w 8 --output-dir outputs/optimize/ma_campaign_recent
 ```
 
 برای ادامه‌ی همان کمپین:
@@ -37,13 +36,13 @@ python optimize.py --auto --strategy ma --profile full `
 ```powershell
 python optimize.py --auto --strategy ma --profile full `
   --auto-cycles 100 --snapshot-cycles 50 --snapshot-top 100 `
-  -w 8 --output-dir outputs/optimize/ma_campaign_2023_2026 --resume
+  -w 8 --output-dir outputs/optimize/ma_campaign_recent --resume
 ```
 
 اگر `--auto-cycles 0` باشد، اجرا تا `Ctrl+C` ادامه دارد. در cycleهای ۵۰، ۱۰۰، ۱۵۰ و ... خروجی زیر ساخته می‌شود:
 
 ```text
-outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/
+outputs/optimize/ma_campaign_recent/snapshots/cycles_000050/
 ├── top_100.json
 ├── top_100.csv
 ├── best_params.json
@@ -52,6 +51,9 @@ outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/
     ├── rank_001_params.json
     ├── rank_002_params.json
     └── ... rank_100_params.json
+└── summaries/
+    ├── rank_001_summary.json
+    └── ... rank_100_summary.json
 ```
 
 رتبه‌بندی snapshot فقط سود خام نیست؛ امتیاز robust چندبازه‌ای و پایداری ناحیه‌ی اطراف پارامتر نیز در آن لحاظ می‌شود.
@@ -64,9 +66,8 @@ outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/
 ```powershell
 python optimize.py --research --strategy ma --profile full `
   --base-source best `
-  --base-params outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/best_params.json `
-  --research-seeds outputs/optimize/ma_campaign_2023_2026/snapshots/cycles_000050/top_100.json `
-  --wf-start 2023-01-01 --wf-end 2026-01-01 `
+  --base-params outputs/optimize/ma_campaign_recent/snapshots/cycles_000050/best_params.json `
+  --research-seeds outputs/optimize/ma_campaign_recent/snapshots/cycles_000050/top_100.json `
   --wf-train-months 24 --wf-validation-months 3 `
   --wf-test-months 2 --wf-step-months 2 `
   --research-tests 500 --research-validation-top 50 `
@@ -76,7 +77,7 @@ python optimize.py --research --strategy ma --profile full `
   --min-oos-folds 4 --min-positive-fold-ratio 0.60 `
   --min-dsr-probability 0.95 --max-pbo 0.20 `
   --min-parameter-consensus 0.50 --max-parameter-spread 0.35 `
-  -w 8 --output-dir outputs/optimize/ma_campaign_2023_2026
+  -w 8 --output-dir outputs/optimize/ma_campaign_recent
 ```
 
 فایل `--research-seeds` اختیاری است. وقتی داده شود، candidateهای سازگارِ Top 100 با همان ترتیب snapshot در ابتدای pool ثابت research قرار می‌گیرند و بقیه‌ی ظرفیت با Halton deterministic پر می‌شود. optimizer تأیید می‌کند که `development_end_exclusive` آن snapshot قبل از اولین OOS است. منشأ candidate پیشنهادی در `recommended_candidate_source` و وضعیت زمانی seed در `research_seed_provenance` ثبت می‌شود؛ نتیجه‌های OOS همچنان هیچ نقشی در انتخاب ندارند.
@@ -89,6 +90,7 @@ python optimize.py --research --strategy ma --profile full `
 - `walk_forward_research/walk_forward_candidate_params.json`: برنده‌ی انتخاب‌شده با Train/inner-validation برای بررسی، حتی اگر gateها رد شوند
 - `walk_forward_research/walk_forward_recommended_params.json`: فقط در صورت `accepted=true` ساخته می‌شود و تنها مسیر پیش‌فرض مجاز برای holdout است
 - `walk_forward_research/research_decision.json`: وضعیت آماده‌بودن holdout و نام gateهای ردشده
+- `walk_forward_research/research_candidate_catalog.csv/json`: Candidateهای منتخب Train/Validation با فایل پارامتر مستقل، ابتدا اطلاعات تصمیم و سپس متغیرها
 - `walk_forward_research/trial_ledger.json`: تعداد دقیق train، validation و OOS test و تعداد مؤثر trialهای DSR
 - `walk_forward_research/parameter_stability.json`: تغییر هر پارامتر بین foldها، consensus و spread
 - `walk_forward_research/fold_XX.json`: انتخاب و نتیجه‌ی کامل هر fold
@@ -102,10 +104,9 @@ python optimize.py --research --strategy ma --profile full `
 
 ```powershell
 python optimize.py --sealed-holdout --strategy ma `
-  --holdout-params outputs/optimize/ma_campaign_2023_2026/walk_forward_research/walk_forward_recommended_params.json `
-  --holdout-start 2026-01-01 --holdout-end latest `
+  --holdout-params outputs/optimize/ma_campaign_recent/walk_forward_research/walk_forward_recommended_params.json `
   --holdout-min-trades 20 --holdout-max-drawdown 30 `
-  --output-dir outputs/optimize/ma_campaign_2023_2026
+  --output-dir outputs/optimize/ma_campaign_recent
 ```
 
 برای MA و RSI سه سناریوی هزینه اجرا می‌شود:
@@ -184,7 +185,8 @@ hookهای اختیاری قابل شناسایی:
 - `is_valid_candidate(params)`: حذف ترکیب‌های نامعتبر قبل از backtest
 - `canonicalize_candidate(params, baseline)`: یکی‌کردن پارامترهای بی‌اثر
 - `preload_optimizer_data(...)`: cache داده در worker
-- `DATA_FILE`: مسیر داده برای audit و fingerprint
+- `DATA_FILE`: مسیر دیتاست اختصاصی Strategy برای اجرا، تاریخ‌ها، audit و fingerprint
+- `TIMEFRAME`: فاصله‌ی کندل مانند `1m` یا `15m`؛ با فاصله‌ی واقعی timestampها تطبیق داده می‌شود
 - `EXECUTION_SCENARIOS`: سناریوهای هزینه‌ی holdout
 
 ## کنترل‌های اعتبار که خودکار اعمال می‌شوند

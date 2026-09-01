@@ -14,6 +14,7 @@ from chart_renderer import render_backtest_chart
 from check_monthly_data import write_monthly_summary
 from fetch_calculate_data import fetch_all_data
 from get_candle_index import get_candle_index, get_month_start_indices
+from market_data import MarketDataSource
 from trade_csv_logger import TradeCSVLogger
 
 
@@ -226,13 +227,29 @@ class TradeEngine:
 
     @staticmethod
     @lru_cache(maxsize=4)
-    def load_market_data(start="2025-01-01", end="2026-02-23", warmup_candles=0):
+    def load_market_data(
+        start="2025-01-01",
+        end="2026-02-23",
+        warmup_candles=0,
+        data_file=None,
+        timeframe=None,
+    ):
         """Resolve and cache an inclusive start/exclusive end candle range.
 
         Optimization workers call the strategy many times for the same range.  The
         cached immutable market arrays avoid re-reading and parsing the CSV for
         every candidate in a worker process.
         """
+        # The no-argument branch preserves the legacy MA loader and its public
+        # test/mocking surface.  Plug-in strategies pass their own DATA_FILE and
+        # TIMEFRAME and are completely independent of the 15-minute dataset.
+        if data_file is not None:
+            return MarketDataSource(data_file, timeframe).load(
+                start=start,
+                end=end,
+                warmup_candles=warmup_candles,
+            )
+
         start_index = get_candle_index(start) if isinstance(start, str) else int(start)
         end_index = get_candle_index(end) if isinstance(end, str) else int(end)
         if end_index <= start_index:
@@ -364,6 +381,15 @@ class TradeEngine:
             return equity_curve, max_drawdown
         drawdown = (total_assets - peak) / peak * 100
         return equity_curve, min(max_drawdown, drawdown)
+
+    def update_account_drawdown(self, account: AccountState, total_assets: float):
+        """Record mark-to-market drawdown through the public strategy API."""
+        account.equity_curve, account.max_drawdown = self._update_drawdown(
+            account.equity_curve,
+            account.max_drawdown,
+            float(total_assets),
+        )
+        return account.max_drawdown
 
     @staticmethod
     def position_equity(position, price):
@@ -1389,6 +1415,128 @@ class TradeEngine:
             "expectancy_percent": expectancy_pct,
             "calmar_ratio": calmar_ratio,
         }
+
+    def finalize_account(
+        self,
+        account: AccountState,
+        *,
+        first_balance: float,
+        open_positions=(),
+        ending_mark_price: float,
+        start_time,
+        end_time,
+        monthly_returns=(),
+        output_file=None,
+        extra_metrics=None,
+    ):
+        """Build the generic optimizer/report result for any strategy.
+
+        Unlike :meth:`finalize_backtest`, this API has no MA, RSI, scale-in, or
+        chart-specific state.  New strategy plug-ins can use the execution and
+        accounting methods on ``TradeEngine`` and finish with this compact
+        contract.  Strategy-specific numeric metrics may be supplied through
+        ``extra_metrics``.
+        """
+        positions = list(open_positions or ())
+        ending_mark_price = float(ending_mark_price)
+        open_margin = sum(position.margin for position in positions)
+        marked_equity = self.open_positions_equity(positions, ending_mark_price)
+        marked_equity_no_fee = sum(
+            self.position_equity_no_fee(position, ending_mark_price)
+            for position in positions
+        )
+        static_balance = account.balance + open_margin + account.save_money
+        final_balance = account.balance + marked_equity + account.save_money
+        final_balance_without_fee = (
+            account.balance_without_fee + marked_equity_no_fee + account.save_money
+        )
+        total_profit = final_balance - float(first_balance)
+        realized_profit = sum(account.profits_lst)
+        unrealized_profit = marked_equity - open_margin
+        closed_trades = int(account.count_closed_orders)
+        wins = int(account.total_wins)
+        losses = int(account.total_losses)
+        win_rate = wins * 100.0 / closed_trades if closed_trades else 0.0
+        monthly_returns = [float(value) for value in (monthly_returns or ())]
+        profit_months = sum(value > 0 for value in monthly_returns)
+        loss_months = sum(value < 0 for value in monthly_returns)
+        return_percent = (
+            final_balance * 100.0 / float(first_balance) - 100.0
+            if first_balance else 0.0
+        )
+        score_metrics = self.calculate_performance_score(
+            return_percent=return_percent,
+            max_drawdown=account.max_drawdown,
+            win_rate=win_rate,
+            profits=account.profits_lst,
+            first_balance=float(first_balance),
+            profit_months=profit_months,
+            loss_months=loss_months,
+            liquidations=account.total_liquids,
+            closed_trades=closed_trades,
+        )
+        result = {
+            "final_balance_static": round(static_balance, 6),
+            "final_balance_dynamic": round(final_balance, 6),
+            "final_balance": round(final_balance, 6),
+            "final_balance_without_fee": round(final_balance_without_fee, 6),
+            "total_profit": round(total_profit, 6),
+            "realized_profit": round(realized_profit, 6),
+            "unrealized_profit": round(unrealized_profit, 6),
+            "open_positions": len(positions),
+            "total_fees": round(account.deducting_fee_total, 6),
+            "saved_money": round(account.save_money, 6),
+            "liquidations": int(account.total_liquids),
+            "total_profit_percent": round(return_percent, 6),
+            "closed_trades": closed_trades,
+            "wins": wins,
+            "losses": losses,
+            "long_trades": int(account.total_long),
+            "long_wins": int(account.total_wins_long),
+            "long_losses": int(account.total_long - account.total_wins_long),
+            "short_trades": int(account.total_short),
+            "short_wins": int(account.total_wins_short),
+            "short_losses": int(account.total_short - account.total_wins_short),
+            "maximum_drawdown": round(float(account.max_drawdown), 6),
+            "win_rate": round(win_rate, 6),
+            "profit_months": int(profit_months),
+            "loss_months": int(loss_months),
+            "trade_profits": list(account.profits_lst),
+            "monthly_returns": monthly_returns,
+            **score_metrics,
+        }
+        if extra_metrics:
+            result.update(dict(extra_metrics))
+
+        if self.write_trades:
+            output_file = output_file or os.path.join(
+                self.output_dir, "trades", "data_orders.csv"
+            )
+            days, hours, minutes = trade_duration(start_time, end_time)
+            self.csv_logger.save_csv(
+                first_balance=first_balance,
+                final_balance=final_balance,
+                total_profit=total_profit,
+                total_profit_percent=return_percent,
+                total_fee=account.deducting_fee_total,
+                start_time=start_time,
+                end_time=end_time,
+                days=days,
+                hours=hours,
+                minutes=minutes,
+                overview_metrics={
+                    "Performance": {
+                        "Optimizer score": score_metrics["score"],
+                        "Maximum drawdown %": account.max_drawdown,
+                        "Win rate %": win_rate,
+                        "Profit factor": score_metrics["profit_factor"],
+                        "Expectancy %": score_metrics["expectancy_percent"],
+                        "Calmar ratio": score_metrics["calmar_ratio"],
+                    }
+                },
+                file_name=str(output_file),
+            )
+        return result
 
     def finalize_backtest(self, **state):
         """Calculate final metrics, emit reports/files, render the chart, and return results."""

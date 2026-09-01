@@ -8,6 +8,7 @@ Examples:
 """
 
 import argparse
+import calendar
 import csv
 from dataclasses import replace
 import gzip
@@ -48,6 +49,7 @@ from market_data_audit import (
     fingerprint_config,
     fingerprint_data,
 )
+from market_data import MarketDataSource
 
 
 # Every key is an existing MAStrategyConfig setting.  Defaults in
@@ -259,6 +261,35 @@ STAGED_AUTO_PHASES = (
     ("scale", "scale"),
 )
 
+
+def _strategy_staged_phases(args):
+    """Return a strategy-owned staged schedule, preserving the MA default."""
+    adapter = _adapter_from_args(args)
+    profiles = getattr(args, "_parameter_profiles", None) or (
+        PARAMETER_PROFILES
+        if adapter.identifier == "ma_strategy:ma_strategy"
+        else adapter.discovered_profiles()
+    )
+    declared = getattr(adapter.module, "STAGED_PHASES", None)
+    if declared is None:
+        if adapter.identifier == "ma_strategy:ma_strategy":
+            return STAGED_AUTO_PHASES
+        return ()
+    phases = []
+    for item in declared:
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            raise ValueError("STAGED_PHASES entries must be (phase_name, profile_name)")
+        phase_name, profile_name = str(item[0]), str(item[1])
+        if profile_name not in profiles:
+            raise ValueError(
+                f"STAGED_PHASES profile {profile_name!r} is not exposed by "
+                f"{adapter.identifier}"
+            )
+        phases.append((phase_name, profile_name))
+    if not phases:
+        raise ValueError("STAGED_PHASES cannot be empty")
+    return tuple(phases)
+
 # Backward-compatible public name used by tests and imports.
 param_grid = FULL_PARAM_GRID
 
@@ -282,9 +313,17 @@ RESULT_COLUMNS = [
     "scale_short_winrate", "scale_short_profit",
 ]
 
+IMPORTANT_RESULT_COLUMNS = [
+    "total_profit_percent", "total_profit", "maximum_drawdown",
+    "closed_trades", "win_rate", "profit_factor", "expectancy_percent",
+    "calmar_ratio", "liquidations", "final_balance", "total_fees",
+]
+
 DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
 AUTO_TIME_COLUMNS = ["time_normalized_score", "range_candles"]
 CANDLES_PER_YEAR_15M = 365.25 * 24 * 4
+_ACTIVE_MARKET_DATA_SOURCE = None
+_ACTIVE_CANDLES_PER_YEAR = CANDLES_PER_YEAR_15M
 SURROGATE_MAX_TRAINING_SAMPLES = 10_000
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
 SURROGATE_CACHE_VERSION = 2
@@ -298,8 +337,12 @@ DEFAULT_AUTO_DISCOVERY_START = "2024-01-01"
 DEFAULT_DEVELOPMENT_END = "2025-04-01"
 DEFAULT_RESEARCH_END = "2026-01-01"
 DEFAULT_HOLDOUT_START = "2026-01-01"
-DEFAULT_AUTO_CAMPAIGN_DIR = "auto_2023_2026"
-DEFAULT_STAGED_CAMPAIGN_DIR = "staged_2023_2026"
+DEFAULT_ROLLING_DEVELOPMENT_MONTHS = 27
+DEFAULT_ROLLING_OOS_MONTHS = 8
+DEFAULT_ROLLING_EMBARGO_MONTHS = 1
+DEFAULT_ROLLING_HOLDOUT_MONTHS = 5
+DEFAULT_ROLLING_STRESS_MONTHS = 6
+DEFAULT_ROLLING_VALIDATION_MONTHS = 6
 
 _WORKER_START = DEFAULT_DEVELOPMENT_START
 _WORKER_END = DEFAULT_DEVELOPMENT_END
@@ -912,7 +955,7 @@ def _robust_validation_score(
 
 
 def _time_normalized_score(score, range_candles):
-    """Convert a raw optimizer score to a comparable 15-minute annual rate."""
+    """Convert a raw optimizer score to a timeframe-aware annual rate."""
     numeric_score = _finite_number(score)
     try:
         candles = int(range_candles)
@@ -920,7 +963,7 @@ def _time_normalized_score(score, range_candles):
         return None
     if numeric_score is None or candles <= 0:
         return None
-    return numeric_score * CANDLES_PER_YEAR_15M / candles
+    return numeric_score * _ACTIVE_CANDLES_PER_YEAR / candles
 
 
 def _range_candle_count(range_start, range_end):
@@ -929,9 +972,10 @@ def _range_candle_count(range_start, range_end):
 
 AUTO_STAGE_ORDER = ("discovery", "validation", "stress", "walk_forward", "final")
 AUTO_STAGE_WEIGHTS = {
-    "discovery": 0.25,
-    "validation": 0.20,
-    "stress": 0.15,
+    # Recent Discovery evidence is intentionally stronger than older regimes.
+    "discovery": 0.35,
+    "validation": 0.15,
+    "stress": 0.10,
     "walk_forward": 0.30,
     "final": 0.10,
 }
@@ -1385,20 +1429,111 @@ def _combine_auto_stage_records(stage_records):
                 - 10.0 * dispersion
                 + 10.0 * transformed_quality
             )
-        combined.append({
+        combined_record = {
             "candidate_id": candidate_id,
             "params": latest["params"],
             "robust_score": robust_score,
+            "recency_score": (
+                100.0 * percentiles.get("discovery", {}).get(candidate_id)
+                if percentiles.get("discovery", {}).get(candidate_id) is not None
+                else None
+            ),
+            "stage_consistency_score": (
+                100.0 * (1.0 - statistics.pstdev(ranks)) if ranks else None
+            ),
             "worst_stage_percentile": min(ranks) if ranks else None,
             "stage_scores": stage_scores,
             "stage_metrics": stage_metrics,
-        })
-    combined.sort(key=lambda record: record["robust_score"], reverse=True)
+        }
+        combined_record.update(_auto_candidate_decision(combined_record))
+        combined.append(combined_record)
+    combined.sort(key=_auto_candidate_rank_key, reverse=True)
     return combined
 
 
-def _market_data_coverage():
-    """Return explicit inclusive candle bounds and the exclusive dataset end."""
+def _auto_candidate_decision(record):
+    """Classify Auto evidence for research triage, never for live deployment."""
+    robust = _finite_number(record.get("robust_score"))
+    recency = _finite_number(record.get("recency_score"))
+    consistency = _finite_number(record.get("stage_consistency_score"))
+    worst = _finite_number(record.get("worst_stage_percentile"))
+    stages = record.get("stage_metrics", {}) or {}
+    final_metrics = stages.get("final", {}) or {}
+    final_return = _finite_number(final_metrics.get("total_profit_percent"))
+    final_drawdown = _finite_number(final_metrics.get("maximum_drawdown"))
+    liquidations = sum(
+        int((metrics or {}).get("liquidations", 0) or 0)
+        for metrics in stages.values()
+    )
+    reject_reasons = []
+    if robust is None:
+        reject_reasons.append("invalid robust score")
+    if liquidations > 0:
+        reject_reasons.append("liquidation detected")
+    if final_return is not None and final_return <= 0:
+        reject_reasons.append("non-positive final return")
+    if final_drawdown is not None and abs(final_drawdown) > 50:
+        reject_reasons.append("final drawdown above 50%")
+    if worst is not None and worst < 0.10:
+        reject_reasons.append("worst stage below 10th percentile")
+    if recency is not None and recency < 10:
+        reject_reasons.append("recent Discovery below 10th percentile")
+    complete = all(stage in stages for stage in AUTO_STAGE_ORDER)
+    if reject_reasons:
+        decision = "REJECT"
+        reasons = reject_reasons
+    elif (
+        complete
+        and worst is not None and worst >= 0.50
+        and recency is not None and recency >= 60
+        and consistency is not None and consistency >= 75
+        and final_return is not None and final_return > 0
+    ):
+        decision = "ACCEPT"
+        reasons = [
+            "stable across every Auto stage",
+            "strong recent Discovery rank",
+            "positive full-development return",
+            "eligible for independent Research validation",
+        ]
+    else:
+        decision = "WATCH"
+        reasons = []
+        if not complete:
+            reasons.append("Auto funnel is not complete")
+        if worst is None or worst < 0.50:
+            reasons.append("worst-stage rank is below ACCEPT threshold")
+        if recency is None or recency < 60:
+            reasons.append("recent Discovery rank is below ACCEPT threshold")
+        if consistency is None or consistency < 75:
+            reasons.append("cross-stage consistency is below ACCEPT threshold")
+        if final_return is None:
+            reasons.append("full-development return is not available")
+    return {
+        "decision": decision,
+        "decision_scope": "Auto triage only; Research and sealed Holdout still required",
+        "decision_reasons": reasons,
+    }
+
+
+def _auto_candidate_rank_key(record):
+    """Prefer research-eligible evidence before raw score magnitude."""
+    decision_priority = {"ACCEPT": 2, "WATCH": 1, "REJECT": 0}
+    return (
+        decision_priority.get(record.get("decision"), 1),
+        _finite_number(record.get("robust_score")) or -math.inf,
+        _finite_number(record.get("recency_score")) or -math.inf,
+        _finite_number(record.get("stage_consistency_score")) or -math.inf,
+    )
+
+
+def _market_data_coverage(source=None):
+    """Return bounds for the active strategy's own candle dataset."""
+    source = source or _ACTIVE_MARKET_DATA_SOURCE
+    if source is not None:
+        return source.coverage()
+
+    # Backward-compatible fallback for callers importing this helper directly.
     from get_candle_index import _open_times
 
     open_times = _open_times().dropna()
@@ -1424,23 +1559,175 @@ def _latest_market_end():
     return _market_data_coverage()["end_exclusive"]
 
 
+def _shift_calendar_months(value, months):
+    """Shift a datetime by whole calendar months while preserving valid days."""
+    month_index = value.year * 12 + (value.month - 1) + int(months)
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return value.replace(year=year, month=month, day=day)
+
+
+def _date_bound(value):
+    """Use compact ISO dates for midnight bounds and timestamps otherwise."""
+    if value.hour == value.minute == value.second == value.microsecond == 0:
+        return value.strftime("%Y-%m-%d")
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _rolling_date_protocol(args, coverage=None):
+    """Derive a leak-resistant recent protocol backwards from the latest candle."""
+    coverage = coverage or _market_data_coverage()
+    data_end = datetime.fromisoformat(coverage["end_exclusive"])
+    holdout_start = _shift_calendar_months(
+        data_end, -int(args.rolling_holdout_months)
+    )
+    research_end = _shift_calendar_months(
+        holdout_start, -int(args.rolling_embargo_months)
+    )
+    development_end = _shift_calendar_months(
+        research_end, -int(args.rolling_oos_months)
+    )
+    development_start = _shift_calendar_months(
+        development_end, -int(args.rolling_development_months)
+    )
+    validation_start = _shift_calendar_months(
+        development_start, int(args.rolling_stress_months)
+    )
+    discovery_start = _shift_calendar_months(
+        validation_start, int(args.rolling_validation_months)
+    )
+    if not development_start < validation_start < discovery_start < development_end:
+        raise ValueError(
+            "rolling date policy leaves no Discovery range; reduce stress/validation "
+            "months or increase development months"
+        )
+    return {
+        "policy": "auto",
+        "dataset_last_candle": coverage["last_candle"],
+        "dataset_end_exclusive": coverage["end_exclusive"],
+        "development_start": _date_bound(development_start),
+        "validation_start": _date_bound(validation_start),
+        "discovery_start": _date_bound(discovery_start),
+        "development_end": _date_bound(development_end),
+        "research_end": _date_bound(research_end),
+        "embargo_start": _date_bound(research_end),
+        "holdout_start": _date_bound(holdout_start),
+        "holdout_end": _date_bound(data_end),
+        "months": {
+            "development": int(args.rolling_development_months),
+            "oos": int(args.rolling_oos_months),
+            "embargo": int(args.rolling_embargo_months),
+            "holdout": int(args.rolling_holdout_months),
+            "stress": int(args.rolling_stress_months),
+            "validation": int(args.rolling_validation_months),
+        },
+    }
+
+
+def _apply_date_policy(args, coverage=None):
+    """Resolve automatic dates once; fixed mode preserves every CLI boundary."""
+    if getattr(args, "date_policy", "auto") == "fixed":
+        protocol = {
+            "policy": "fixed",
+            "development_start": args.auto_stress_start,
+            "validation_start": args.auto_validation_start,
+            "discovery_start": args.auto_discovery_start,
+            "development_end": args.auto_end,
+            "research_end": args.wf_end,
+            "holdout_start": args.holdout_start,
+            "holdout_end": args.holdout_end,
+        }
+    else:
+        protocol = _rolling_date_protocol(args, coverage=coverage)
+        args.start = protocol["development_start"]
+        args.end = protocol["development_end"]
+        args.auto_stress_start = protocol["development_start"]
+        args.auto_validation_start = protocol["validation_start"]
+        args.auto_discovery_start = protocol["discovery_start"]
+        args.auto_end = protocol["development_end"]
+        args.random_audit_earliest = protocol["development_start"]
+        args.random_audit_recent_start = protocol["discovery_start"]
+        args.wf_start = protocol["development_start"]
+        args.wf_end = protocol["research_end"]
+        args.holdout_start = protocol["holdout_start"]
+        args.holdout_end = "latest"
+    args._date_protocol = protocol
+    return protocol
+
+
+def _restore_frozen_date_protocol(args, protocol):
+    """Apply persisted boundaries so resumed campaigns never drift with new candles."""
+    if not protocol:
+        return
+    mappings = {
+        "development_start": ("start", "auto_stress_start", "wf_start", "random_audit_earliest"),
+        "validation_start": ("auto_validation_start",),
+        "discovery_start": ("auto_discovery_start", "random_audit_recent_start"),
+        "development_end": ("end", "auto_end"),
+        "research_end": ("wf_end",),
+        "holdout_start": ("holdout_start",),
+    }
+    for protocol_key, argument_names in mappings.items():
+        value = protocol.get(protocol_key)
+        if value is None:
+            continue
+        for argument_name in argument_names:
+            setattr(args, argument_name, value)
+    args._date_protocol = dict(protocol)
+
+
+def _load_frozen_date_protocol(output_dir):
+    """Find the newest authoritative protocol across the campaign workflow."""
+    output_dir = Path(output_dir)
+    candidates = (
+        output_dir / "walk_forward_research" / "walk_forward_report.json",
+        output_dir / "staged_state.json",
+        output_dir / "auto_state.json",
+    )
+    for path in candidates:
+        payload = _load_json(path, {}) if path.is_file() else {}
+        protocol = (payload or {}).get("date_protocol")
+        if isinstance(protocol, dict) and protocol:
+            return protocol
+    return None
+
+
 def _timestamp_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _strategy_data_file(args, adapter=None):
-    explicit = getattr(args, "data_file", None)
-    if explicit:
-        return Path(explicit)
     adapter = adapter or _adapter_from_args(args)
     discovered = getattr(adapter.module, "DATA_FILE", None)
     if discovered:
         return Path(discovered)
+    explicit = getattr(args, "data_file", None)
+    if explicit:
+        return Path(explicit)
     if adapter.identifier == "ma_strategy:ma_strategy":
         from fetch_calculate_data import DATA_FILE
 
         return Path(DATA_FILE)
     return None
+
+
+def _activate_strategy_market_data(args, adapter=None):
+    """Make date/index math follow the selected strategy and its timeframe."""
+    global _ACTIVE_MARKET_DATA_SOURCE, _ACTIVE_CANDLES_PER_YEAR
+    adapter = adapter or _adapter_from_args(args)
+    data_file = _strategy_data_file(args, adapter)
+    if data_file is None:
+        _ACTIVE_MARKET_DATA_SOURCE = None
+        _ACTIVE_CANDLES_PER_YEAR = CANDLES_PER_YEAR_15M
+        return None
+    source = MarketDataSource(data_file, adapter.timeframe)
+    coverage = source.coverage()
+    interval_seconds = float(coverage["interval_seconds"])
+    _ACTIVE_MARKET_DATA_SOURCE = source
+    _ACTIVE_CANDLES_PER_YEAR = 365.25 * 24 * 60 * 60 / interval_seconds
+    args._market_data_source = source
+    return source
 
 
 def _run_research_preflight(args, output_dir, resolved_config):
@@ -1478,7 +1765,12 @@ def _run_research_preflight(args, output_dir, resolved_config):
         from market_data_audit import DEFAULT_ISSUE_POLICIES
 
         policies = {code: "warn" for code in DEFAULT_ISSUE_POLICIES}
-    report = audit_market_data(data_file, AuditConfig(policies=policies))
+    source = adapter.market_data_source(data_file)
+    expected_interval = source.interval() if source is not None else "15min"
+    report = audit_market_data(
+        data_file,
+        AuditConfig(policies=policies, expected_interval=expected_interval),
+    )
     _write_json(output_dir / "market_data_audit.json", report.to_dict())
     if mode == "strict":
         report.raise_for_errors()
@@ -1700,9 +1992,13 @@ def _result_row(keys, index, params, result, duration, objective_score=None):
 
 def _result_fieldnames(keys):
     """Put outcome and trade metrics before the usually much wider parameter set."""
-    metrics = [column for column in RESULT_COLUMNS if column != "score"]
+    metrics = [
+        column for column in RESULT_COLUMNS
+        if column != "score" and column not in IMPORTANT_RESULT_COLUMNS
+    ]
     return [
-        "test_index", "objective_score", "score", *metrics,
+        "test_index", "objective_score", "score",
+        *IMPORTANT_RESULT_COLUMNS, *metrics,
         "profit_per_trade", "duration_s", *keys,
     ]
 
@@ -1859,6 +2155,8 @@ def _bound_index(value):
     parsed = _parse_bound(value)
     if isinstance(parsed, int):
         return parsed
+    if _ACTIVE_MARKET_DATA_SOURCE is not None:
+        return _ACTIVE_MARKET_DATA_SOURCE.resolve_index(parsed)
     from get_candle_index import get_candle_index
 
     return int(get_candle_index(parsed))
@@ -1874,6 +2172,8 @@ def _format_range_bound(value):
             return str(value)
 
     try:
+        if _ACTIVE_MARKET_DATA_SOURCE is not None:
+            return _ACTIVE_MARKET_DATA_SOURCE.format_bound(parsed)
         from get_candle_index import _open_times
 
         open_times = _open_times().dropna()
@@ -1910,8 +2210,12 @@ def _validate_auto_ranges(ranges):
 def _auto_configuration(args, profile, grid, base_tune, base_description, resolved_end):
     ranges = _auto_ranges(args, resolved_end)
     _validate_auto_ranges(ranges)
+    adapter = _adapter_from_args(args)
+    data_file = _strategy_data_file(args, adapter)
     return {
-        "strategy": _adapter_from_args(args).identifier,
+        "strategy": adapter.identifier,
+        "data_file": str(data_file.resolve()) if data_file is not None else None,
+        "timeframe": adapter.timeframe,
         "parameter_grid_source": getattr(args, "param_grid", None),
         "profile": profile,
         "parameter_grid": {key: list(values) for key, values in grid.items()},
@@ -2799,10 +3103,14 @@ def _safe_cleanup_completed_cycle(cycle_dir):
 
 
 def _auto_stage_fieldnames(keys):
-    metrics = [column for column in RESULT_COLUMNS if column != "score"]
+    metrics = [
+        column for column in RESULT_COLUMNS
+        if column != "score" and column not in IMPORTANT_RESULT_COLUMNS
+    ]
     return [
         "candidate_id", "cycle", "stage", "range_start", "range_end",
-        "objective_score", "time_normalized_score", "score", *metrics,
+        "objective_score", "time_normalized_score", "score",
+        *IMPORTANT_RESULT_COLUMNS, *metrics,
         "profit_per_trade", "range_candles", "duration_s", *keys, "error",
     ]
 
@@ -3343,24 +3651,53 @@ def _write_rows_atomic(path, fieldnames, rows):
 
 
 def _flatten_hall_record(record, keys, rank):
+    final_metrics = record.get("stage_metrics", {}).get("final", {}) or {}
     row = {
         "rank": rank,
+        "decision": record.get("decision", "WATCH"),
+        "decision_reasons": "; ".join(record.get("decision_reasons", []) or []),
+        "decision_scope": record.get("decision_scope"),
+        "robust_score": record["robust_score"],
+        "recency_score": record.get("recency_score"),
+        "stage_consistency_score": record.get("stage_consistency_score"),
+        "worst_stage_percentile": record.get("worst_stage_percentile"),
         "cycle": record["cycle"],
         "candidate_id": record["candidate_id"],
-        "robust_score": record["robust_score"],
-        "worst_stage_percentile": record.get("worst_stage_percentile"),
     }
-    row.update({key: record["params"].get(key) for key in keys})
     metric_names = (
         "score", "time_normalized_score", "total_profit", "total_profit_percent", "closed_trades",
         "win_rate", "maximum_drawdown", "profit_factor", "expectancy_percent",
         "calmar_ratio", "liquidations",
     )
+    for metric in metric_names:
+        row[f"final_{metric}"] = final_metrics.get(metric)
     for stage in AUTO_STAGE_ORDER:
         metrics = record.get("stage_metrics", {}).get(stage, {})
         for metric in metric_names:
+            if stage == "final":
+                continue
             row[f"{stage}_{metric}"] = metrics.get(metric)
+    row.update({key: record.get("effective_params", record["params"]).get(key) for key in keys})
     return row
+
+
+def _candidate_summary(record, rank, parameter_file):
+    return {
+        "rank": rank,
+        "candidate_id": record.get("candidate_id"),
+        "decision": record.get("decision", "WATCH"),
+        "decision_scope": record.get("decision_scope"),
+        "decision_reasons": record.get("decision_reasons", []),
+        "robust_score": record.get("robust_score"),
+        "recency_score": record.get("recency_score"),
+        "stage_consistency_score": record.get("stage_consistency_score"),
+        "worst_stage_percentile": record.get("worst_stage_percentile"),
+        "cycle": record.get("cycle"),
+        "parameter_file": str(parameter_file).replace("\\", "/"),
+        "stage_scores": record.get("stage_scores", {}),
+        "stage_metrics": record.get("stage_metrics", {}),
+        "effective_params": record.get("effective_params") or record.get("params") or {},
+    }
 
 
 def _save_auto_workbook(output_dir, hall_rows, importance_rows):
@@ -3404,7 +3741,11 @@ def _save_auto_workbook(output_dir, hall_rows, importance_rows):
             )
             worksheet.add_table(table)
         headers = {cell.value: cell.column for cell in worksheet[1]}
-        for metric in ("robust_score", "weight", "effect"):
+        for metric in (
+            "robust_score", "recency_score", "stage_consistency_score",
+            "worst_stage_percentile", "final_total_profit_percent",
+            "weight", "effect",
+        ):
             column = headers.get(metric)
             if column and worksheet.max_row >= 3:
                 letter = get_column_letter(column)
@@ -3422,7 +3763,10 @@ def _save_auto_workbook(output_dir, hall_rows, importance_rows):
 
 def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled=True):
     output_dir = Path(output_dir)
-    ranked_hall = sorted(hall, key=lambda record: record["robust_score"], reverse=True)
+    for record in hall:
+        if not record.get("decision"):
+            record.update(_auto_candidate_decision(record))
+    ranked_hall = sorted(hall, key=_auto_candidate_rank_key, reverse=True)
     _write_json(output_dir / "hall_of_fame.json", ranked_hall)
     _write_json(output_dir / "parameter_importance.json", importance)
     if ranked_hall:
@@ -3431,10 +3775,47 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         # Before the first full finalist exists, expose the best provisional
         # checkpoint so even an early interruption has a usable best_params.json.
         _write_json(output_dir / "best_params.json", state["checkpoint_best_params"])
-    hall_rows = [
-        _flatten_hall_record(record, keys, rank)
-        for rank, record in enumerate(ranked_hall, start=1)
-    ]
+    candidates_dir = output_dir / "candidates"
+    candidates_dir.mkdir(parents=True, exist_ok=True)
+    hall_rows = []
+    candidate_catalog = []
+    for rank, record in enumerate(ranked_hall, start=1):
+        if not record.get("decision"):
+            record.update(_auto_candidate_decision(record))
+        parameter_name = f"rank_{rank:03d}_params.json"
+        summary_name = f"rank_{rank:03d}_summary.json"
+        parameter_path = candidates_dir / parameter_name
+        summary_path = candidates_dir / summary_name
+        _write_json(parameter_path, record["effective_params"])
+        summary = _candidate_summary(
+            record, rank, Path("candidates") / parameter_name
+        )
+        _write_json(summary_path, summary)
+        row = _flatten_hall_record(record, keys, rank)
+        row["parameter_file"] = str(Path("candidates") / parameter_name).replace("\\", "/")
+        row["summary_file"] = str(Path("candidates") / summary_name).replace("\\", "/")
+        # Keep reusable file locations with the decision columns, before metrics/params.
+        row = {
+            key: row[key] for key in (
+                "rank", "decision", "decision_reasons", "decision_scope",
+                "parameter_file", "summary_file", "robust_score", "recency_score",
+                "stage_consistency_score", "worst_stage_percentile", "cycle",
+                "candidate_id",
+            )
+        } | {
+            key: value for key, value in row.items()
+            if key not in {
+                "rank", "decision", "decision_reasons", "decision_scope",
+                "parameter_file", "summary_file", "robust_score", "recency_score",
+                "stage_consistency_score", "worst_stage_percentile", "cycle",
+                "candidate_id",
+            }
+        }
+        hall_rows.append(row)
+        candidate_catalog.append(summary)
+    _write_json(output_dir / "candidate_catalog.json", candidate_catalog)
+    if candidate_catalog:
+        _write_json(output_dir / "best_candidate_summary.json", candidate_catalog[0])
     importance_rows = [
         {"rank": rank, "parameter": key, **item}
         for rank, (key, item) in enumerate(
@@ -3444,6 +3825,9 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
     ]
     if hall_rows:
         _write_rows_atomic(output_dir / "hall_of_fame.csv", list(hall_rows[0]), hall_rows)
+        _write_rows_atomic(
+            output_dir / "candidate_catalog.csv", list(hall_rows[0]), hall_rows
+        )
     if importance_rows:
         _write_rows_atomic(
             output_dir / "parameter_importance.csv",
@@ -3464,7 +3848,10 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "total_evaluations": state["total_evaluations"],
         "hall_of_fame_size": len(ranked_hall),
         "best_robust_score": ranked_hall[0]["robust_score"] if ranked_hall else None,
+        "best_decision": ranked_hall[0].get("decision") if ranked_hall else None,
+        "best_recency_score": ranked_hall[0].get("recency_score") if ranked_hall else None,
         "best_params": ranked_hall[0]["effective_params"] if ranked_hall else None,
+        "date_protocol": state.get("date_protocol"),
         "optimizer_features": state.get("optimizer_features"),
         "advanced_from_cycle": state.get("advanced_from_cycle"),
         "bootstrap": state.get("bootstrap"),
@@ -3498,9 +3885,7 @@ def _merge_hall_of_fame(
         previous = by_signature.get(signature)
         if previous is None or record["robust_score"] > previous["robust_score"]:
             by_signature[signature] = record
-    return sorted(
-        by_signature.values(), key=lambda record: record["robust_score"], reverse=True
-    )[:limit]
+    return sorted(by_signature.values(), key=_auto_candidate_rank_key, reverse=True)[:limit]
 
 
 def run_auto_optimization(args, grid=None):
@@ -3554,6 +3939,11 @@ def run_auto_optimization(args, grid=None):
         saved_runtime_config = state.get("config") or {}
         saved_runtime_config.setdefault("strategy", "ma_strategy:ma_strategy")
         saved_runtime_config.setdefault("parameter_grid_source", None)
+        # Legacy checkpoints predate strategy-owned data metadata.  Their saved
+        # ranges remain authoritative; adding current equivalent metadata keeps
+        # them resumable without weakening checks for all newly created runs.
+        saved_runtime_config.setdefault("data_file", config.get("data_file"))
+        saved_runtime_config.setdefault("timeframe", config.get("timeframe"))
         saved_runtime_config.setdefault(
             "snapshot_cycles", int(getattr(args, "snapshot_cycles", 50))
         )
@@ -3614,6 +4004,14 @@ def run_auto_optimization(args, grid=None):
             "total_evaluations": _reconcile_auto_evaluations(output_dir, state),
             "updated_at": _timestamp_now(),
         })
+        saved_ranges = state.get("config", {}).get("ranges", {}) or {}
+        state.setdefault("date_protocol", {
+            "policy": "frozen_checkpoint",
+            "development_start": (saved_ranges.get("final") or [None, None])[0],
+            "validation_start": (saved_ranges.get("validation") or [None, None])[0],
+            "discovery_start": (saved_ranges.get("discovery") or [None, None])[0],
+            "development_end": (saved_ranges.get("final") or [None, None])[1],
+        })
         print(
             f"Resuming auto cycle {state['cycle']} at {state['stage']} | "
             f"{state['total_evaluations']:,} total evaluations"
@@ -3646,6 +4044,7 @@ def run_auto_optimization(args, grid=None):
             "updated_at": _timestamp_now(),
             "config": config,
             "optimizer_features": optimizer_features,
+            "date_protocol": dict(getattr(args, "_date_protocol", {}) or {}),
             "advanced_from_cycle": 1,
             "bootstrap": bootstrap,
         }
@@ -4260,11 +4659,7 @@ def _merge_staged_archive(archive, phase_hall, block, phase_name, limit):
             merged[signature] = enriched
     return sorted(
         merged.values(),
-        key=lambda record: (
-            _finite_number(record.get("robust_score"))
-            if _finite_number(record.get("robust_score")) is not None
-            else -math.inf
-        ),
+        key=_auto_candidate_rank_key,
         reverse=True,
     )[:limit]
 
@@ -4314,12 +4709,17 @@ def _staged_report_rows(records):
         final_metrics = record.get("stage_metrics", {}).get("final", {})
         row = {
             "rank": rank,
+            "decision": record.get("decision", "WATCH"),
+            "decision_reasons": "; ".join(record.get("decision_reasons", []) or []),
+            "decision_scope": record.get("decision_scope"),
+            "robust_score": record.get("robust_score"),
+            "recency_score": record.get("recency_score"),
+            "stage_consistency_score": record.get("stage_consistency_score"),
+            "worst_stage_percentile": record.get("worst_stage_percentile"),
             "block": record.get("block"),
             "phase": record.get("phase"),
             "cycle": record.get("cycle"),
             "candidate_id": record.get("candidate_id"),
-            "robust_score": record.get("robust_score"),
-            "worst_stage_percentile": record.get("worst_stage_percentile"),
             "random_audit_score": record.get("random_audit_score"),
             "random_audit_valid_ratio": record.get("random_audit_valid_ratio"),
             "random_audit_positive_ratio": record.get("random_audit_positive_ratio"),
@@ -4343,8 +4743,13 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
     fieldnames = list(rows[0])
     output_dir = Path(output_dir)
     _write_rows_atomic(output_dir / "top_100.csv", fieldnames, rows)
+    _write_rows_atomic(output_dir / "candidate_catalog.csv", fieldnames, rows)
     _write_json(output_dir / f"top_{max(1, int(top_n))}.json", ranked)
     _write_json(output_dir / "best_params.json", ranked[0]["effective_params"])
+    _write_json(
+        output_dir / "best_candidate_summary.json",
+        _candidate_summary(ranked[0], 1, Path("best_params.json")),
+    )
     if snapshot_dir is not None:
         snapshot_dir = Path(snapshot_dir)
         snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -4353,12 +4758,23 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
             snapshot_dir / f"top_{max(1, int(top_n))}.json", ranked
         )
         _write_json(snapshot_dir / "best_params.json", ranked[0]["effective_params"])
+        _write_json(
+            snapshot_dir / "best_candidate_summary.json",
+            _candidate_summary(ranked[0], 1, Path("best_params.json")),
+        )
         params_dir = snapshot_dir / "params"
+        summaries_dir = snapshot_dir / "summaries"
         params_dir.mkdir(parents=True, exist_ok=True)
+        summaries_dir.mkdir(parents=True, exist_ok=True)
         for rank, record in enumerate(ranked, 1):
+            parameter_file = Path("params") / f"rank_{rank:03d}_params.json"
             _write_json(
-                params_dir / f"rank_{rank:03d}_params.json",
+                snapshot_dir / parameter_file,
                 record["effective_params"],
+            )
+            _write_json(
+                summaries_dir / f"rank_{rank:03d}_summary.json",
+                _candidate_summary(record, rank, parameter_file),
             )
 
 
@@ -4375,12 +4791,11 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
         enriched.append({**record, **plateau.get(candidate_id, {})})
     enriched.sort(
         key=lambda item: (
+            _auto_candidate_rank_key(item)[0],
             _finite_number(item.get("plateau_adjusted_score"))
             if _finite_number(item.get("plateau_adjusted_score")) is not None
             else -math.inf,
-            _finite_number(item.get("robust_score"))
-            if _finite_number(item.get("robust_score")) is not None
-            else -math.inf,
+            *_auto_candidate_rank_key(item)[1:],
         ),
         reverse=True,
     )
@@ -4392,20 +4807,42 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
             for rank, record in enumerate(selected, 1)
         ]
         for row, record in zip(rows, selected):
+            plateau_values = {}
             for metric in (
                 "neighbour_count", "neighbour_method", "median_grid_distance",
                 "median_neighbour_score",
                 "plateau_stability", "plateau_adjusted_score",
             ):
-                row[metric] = record.get(metric)
+                plateau_values[metric] = record.get(metric)
+            core_keys = (
+                "rank", "decision", "decision_reasons", "decision_scope",
+                "robust_score", "recency_score", "stage_consistency_score",
+                "worst_stage_percentile", "cycle", "candidate_id",
+            )
+            original = dict(row)
+            row.clear()
+            row.update({key: original.get(key) for key in core_keys})
+            row.update(plateau_values)
+            row.update({key: value for key, value in original.items() if key not in core_keys})
         _write_rows_atomic(snapshot_dir / f"top_{top_n}.csv", list(rows[0]), rows)
         _write_json(snapshot_dir / "best_params.json", selected[0]["effective_params"])
+        _write_json(
+            snapshot_dir / "best_candidate_summary.json",
+            _candidate_summary(selected[0], 1, Path("best_params.json")),
+        )
         params_dir = snapshot_dir / "params"
+        summaries_dir = snapshot_dir / "summaries"
         params_dir.mkdir(parents=True, exist_ok=True)
+        summaries_dir.mkdir(parents=True, exist_ok=True)
         for rank, record in enumerate(selected, 1):
+            parameter_file = Path("params") / f"rank_{rank:03d}_params.json"
             _write_json(
-                params_dir / f"rank_{rank:03d}_params.json",
+                snapshot_dir / parameter_file,
                 record["effective_params"],
+            )
+            _write_json(
+                summaries_dir / f"rank_{rank:03d}_summary.json",
+                _candidate_summary(record, rank, parameter_file),
             )
     run_manifest = _load_json(output_dir / "research_manifest.json", {}) or {}
     auto_ranges = state.get("config", {}).get("ranges", {}) or {}
@@ -4419,6 +4856,7 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
             "strategy", "ma_strategy:ma_strategy"
         ),
         "ranking": "plateau_adjusted_score, then robust_score",
+        "date_protocol": state.get("date_protocol"),
         "development_range": development_range,
         "development_end_exclusive": (
             development_range[1]
@@ -4448,7 +4886,7 @@ def _generate_random_audit_windows(
     count = max(1, int(count))
     recent_target = min(count, max(0, round(count * float(recent_ratio))))
     randomizer = random.Random(seed)
-    candles_per_month = round(CANDLES_PER_YEAR_15M / 12)
+    candles_per_month = round(_ACTIVE_CANDLES_PER_YEAR / 12)
     windows = []
     seen = set()
 
@@ -4901,7 +5339,7 @@ def _nested_walk_forward_ranges(
     """Build chronological train -> validation -> untouched OOS folds."""
     start_index = _bound_index(start)
     end_index = _bound_index(end)
-    candles_per_month = round(CANDLES_PER_YEAR_15M / 12)
+    candles_per_month = round(_ACTIVE_CANDLES_PER_YEAR / 12)
     train_width = max(1, round(float(train_months) * candles_per_month))
     validation_width = max(1, round(float(validation_months) * candles_per_month))
     test_width = max(1, round(float(test_months) * candles_per_month))
@@ -5669,8 +6107,22 @@ def run_nested_walk_forward(args, grid=None):
         if recommendation
         else None
     )
+    passed_gate_count = sum(bool(value) for value in gates.values())
+    if recommendation and all(gates.values()):
+        research_decision = "ACCEPT"
+    elif (
+        recommendation
+        and passed_gate_count >= math.ceil(0.70 * len(gates))
+        and gates.get("minimum_completed_folds")
+        and gates.get("maximum_oos_liquidations")
+    ):
+        research_decision = "WATCH"
+    else:
+        research_decision = "REJECT"
+    failed_gates = [name for name, passed in gates.items() if not passed]
     report = {
         "protocol": "nested chronological walk-forward",
+        "date_protocol": dict(getattr(args, "_date_protocol", {}) or {}),
         "strategy": adapter.identifier,
         "fold_count": len(folds),
         "completed_oos_folds": len(completed),
@@ -5693,6 +6145,12 @@ def run_nested_walk_forward(args, grid=None):
         "parameter_stability": parameter_stability,
         "acceptance_gates": gates,
         "accepted": all(gates.values()),
+        "decision": research_decision,
+        "decision_reasons": (
+            ["all Research acceptance gates passed"]
+            if research_decision == "ACCEPT"
+            else [f"failed gate: {name}" for name in failed_gates]
+        ),
         "holdout_ready": bool(recommendation and all(gates.values())),
         "recommended_candidate_id": recommendation_id,
         "recommended_candidate_source": (
@@ -5714,6 +6172,11 @@ def run_nested_walk_forward(args, grid=None):
     _write_json(output_dir / "trial_ledger.json", trial_ledger)
     _write_json(output_dir / "parameter_stability.json", parameter_stability)
     _write_json(output_dir / "research_decision.json", {
+        "decision": research_decision,
+        "decision_scope": (
+            "Research validation; ACCEPT permits one sealed Holdout test, not live trading"
+        ),
+        "decision_reasons": report["decision_reasons"],
         "accepted": report["accepted"],
         "holdout_ready": report["holdout_ready"],
         "candidate_params": (
@@ -5726,10 +6189,68 @@ def run_nested_walk_forward(args, grid=None):
             if report["holdout_ready"]
             else None
         ),
-        "failed_gates": [
-            name for name, passed in gates.items() if not passed
-        ],
+        "failed_gates": failed_gates,
     })
+    research_ranked = sorted(
+        (candidate for candidate in candidates if winner_counts.get(candidate["candidate_id"], 0)),
+        key=lambda candidate: (
+            winner_counts[candidate["candidate_id"]],
+            statistics.median(
+                winner_selection_scores.get(candidate["candidate_id"], [-math.inf])
+            ),
+        ),
+        reverse=True,
+    )
+    research_candidates_dir = output_dir / "candidates"
+    research_candidates_dir.mkdir(parents=True, exist_ok=True)
+    research_rows = []
+    research_catalog = []
+    for rank, candidate in enumerate(research_ranked, 1):
+        candidate_id = candidate["candidate_id"]
+        effective_params = _freeze_strategy_tune(
+            adapter, {**base_tune, **candidate["params"]}
+        )
+        parameter_file = Path("candidates") / f"research_rank_{rank:03d}_params.json"
+        _write_json(output_dir / parameter_file, effective_params)
+        candidate_decision = (
+            research_decision if candidate_id == recommendation_id else "WATCH"
+        )
+        candidate_reasons = (
+            report["decision_reasons"]
+            if candidate_id == recommendation_id
+            else ["selected in fewer train/validation folds than the recommendation"]
+        )
+        summary = {
+            "rank": rank,
+            "candidate_id": candidate_id,
+            "decision": candidate_decision,
+            "decision_reasons": candidate_reasons,
+            "selection_frequency": winner_counts[candidate_id],
+            "median_selection_score": statistics.median(
+                winner_selection_scores.get(candidate_id, [-math.inf])
+            ),
+            "source": candidate.get("source"),
+            "parameter_file": str(parameter_file).replace("\\", "/"),
+            "effective_params": effective_params,
+        }
+        research_catalog.append(summary)
+        research_rows.append({
+            "rank": rank,
+            "decision": candidate_decision,
+            "decision_reasons": "; ".join(candidate_reasons),
+            "selection_frequency": summary["selection_frequency"],
+            "median_selection_score": summary["median_selection_score"],
+            "source": summary["source"],
+            "candidate_id": candidate_id,
+            "parameter_file": summary["parameter_file"],
+            **effective_params,
+        })
+    _write_json(output_dir / "research_candidate_catalog.json", research_catalog)
+    if research_rows:
+        _write_rows_atomic(
+            output_dir / "research_candidate_catalog.csv",
+            list(research_rows[0]), research_rows,
+        )
     if recommendation:
         _write_json(
             output_dir / "walk_forward_candidate_params.json",
@@ -5904,6 +6425,7 @@ def run_sealed_holdout(args):
     }
     report = {
         "protocol": "sealed holdout",
+        "date_protocol": dict(getattr(args, "_date_protocol", {}) or {}),
         "status": "contaminated_repeat" if contaminated else "first_and_only_peek",
         "created_at": _timestamp_now(),
         "strategy": adapter.identifier,
@@ -5930,6 +6452,19 @@ def run_sealed_holdout(args):
         "scenario_results": scenario_results,
         "feedback_policy": "results are never written to Hall of Fame, surrogate history, or seeds",
     }
+    report["decision"] = "ACCEPT" if report["accepted"] else "REJECT"
+    report["decision_reasons"] = (
+        ["all sealed Holdout cost scenarios passed on the first peek"]
+        if report["accepted"]
+        else (
+            ["sealed range was previously consumed; this repeat is contaminated"]
+            if contaminated
+            else [
+                f"failed cost scenario: {name}"
+                for name, passed in scenario_gates.items() if not passed
+            ]
+        )
+    )
     run_dir = output_dir / "sealed_holdout" / run_fingerprint[:16]
     if run_dir.exists() and contaminated:
         run_dir = output_dir / "sealed_holdout" / (
@@ -5962,7 +6497,14 @@ def run_staged_optimization(args):
     output_dir.mkdir(parents=True, exist_ok=True)
     state_path = output_dir / "staged_state.json"
     archive_path = output_dir / "staged_hall_of_fame.json"
-    phase_count = len(STAGED_AUTO_PHASES)
+    staged_phases = _strategy_staged_phases(args)
+    strategy_adapter = _adapter_from_args(args)
+    parameter_profiles = getattr(args, "_parameter_profiles", None) or (
+        PARAMETER_PROFILES
+        if strategy_adapter.identifier == "ma_strategy:ma_strategy"
+        else strategy_adapter.discovered_profiles()
+    )
+    phase_count = len(staged_phases)
     block_cycles = int(args.stage_cycles) * phase_count
     if int(args.snapshot_cycles) != block_cycles:
         raise ValueError(
@@ -5970,8 +6512,13 @@ def run_staged_optimization(args):
             f"({block_cycles} with the current schedule)"
         )
 
+    persisted_state = _load_json(state_path, {}) if state_path.is_file() else {}
+    if persisted_state:
+        _restore_frozen_date_protocol(args, persisted_state.get("date_protocol"))
+
     staged_config = {
-        "phases": [list(item) for item in STAGED_AUTO_PHASES],
+        "strategy": _adapter_from_args(args).identifier,
+        "phases": [list(item) for item in staged_phases],
         "stage_cycles": int(args.stage_cycles),
         "snapshot_cycles": int(args.snapshot_cycles),
         "snapshot_top": int(args.snapshot_top),
@@ -5984,7 +6531,12 @@ def run_staged_optimization(args):
         "random_audit_max_months": int(args.random_audit_max_months),
     }
     if state_path.is_file():
-        state = _load_json(state_path, {}) or {}
+        state = persisted_state or {}
+        saved_staged_config = state.get("config") or {}
+        saved_staged_config.setdefault(
+            "strategy", _adapter_from_args(args).identifier
+        )
+        state["config"] = saved_staged_config
         if state.get("config") != staged_config:
             raise ValueError(
                 "staged checkpoint settings differ from this command; use the original "
@@ -6003,7 +6555,11 @@ def run_staged_optimization(args):
         legacy_auto_dir = output_dir.parent / "auto"
         legacy_best_path = legacy_auto_dir / "best_params.json"
         legacy_hall_path = legacy_auto_dir / "hall_of_fame.json"
-        if getattr(args, "base_source", "config") == "config" and legacy_best_path.is_file():
+        if (
+            _adapter_from_args(args).identifier == "ma_strategy:ma_strategy"
+            and getattr(args, "base_source", "config") == "config"
+            and legacy_best_path.is_file()
+        ):
             baseline = load_ma_strategy_tune(legacy_best_path)
             base_description = f"legacy auto winner: {legacy_best_path}"
             legacy_hall = _load_json(legacy_hall_path, []) or []
@@ -6034,6 +6590,7 @@ def run_staged_optimization(args):
             "baseline_source": base_description,
             "baseline_params": baseline,
             "config": staged_config,
+            "date_protocol": dict(getattr(args, "_date_protocol", {}) or {}),
             "created_at": _timestamp_now(),
             "updated_at": _timestamp_now(),
         }
@@ -6043,7 +6600,8 @@ def run_staged_optimization(args):
     internal_limit = max(500, int(args.snapshot_top) * 5)
     while total_limit == 0 or state["cycles_completed"] < total_limit:
         phase_index = int(state.get("phase_index", 0)) % phase_count
-        phase_name, profile_name = STAGED_AUTO_PHASES[phase_index]
+        phase_name, profile_name = staged_phases[phase_index]
+        phase_grid = parameter_profiles[profile_name]
         block = int(state.get("block", 1))
         phase_dir = (
             output_dir / "blocks" / f"block_{block:04d}" /
@@ -6063,7 +6621,7 @@ def run_staged_optimization(args):
         phase_args.base_params = str(baseline_path)
         phase_args.resume = (phase_dir / "auto_state.json").is_file()
         seeds = _staged_seed_data(
-            archive[:int(args.snapshot_top)], PARAMETER_PROFILES[profile_name], baseline
+            archive[:int(args.snapshot_top)], phase_grid, baseline
         )
         phase_args._seed_elites = seeds
         phase_args._seed_history = seeds
@@ -6071,9 +6629,9 @@ def run_staged_optimization(args):
         print(
             f"\nStaged block {block} | phase {phase_index + 1}/{phase_count}: "
             f"{phase_name.upper()} | {args.stage_cycles} cycles | "
-            f"{len(PARAMETER_PROFILES[profile_name])} active parameters"
+            f"{len(phase_grid)} active parameters"
         )
-        run_auto_optimization(phase_args, grid=PARAMETER_PROFILES[profile_name])
+        run_auto_optimization(phase_args, grid=phase_grid)
         phase_state = _load_json(phase_dir / "auto_state.json", {}) or {}
         if int(phase_state.get("cycles_completed", 0)) < int(args.stage_cycles):
             state.update({
@@ -6166,8 +6724,9 @@ def run_staged_optimization(args):
                 "cycle": int(state["cycles_completed"]),
                 "requested_top": int(args.snapshot_top),
                 "saved_candidates": min(len(archive), int(args.snapshot_top)),
-                "strategy": "ma_strategy:ma_strategy",
+                "strategy": _adapter_from_args(args).identifier,
                 "ranking": "random-window audit when available, then robust score",
+                "date_protocol": state.get("date_protocol"),
                 "development_range": [args.auto_stress_start, development_end],
                 "development_end_exclusive": development_end,
                 "holdout_status": "development results; later data not consumed",
@@ -6528,7 +7087,7 @@ instead of a YYYY-MM-DD date.""",
       --tests 5000 -w 8 --output-dir outputs/optimize/focused_run
 
   Train on one period and use the next period as inner validation:
-    python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+    python optimize.py --mode smart --profile signal --tests 10000 -w 8 --date-policy fixed `
       --start 2023-01-01 --end 2024-01-01 `
       --validation-start 2024-01-01 --validation-end 2025-04-01 `
       --validation-top 30 --min-trades 50 --max-drawdown 35 `
@@ -6556,8 +7115,8 @@ Tips:
   * Use a new --output-dir for a new experiment; use --resume only for the same run.
   * Plain --auto detects and resumes a compatible checkpoint in --output-dir.
   * A new campaign warm-starts from a compatible existing --base-params winner.
-  * Candidate-search defaults use 2023-01-01 through 2025-04-01.
-  * Nested OOS then covers the rest of 2025; 2026-01-01 onward stays sealed.
+  * --date-policy auto derives recent leak-resistant ranges from the latest candle.
+  * Use --date-policy fixed when explicit date flags must be preserved exactly.
   * For trustworthy selection, use --research, freeze its recommendation, then peek once with --sealed-holdout.
   * Raw score is preserved; cross-range comparisons use a candle-count annualized score.
   * Auto learns from normalized Discovery ranks and later funnel outcomes, not raw scale.
@@ -6629,7 +7188,10 @@ Tips:
     )
     execution.add_argument(
         "--data-file", metavar="PATH",
-        help="market CSV used for audit/fingerprinting (auto-discovered for ma)",
+        help=(
+            "fallback market CSV for audit/date discovery when a strategy does not "
+            "expose DATA_FILE; strategy-owned DATA_FILE is authoritative"
+        ),
     )
     execution.add_argument(
         "--data-audit", choices=("strict", "warn", "off"), default="strict",
@@ -6637,6 +7199,42 @@ Tips:
     )
 
     ranges = parser.add_argument_group("standard search ranges and robustness")
+    ranges.add_argument(
+        "--date-policy", choices=("auto", "fixed"), default="auto",
+        help=(
+            "auto derives and freezes recent ranges from the latest candle; "
+            "fixed uses the explicit date options below"
+        ),
+    )
+    ranges.add_argument(
+        "--rolling-development-months", type=int,
+        default=DEFAULT_ROLLING_DEVELOPMENT_MONTHS, metavar="N",
+        help="development history retained before reporting-only OOS",
+    )
+    ranges.add_argument(
+        "--rolling-oos-months", type=int, default=DEFAULT_ROLLING_OOS_MONTHS,
+        metavar="N", help="reporting-only OOS reservation before the embargo",
+    )
+    ranges.add_argument(
+        "--rolling-embargo-months", type=int,
+        default=DEFAULT_ROLLING_EMBARGO_MONTHS, metavar="N",
+        help="unused calendar months between research OOS and sealed holdout",
+    )
+    ranges.add_argument(
+        "--rolling-holdout-months", type=int,
+        default=DEFAULT_ROLLING_HOLDOUT_MONTHS, metavar="N",
+        help="latest calendar months reserved as the sealed holdout",
+    )
+    ranges.add_argument(
+        "--rolling-stress-months", type=int,
+        default=DEFAULT_ROLLING_STRESS_MONTHS, metavar="N",
+        help="oldest part of rolling development used by Auto Stress",
+    )
+    ranges.add_argument(
+        "--rolling-validation-months", type=int,
+        default=DEFAULT_ROLLING_VALIDATION_MONTHS, metavar="N",
+        help="rolling Validation duration after Stress and before Discovery",
+    )
     ranges.add_argument(
         "--start", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
         help="inclusive training start",
@@ -6986,6 +7584,29 @@ def main(argv=None):
         for name, grid in args._parameter_profiles.items():
             print(f"{name}: {len(grid)} parameters | {grid_size(grid):,} grid combinations")
         return
+    try:
+        _activate_strategy_market_data(args, args._strategy_adapter)
+        frozen_protocol = (
+            _load_frozen_date_protocol(args.output_dir)
+            if args.date_policy == "auto" else None
+        )
+        if frozen_protocol:
+            _restore_frozen_date_protocol(args, frozen_protocol)
+            date_protocol = frozen_protocol
+        else:
+            date_protocol = _apply_date_policy(args)
+    except (IndexError, OSError, TypeError, ValueError) as error:
+        raise SystemExit(f"cannot resolve date policy: {error}") from error
+    rolling_counts = (
+        args.rolling_development_months,
+        args.rolling_oos_months,
+        args.rolling_embargo_months,
+        args.rolling_holdout_months,
+        args.rolling_stress_months,
+        args.rolling_validation_months,
+    )
+    if min(rolling_counts) <= 0:
+        raise SystemExit("all rolling date-policy month counts must be greater than zero")
     if args.tests <= 0:
         raise SystemExit("--tests must be greater than zero")
     if args.elite_size <= 0:
@@ -7089,11 +7710,14 @@ def main(argv=None):
     if args.staged:
         if not args.auto:
             raise SystemExit("--staged requires --auto")
-        if args._strategy_adapter.identifier != "ma_strategy:ma_strategy":
+        try:
+            staged_phases = _strategy_staged_phases(args)
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
+        if not staged_phases:
             raise SystemExit(
-                "--staged uses MA-specific signal/exit/risk/RSI/scale groups; "
-                "for any plug-in strategy use --auto, which still publishes "
-                "Top-N snapshots every --snapshot-cycles"
+                f"strategy {args._strategy_adapter.identifier} does not expose "
+                "STAGED_PHASES; use normal --auto or define staged profile groups"
             )
         if min(args.stage_cycles, args.snapshot_cycles, args.snapshot_top) <= 0:
             raise SystemExit("staged cycle and snapshot settings must be greater than zero")
@@ -7108,7 +7732,7 @@ def main(argv=None):
             or args.random_audit_max_months < args.random_audit_min_months
         ):
             raise SystemExit("random-audit month limits must satisfy 0 < min <= max")
-        expected_snapshot = args.stage_cycles * len(STAGED_AUTO_PHASES)
+        expected_snapshot = args.stage_cycles * len(staged_phases)
         if args.snapshot_cycles != expected_snapshot:
             raise SystemExit(
                 f"--snapshot-cycles must equal {expected_snapshot} for the current "
@@ -7221,7 +7845,7 @@ def main(argv=None):
                 f"Dataset candles: {coverage['first_candle']} -> "
                 f"{coverage['last_candle']} (inclusive)"
             )
-            print(f"Development end: {resolved_end} (exclusive)")
+            print(f"Research end: {resolved_end} (exclusive)")
             try:
                 has_reserved_holdout = (
                     _bound_index(resolved_end)
@@ -7231,7 +7855,12 @@ def main(argv=None):
                 has_reserved_holdout = False
             if has_reserved_holdout:
                 print(
-                    f"Reserved sealed holdout: {resolved_end} -> "
+                    f"Embargo: {date_protocol.get('embargo_start', resolved_end)} -> "
+                    f"{date_protocol.get('holdout_start', resolved_end)}"
+                )
+                print(
+                    f"Reserved sealed holdout: "
+                    f"{date_protocol.get('holdout_start', resolved_end)} -> "
                     f"{coverage['end_exclusive']} (exclusive; last candle "
                     f"{coverage['last_candle']})"
                 )
@@ -7257,13 +7886,18 @@ def main(argv=None):
             ranges = _auto_ranges(args, resolved_end)
             _validate_auto_ranges(ranges)
             print("Mode: staged auto" if args.staged else "Mode: auto")
+            print(
+                f"Date policy: {date_protocol['policy']} | latest candle: "
+                f"{date_protocol.get('dataset_last_candle', 'manual')}"
+            )
             if args.staged:
+                staged_phases = _strategy_staged_phases(args)
                 print(
                     "Phase schedule: "
                     + " -> ".join(
                         f"{name} ({len(args._parameter_profiles[profile])} params, "
                         f"{args.stage_cycles} cycles)"
-                        for name, profile in STAGED_AUTO_PHASES
+                        for name, profile in staged_phases
                     )
                 )
                 audit_windows = args.random_audit_tests // args.random_audit_top
@@ -7316,9 +7950,13 @@ def main(argv=None):
         return
     multiprocessing.freeze_support()
     if args.auto and args.output_dir == DEFAULT_OUTPUT_DIR:
+        protocol_tag = (
+            f"{str(args.auto_stress_start)[:10].replace('-', '')}_"
+            f"{str(date_protocol.get('holdout_end', args.auto_end))[:10].replace('-', '')}"
+        )
         args.output_dir = os.path.join(
             DEFAULT_OUTPUT_DIR,
-            DEFAULT_STAGED_CAMPAIGN_DIR if args.staged else DEFAULT_AUTO_CAMPAIGN_DIR,
+            ("staged_" if args.staged else "auto_") + protocol_tag,
         )
     resolved_cli_config = {
         key: value for key, value in vars(args).items() if not key.startswith("_")

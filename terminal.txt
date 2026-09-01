@@ -713,3 +713,4 @@ saved Money: 3523.18 $
 Count Liquids: 0
 count_profit_months: 12
 count_loss_months: 0
+Total score: 520.3563367507661

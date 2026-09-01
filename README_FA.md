@@ -1,5 +1,7 @@
 # راهنمای فارسی Backtest Trade Engine
 
+[راهنمای ساخت Strategy جدید با دیتاست و Timeframe اختصاصی](STRATEGY_PLUGIN_GUIDE_FA.md) — شامل قالب آماده‌ی `example_strategy.py` برای `data_candle/btc_1m_data.csv`.
+
 [راهنمای پروتکل تحقیق معتبر، Top 100، walk-forward، holdout و تعویض استراتژی](RESEARCH_GUIDE_FA.md)
 
 [English guide](README.md)
@@ -236,8 +238,9 @@ optimizer هنگام ارزیابی کاندیدها چارت، پیام‌ها�
 | `--chunksize N` | `0` | اندازه chunk پردازش چندپردازه؛ صفر یعنی خودکار. |
 | `--elite-size N` | `20` | تعداد گزینه‌های برتر برای هدایت smart search. |
 | `--seed N` | `42` | seed برای تکرارپذیری جستجوی smart. |
-| `--start VALUE` | `2023-01-01` | شروع inclusive بازه‌ی جست‌وجوی candidate. |
-| `--end VALUE` | `2025-04-01` | پایان exclusive جست‌وجو؛ داده‌ی جدیدتر برای OOS و Holdout رزرو می‌شود. |
+| `--date-policy auto\|fixed` | `auto` | ساخت بازه از آخرین کندل یا حفظ تاریخ‌های دستی. |
+| `--start VALUE` | خودکار | شروع inclusive جست‌وجو؛ fallback حالت fixed برابر `2023-01-01` است. |
+| `--end VALUE` | خودکار | پایان exclusive جست‌وجو؛ fallback حالت fixed برابر `2025-04-01` است. |
 | `--validation-start VALUE` | — | شروع inclusive inner-validation؛ همراه end لازم است. |
 | `--validation-end VALUE` | — | پایان exclusive inner-validation؛ همراه start لازم است. |
 | `--validation-top N` | `20` | تعداد finalistهای train برای inner-validation. |
@@ -275,18 +278,18 @@ python optimize.py --profile risk --mode grid --dry-run
 
 ```powershell
 # جستجوی focused از تنظیمات اصلی
-python optimize.py --mode smart --profile focused --tests 5000 -w 8 `
+python optimize.py --mode smart --profile focused --tests 5000 -w 8 --date-policy fixed `
   --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/focused_01
 
 # بهینه‌سازی خروج با حفظ سایر پارامترهای برنده قبلی
-python optimize.py --mode smart --profile exit --tests 5000 -w 8 `
+python optimize.py --mode smart --profile exit --tests 5000 -w 8 --date-policy fixed `
   --base-source file --base-params outputs/optimize/focused_01/best_params.json `
   --start 2023-01-01 --end 2025-04-01 `
   --output-dir outputs/optimize/exit_01
 
 # inner-validation جدا؛ این بازه holdout نهایی و unseen نیست
-python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 --date-policy fixed `
   --start 2023-01-01 --end 2024-01-01 `
   --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
@@ -294,7 +297,7 @@ python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
   --output-dir outputs/optimize/signal_validated
 
 # ادامه همان اجرای سازگار
-python optimize.py --mode smart --profile signal --tests 10000 -w 8 `
+python optimize.py --mode smart --profile signal --tests 10000 -w 8 --date-policy fixed `
   --start 2023-01-01 --end 2024-01-01 `
   --validation-start 2024-01-01 --validation-end 2025-04-01 `
   --validation-top 30 --overfit-penalty 0.35 `
@@ -334,17 +337,21 @@ validation_results.json       جزئیات finalistهای inner-validation
 
 گزینه `--auto` یک کمپین قابل‌ادامه را تا زمان زدن `Ctrl+C` اجرا می‌کند. این حالت به‌صورت پیش‌فرض از grid اصلی `full` استفاده می‌کند؛ فقط برای جست‌وجوی عمداً کوچک‌تر `--profile focused` بدهید. هر چرخه دارای قیف پایداری با بازه‌های مستقل است: ۲۰۰۰ تست Discovery، سپس ۵۰۰ مورد برای Validation، ۲۵۰ مورد برای Stress، ۱۵۰ مورد برای Walk-forward داخلی و ۱۰۰ مورد برای Final. Auto عمداً فقط از ناحیه‌ی پیش از OOS استفاده می‌کند:
 
+مدیریت تاریخ به‌صورت پیش‌فرض `--date-policy auto` است. هر کمپین جدید از آخرین کندل معتبر به عقب حرکت می‌کند: پنج ماه آخر Holdout بسته، یک ماه قبل از آن Embargo، هشت ماه قبل‌تر Research OOS و ۲۷ ماه قبل‌تر Auto Development است. تاریخ‌های حل‌شده داخل State و Manifest قفل می‌شوند؛ بنابراین اضافه‌شدن کندل جدید تاریخ یک Resume را جابه‌جا نمی‌کند. برای تاریخ‌های کاملاً دستی از `--date-policy fixed` همراه گزینه‌های تاریخ استفاده کنید.
+
+با دیتاست فعلی که پایان exclusive آن `2026-08-01 00:00:00` است، بازه‌ها به شکل زیر حل می‌شوند: Stress از `2023-03-01`، Validation از `2023-09-01`، Discovery از `2024-03-01` تا `2025-06-01`، Research تا `2026-02-01`، Embargo تا `2026-03-01` و Holdout تا `2026-08-01`.
+
 ```text
-Discovery    2024-01-01 -> 2025-04-01
-Validation   2023-07-01 -> 2024-01-01
-Stress       2023-01-01 -> 2023-07-01
-Final        2023-01-01 -> 2025-04-01
+Discovery    2024-03-01 -> 2025-06-01
+Validation   2023-09-01 -> 2024-03-01
+Stress       2023-03-01 -> 2023-09-01
+Final        2023-03-01 -> 2025-06-01
 ```
 
-Nested research از `2023-01-01` شروع می‌شود و چهار Fold دوماهه‌ی OOS را از بعد مرز Development تا ابتدای دسامبر ۲۰۲۵ گزارش می‌کند. باقیمانده‌ی دسامبر نقش Embargo را دارد و داده‌ی `2026-01-01` به بعد برای Holdout یک‌باره بسته می‌ماند؛ Holdout تا آخرین کندل `2026-05-31 23:45:00` ادامه دارد و پایان exclusive آن `2026-06-01 00:00:00` است. manifest هر snapshot پایان exclusive داده‌ی مصرف‌شده را نگه می‌دارد؛ seed هم‌پوشان یا بدون provenance فقط به‌صورت تشخیصی اجرا می‌شود و نمی‌تواند همه‌ی gateها را پاس کند.
+Nested research از ابتدای rolling Development شروع می‌شود و چهار Fold دوماهه‌ی OOS را پس از مرز `2025-06-01` تا `2026-02-01` گزارش می‌کند. فوریه Embargo است و داده‌ی `2026-03-01` به بعد برای Holdout یک‌باره بسته می‌ماند؛ Holdout فعلی تا آخرین کندل `2026-07-31 23:45:00` ادامه دارد. Manifest هر snapshot پایان exclusive داده‌ی مصرف‌شده را نگه می‌دارد؛ Seed هم‌پوشان یا بدون Provenance فقط به‌صورت تشخیصی اجرا می‌شود و نمی‌تواند همه‌ی Gateها را پاس کند.
 
 ```powershell
-# شروع اجرای نامحدود؛ خروجی پیش‌فرض outputs/optimize/auto_2023_2026 است
+# شروع اجرای نامحدود؛ پوشه خروجی تاریخ‌دار به‌صورت خودکار انتخاب می‌شود
 python .\optimize.py --auto -w 16
 
 # برای توقف امن یک‌بار Ctrl+C بزنید
@@ -398,6 +405,8 @@ Auto از نتایج Discovery یاد می‌گیرد کدام پارامتره�
 
 هر چرخه والد خود را در `training_parent.json` ثبت می‌کند. پس از تکمیل چرخه اول، بهترین پارامتر Hall of Fame به baseline و والد mutation چرخه بعد تبدیل می‌شود؛ بنابراین train از بهترین مسیر شناخته‌شده ادامه پیدا می‌کند و هم‌زمان exploration تصادفی نیز حفظ می‌شود.
 
+در CSVها ابتدا تصمیم و معیارهای مهم ریسک/عملکرد و سپس پارامترها قرار می‌گیرند. `candidate_catalog.csv/json` فهرست کامل قابل‌استفاده است و برای هر رتبه در پوشه `candidates` یک فایل پارامتر و یک Summary مستقل ساخته می‌شود. `ACCEPT` یعنی مناسب ورود به Research، `WATCH` یعنی امیدوارکننده ولی نیازمند بررسی، و `REJECT` مانع می‌شود یک نتیجه‌ی شکننده صرفاً به‌دلیل Score بزرگ به `best_params.json` تبدیل شود.
+
 | گزینه Auto | پیش‌فرض | کاربرد |
 |---|---:|---|
 | `--auto` | خاموش | شروع کمپین پیوسته و مرحله‌ای. |
@@ -407,10 +416,10 @@ Auto از نتایج Discovery یاد می‌گیرد کدام پارامتره�
 | `--auto-final-top N` | `100` | تعداد برندگان Stress برای تست کل تاریخچه. |
 | `--auto-hall-size N` | `100` | تعداد برندگان نگه‌داری‌شده بین چرخه‌ها. |
 | `--auto-cycles N` | `0` | محدودیت چرخه؛ صفر یعنی ادامه تا `Ctrl+C`. |
-| `--auto-discovery-start VALUE` | `2024-01-01` | شروع بازه جدید Discovery. |
-| `--auto-validation-start VALUE` | `2023-07-01` | شروع Validation؛ پایان آن شروع Discovery است. |
-| `--auto-stress-start VALUE` | `2023-01-01` | شروع Stress و تاریخچه development. |
-| `--auto-end VALUE` | `2025-04-01` | پایان exclusive جست‌وجو؛ داده‌ی بعدی forward/OOS می‌ماند. |
+| `--auto-discovery-start VALUE` | خودکار | شروع Discovery؛ در حالت fixed مستقیماً استفاده می‌شود. |
+| `--auto-validation-start VALUE` | خودکار | شروع Validation؛ در حالت fixed مستقیماً استفاده می‌شود. |
+| `--auto-stress-start VALUE` | خودکار | شروع Stress/Development؛ در حالت fixed مستقیماً استفاده می‌شود. |
+| `--auto-end VALUE` | خودکار | پایان exclusive Development؛ در حالت fixed مستقیماً استفاده می‌شود. |
 | `--auto-importance-target METRIC` | `objective_score` | معیار اهمیت: امتیاز نهایی، سود یا درصد سود. |
 
 نتیجه هر تست بلافاصله flush می‌شود و برای هر چرخه و مرحله checkpoint جدا وجود دارد. برای Resume باید profile، grid، پارامتر پایه، بازه‌ها، اندازه قیف و محدودیت‌های ریسک یکسان بمانند؛ تعداد worker و فاصله گزارش را می‌توان تغییر داد.
