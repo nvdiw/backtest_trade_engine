@@ -251,7 +251,7 @@ python optimize.py --profile risk --mode grid --dry-run
 
 | Profile | Intended use |
 |---|---|
-| `focused` | Entry/exit score thresholds and score weights; practical starting point. |
+| `focused` | Entry/exit scores plus MA/EMA, ADX, ATR, volume, and RSI timing; practical recency-focused search. |
 | `signal` | Entry thresholds, indicators, filters, and entry weights. |
 | `exit` | Exit thresholds, trailing behavior, guards, and exit weights. |
 | `risk` | Sizing, leverage, monthly rules, cooldowns, and scale-ins. |
@@ -391,6 +391,8 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 
 Candidate reports put decisions and critical risk/performance metrics before parameter columns. `candidate_catalog.csv/json` provides the reusable ranking, while `candidates/rank_NNN_params.json` and the matching summary file make every finalist directly inspectable. `ACCEPT` means eligible for independent Research, `WATCH` means promising but below one or more Auto thresholds, and `REJECT` prevents a fragile high-score result from becoming `best_params.json`.
 
+`auto_report.xlsx` and each 50-cycle `snapshot_report.xlsx` provide a colored decision dashboard rather than only raw columns. They include campaign start/update time, elapsed hours, exact test and historical-stability ranges, a Top-candidate profit chart, decision colors, aggregate monthly statistics, the number of months returning at least 8%, the same statistics for the latest 12 observed months, and a month-by-month sheet for the best candidate. Finalists retain compact monthly equity returns so these counts reflect actual monthly performance; discovery candidates do not carry this extra payload.
+
 | Auto option | Default | Meaning |
 |---|---:|---|
 | `--auto` | off | Start the continuous staged campaign. |
@@ -404,6 +406,7 @@ Candidate reports put decisions and critical risk/performance metrics before par
 | `--auto-discovery-start VALUE` | auto-derived | Recent Discovery start; honored directly in fixed mode. |
 | `--auto-validation-start VALUE` | auto-derived | Validation start; honored directly in fixed mode. |
 | `--auto-stress-start VALUE` | auto-derived | Stress/development start; honored directly in fixed mode. |
+| `--auto-stress-end VALUE` | auto-derived | Exclusive end of the older stability-only slice; honored directly in fixed mode. |
 | `--auto-end VALUE` | auto-derived | Exclusive Development end; honored directly in fixed mode. |
 | `--auto-importance-target METRIC` | `objective_score` | Importance target: objective score, profit, or profit %. |
 | `--auto-halving-rungs N` | `2` | Cheap expanding Discovery rungs; `0` disables them. |

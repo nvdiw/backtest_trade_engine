@@ -211,6 +211,21 @@ FOCUSED_PARAM_GRID = {
     "exit_score_adx": [1, 2, 3],
     "exit_score_opposite_candle": [1, 2, 3],
     "post_cross_penalty_score": [0, 1, 2, 3, 4, 5],
+    # Tune the indicators that create the signals as well as their scores.
+    "ema_16_period": [10, 12, 14, 16, 18, 20, 24],
+    "ma_50_period": [35, 40, 45, 50, 55, 60, 70],
+    "ma_100_period": [80, 90, 100, 102, 110, 125, 140],
+    "ma_200_period": [160, 180, 198, 200, 220, 240, 260],
+    "period_adx": [8, 10, 12, 14, 16, 18, 21],
+    "period_atr": [8, 10, 12, 14, 16, 18, 21],
+    "period_atr_ma": [7, 10, 14, 18, 21, 28, 35],
+    "period_vol_avg": [6, 8, 10, 12, 15, 18, 21, 30],
+    "period_rsi": [7, 9, 11, 14, 18, 21],
+    "entry_adx_threshold": [12, 15, 18, 20, 20.5, 22, 25, 28, 32],
+    "entry_atr_threshold": [0.7, 0.85, 1.0, 1.1, 1.2, 1.35, 1.5],
+    "volume_spike_multiplier": [0.9, 1.0, 1.1, 1.2, 1.24, 1.3, 1.45, 1.6, 1.8],
+    "rsi_entry_buffer": [2, 4, 6, 8, 10, 12],
+    "rsi_distance_threshold": [4, 6, 8, 10, 12, 15, 20],
 }
 
 
@@ -328,20 +343,18 @@ SURROGATE_MAX_TRAINING_SAMPLES = 10_000
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
 SURROGATE_CACHE_VERSION = 2
 
-# The default protocol deliberately follows the newest complete market regimes
-# while keeping 2026 sealed.  These constants are also used as harmless worker
-# bootstrap values before each task supplies its exact stage range.
+# Fixed-mode bootstrap values. Auto mode replaces them from the final candle.
 DEFAULT_DEVELOPMENT_START = "2023-01-01"
 DEFAULT_AUTO_VALIDATION_START = "2023-07-01"
 DEFAULT_AUTO_DISCOVERY_START = "2024-01-01"
 DEFAULT_DEVELOPMENT_END = "2025-04-01"
 DEFAULT_RESEARCH_END = "2026-01-01"
 DEFAULT_HOLDOUT_START = "2026-01-01"
-DEFAULT_ROLLING_DEVELOPMENT_MONTHS = 27
+DEFAULT_ROLLING_DEVELOPMENT_MONTHS = 24
 DEFAULT_ROLLING_OOS_MONTHS = 8
 DEFAULT_ROLLING_EMBARGO_MONTHS = 1
 DEFAULT_ROLLING_HOLDOUT_MONTHS = 5
-DEFAULT_ROLLING_STRESS_MONTHS = 6
+DEFAULT_ROLLING_STRESS_MONTHS = 3
 DEFAULT_ROLLING_VALIDATION_MONTHS = 6
 
 _WORKER_START = DEFAULT_DEVELOPMENT_START
@@ -1409,6 +1422,10 @@ def _combine_auto_stage_records(stage_records):
             stage_metrics[stage] = {
                 **record["result"],
                 "time_normalized_score": normalized_score,
+                "range_start": record.get("range_start"),
+                "range_end": record.get("range_end"),
+                "range_candles": record.get("range_candles"),
+                "duration_s": record.get("duration"),
             }
         if not qualified:
             robust_score = -math.inf
@@ -1576,30 +1593,36 @@ def _date_bound(value):
 
 
 def _rolling_date_protocol(args, coverage=None):
-    """Derive a leak-resistant recent protocol backwards from the latest candle."""
+    """Anchor optimization to a recent window ending at the latest candle.
+
+    Only Stress uses the short immediately preceding historical slice. It is
+    excluded from Final so older regimes cannot dominate parameter selection.
+    """
     coverage = coverage or _market_data_coverage()
     data_end = datetime.fromisoformat(coverage["end_exclusive"])
+    development_end = data_end
+    development_start = _shift_calendar_months(
+        development_end, -int(args.rolling_development_months)
+    )
+    stability_start = _shift_calendar_months(
+        development_start, -int(args.rolling_stress_months)
+    )
+    validation_start = development_start
+    discovery_start = _shift_calendar_months(
+        validation_start, int(args.rolling_validation_months)
+    )
+
+    # These bounds remain available to the separate research/holdout workflow.
+    # Auto candidate search itself ends at development_end (the newest candle).
     holdout_start = _shift_calendar_months(
         data_end, -int(args.rolling_holdout_months)
     )
     research_end = _shift_calendar_months(
         holdout_start, -int(args.rolling_embargo_months)
     )
-    development_end = _shift_calendar_months(
-        research_end, -int(args.rolling_oos_months)
-    )
-    development_start = _shift_calendar_months(
-        development_end, -int(args.rolling_development_months)
-    )
-    validation_start = _shift_calendar_months(
-        development_start, int(args.rolling_stress_months)
-    )
-    discovery_start = _shift_calendar_months(
-        validation_start, int(args.rolling_validation_months)
-    )
-    if not development_start < validation_start < discovery_start < development_end:
+    if not stability_start < validation_start < discovery_start < development_end:
         raise ValueError(
-            "rolling date policy leaves no Discovery range; reduce stress/validation "
+            "rolling date policy leaves no recent Discovery range; reduce validation "
             "months or increase development months"
         )
     return {
@@ -1607,6 +1630,8 @@ def _rolling_date_protocol(args, coverage=None):
         "dataset_last_candle": coverage["last_candle"],
         "dataset_end_exclusive": coverage["end_exclusive"],
         "development_start": _date_bound(development_start),
+        "stability_start": _date_bound(stability_start),
+        "stability_end": _date_bound(development_start),
         "validation_start": _date_bound(validation_start),
         "discovery_start": _date_bound(discovery_start),
         "development_end": _date_bound(development_end),
@@ -1619,7 +1644,7 @@ def _rolling_date_protocol(args, coverage=None):
             "oos": int(args.rolling_oos_months),
             "embargo": int(args.rolling_embargo_months),
             "holdout": int(args.rolling_holdout_months),
-            "stress": int(args.rolling_stress_months),
+            "historical_stability": int(args.rolling_stress_months),
             "validation": int(args.rolling_validation_months),
         },
     }
@@ -1628,9 +1653,12 @@ def _rolling_date_protocol(args, coverage=None):
 def _apply_date_policy(args, coverage=None):
     """Resolve automatic dates once; fixed mode preserves every CLI boundary."""
     if getattr(args, "date_policy", "auto") == "fixed":
+        stress_end = args.auto_stress_end or args.auto_validation_start
         protocol = {
             "policy": "fixed",
             "development_start": args.auto_stress_start,
+            "stability_start": args.auto_stress_start,
+            "stability_end": stress_end,
             "validation_start": args.auto_validation_start,
             "discovery_start": args.auto_discovery_start,
             "development_end": args.auto_end,
@@ -1642,7 +1670,8 @@ def _apply_date_policy(args, coverage=None):
         protocol = _rolling_date_protocol(args, coverage=coverage)
         args.start = protocol["development_start"]
         args.end = protocol["development_end"]
-        args.auto_stress_start = protocol["development_start"]
+        args.auto_stress_start = protocol["stability_start"]
+        args.auto_stress_end = protocol["stability_end"]
         args.auto_validation_start = protocol["validation_start"]
         args.auto_discovery_start = protocol["discovery_start"]
         args.auto_end = protocol["development_end"]
@@ -1662,6 +1691,8 @@ def _restore_frozen_date_protocol(args, protocol):
         return
     mappings = {
         "development_start": ("start", "auto_stress_start", "wf_start", "random_audit_earliest"),
+        "stability_start": ("auto_stress_start",),
+        "stability_end": ("auto_stress_end",),
         "validation_start": ("auto_validation_start",),
         "discovery_start": ("auto_discovery_start", "random_audit_recent_start"),
         "development_end": ("end", "auto_end"),
@@ -2143,11 +2174,12 @@ def _validate_top_candidates(records, args, workers, chunksize):
 
 
 def _auto_ranges(args, resolved_end):
+    stress_end = getattr(args, "auto_stress_end", None) or args.auto_validation_start
     return {
         "discovery": [args.auto_discovery_start, resolved_end],
         "validation": [args.auto_validation_start, args.auto_discovery_start],
-        "stress": [args.auto_stress_start, args.auto_validation_start],
-        "final": [args.auto_stress_start, resolved_end],
+        "stress": [args.auto_stress_start, stress_end],
+        "final": [args.auto_validation_start, resolved_end],
     }
 
 
@@ -2199,11 +2231,16 @@ def _validate_auto_ranges(ranges):
     discovery_start = _bound_index(ranges["discovery"][0])
     validation_start = _bound_index(ranges["validation"][0])
     stress_start = _bound_index(ranges["stress"][0])
+    stress_end = _bound_index(ranges["stress"][1])
+    final_start = _bound_index(ranges["final"][0])
     final_end = _bound_index(ranges["final"][1])
-    if not stress_start < validation_start < discovery_start < final_end:
+    if not (
+        stress_start < stress_end <= validation_start
+        and final_start == validation_start < discovery_start < final_end
+    ):
         raise ValueError(
-            "auto ranges must satisfy: stress-start < validation-start < "
-            "discovery-start < auto-end"
+            "auto ranges must satisfy: stress-start < stress-end <= recent-start "
+            "< discovery-start < auto-end"
         )
 
 
@@ -2310,6 +2347,7 @@ def _restore_auto_resume_args(args, state):
         args.auto_discovery_start = ranges["discovery"][0]
         args.auto_validation_start = ranges["validation"][0]
         args.auto_stress_start = ranges["stress"][0]
+        args.auto_stress_end = ranges["stress"][1]
         args.auto_end = ranges["final"][1]
 
     features = state.get("optimizer_features") or {}
@@ -2804,7 +2842,9 @@ def _expanding_discovery_ranges(range_start, range_end, rung_count):
 
 
 def _walk_forward_ranges(ranges, fold_count):
-    start_index = _bound_index(ranges["stress"][0])
+    # The historical slice is only a Stress sanity check; walk-forward belongs
+    # to the main recent optimization window.
+    start_index = _bound_index(ranges["final"][0])
     end_index = _bound_index(ranges["discovery"][0])
     width = end_index - start_index
     fold_count = min(max(0, fold_count), max(0, width))
@@ -3112,6 +3152,7 @@ def _auto_stage_fieldnames(keys):
         "objective_score", "time_normalized_score", "score",
         *IMPORTANT_RESULT_COLUMNS, *metrics,
         "profit_per_trade", "range_candles", "duration_s", *keys, "error",
+        "monthly_returns_json",
     ]
 
 
@@ -3150,6 +3191,10 @@ def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
         "time_normalized_score": time_normalized_score,
         "range_candles": range_candles,
         "error": error,
+        "monthly_returns_json": (
+            json.dumps(result.get("monthly_returns", []), separators=(",", ":"))
+            if result and result.get("monthly_returns") is not None else ""
+        ),
     }
     row.update({key: params[key] for key in keys})
     if result:
@@ -3179,6 +3224,14 @@ def _read_auto_stage_records(path, candidates):
             if candidate is None:
                 continue
             result = {key: _parse_metric(row.get(key)) for key in RESULT_COLUMNS}
+            monthly_json = row.get("monthly_returns_json")
+            if monthly_json:
+                try:
+                    result["monthly_returns"] = [
+                        float(value) for value in json.loads(monthly_json)
+                    ]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    result["monthly_returns"] = []
             raw_score = _parse_metric(row.get("objective_score"))
             range_candles = _parse_metric(row.get("range_candles"))
             if range_candles is None:
@@ -3198,6 +3251,8 @@ def _read_auto_stage_records(path, candidates):
                 "objective_score": raw_score,
                 "time_normalized_score": normalized_score,
                 "range_candles": range_candles,
+                "range_start": row.get("range_start"),
+                "range_end": row.get("range_end"),
                 "duration": float(row.get("duration_s") or 0),
                 "error": row.get("error") or None,
             }
@@ -3332,6 +3387,7 @@ def _run_auto_stage(
         state["config"].get("indicator_warmup", False)
     )
     strategy_spec = state["config"].get("strategy", "ma")
+    capture_monthly_detail = stage == "final"
     tasks = [
         (candidate["candidate_id"], candidate["params"])
         for candidate in pending
@@ -3355,7 +3411,7 @@ def _run_auto_stage(
                     True,
                      use_indicator_warmup,
                      strategy_spec,
-                     False,
+                     capture_monthly_detail,
                      fixed_warmup,
                  ),
             )
@@ -3367,7 +3423,7 @@ def _run_auto_stage(
                 False,
                 use_indicator_warmup,
                 strategy_spec,
-                False,
+                capture_monthly_detail,
                 fixed_warmup,
             )
 
@@ -3383,7 +3439,7 @@ def _run_auto_stage(
                     _parse_bound(range_end),
                     use_indicator_warmup,
                     strategy_spec,
-                    False,
+                    capture_monthly_detail,
                     fixed_warmup,
                 )
                 for candidate_id, params in tasks
@@ -3419,6 +3475,8 @@ def _run_auto_stage(
                     "objective_score": objective_score,
                     "time_normalized_score": normalized_score,
                     "range_candles": range_candles,
+                    "range_start": range_start,
+                    "range_end": range_end,
                     "duration": duration,
                     "error": error,
                 }
@@ -3650,7 +3708,102 @@ def _write_rows_atomic(path, fieldnames, rows):
     _replace_with_retry(temporary, path)
 
 
-def _flatten_hall_record(record, keys, rank):
+def _compound_returns(values):
+    compounded = 1.0
+    for value in values:
+        compounded *= 1.0 + value
+    return (compounded - 1.0) * 100.0
+
+
+def _monthly_performance_summary(monthly_returns):
+    """Return decision-friendly monthly statistics from decimal returns."""
+    values = []
+    for value in monthly_returns or ():
+        numeric = _finite_number(value)
+        if numeric is not None:
+            values.append(numeric)
+    recent = values[-12:]
+
+    def describe(sample, prefix=""):
+        positive = sum(value > 0 for value in sample)
+        negative = sum(value < 0 for value in sample)
+        return {
+            f"{prefix}months_observed": len(sample),
+            f"{prefix}profitable_months": positive,
+            f"{prefix}losing_months": negative,
+            f"{prefix}flat_months": len(sample) - positive - negative,
+            f"{prefix}months_ge_8pct": sum(value >= 0.08 for value in sample),
+            f"{prefix}positive_month_ratio": (
+                positive / len(sample) if sample else None
+            ),
+            f"{prefix}compound_return_pct": (
+                _compound_returns(sample) if sample else None
+            ),
+            f"{prefix}average_month_pct": (
+                statistics.fmean(sample) * 100.0 if sample else None
+            ),
+            f"{prefix}best_month_pct": max(sample) * 100.0 if sample else None,
+            f"{prefix}worst_month_pct": min(sample) * 100.0 if sample else None,
+        }
+
+    summary = describe(values)
+    summary.update(describe(recent, "last_12_"))
+    return summary
+
+
+def _range_reporting_summary(state):
+    ranges = (state.get("config") or {}).get("ranges", {}) or {}
+    final_range = ranges.get("final") or [None, None]
+    stress_range = ranges.get("stress") or [None, None]
+    created_at = state.get("created_at")
+    updated_at = state.get("updated_at")
+    elapsed_seconds = None
+    try:
+        elapsed_seconds = max(
+            0.0,
+            (datetime.fromisoformat(updated_at) - datetime.fromisoformat(created_at)).total_seconds(),
+        )
+    except (TypeError, ValueError):
+        pass
+    return {
+        "campaign_started_at": created_at,
+        "campaign_updated_at": updated_at,
+        "campaign_elapsed_hours": (
+            elapsed_seconds / 3600.0 if elapsed_seconds is not None else None
+        ),
+        "test_start": final_range[0] if len(final_range) > 0 else None,
+        "test_end": final_range[1] if len(final_range) > 1 else None,
+        "stability_start": stress_range[0] if len(stress_range) > 0 else None,
+        "stability_end": stress_range[1] if len(stress_range) > 1 else None,
+    }
+
+
+def _monthly_return_rows(monthly_returns, range_start=None):
+    values = [
+        value for value in (_finite_number(item) for item in (monthly_returns or ()))
+        if value is not None
+    ]
+    start_date = None
+    try:
+        start_date = datetime.fromisoformat(str(range_start)).replace(day=1)
+    except (TypeError, ValueError):
+        pass
+    rows = []
+    for index, value in enumerate(values):
+        label = (
+            _shift_calendar_months(start_date, index).strftime("%Y-%m")
+            if start_date is not None else f"Month {index + 1}"
+        )
+        rows.append({
+            "Month": label,
+            "Return %": value * 100.0,
+            "Profitable": value > 0,
+            "Profit >= 8%": value >= 0.08,
+        })
+    return rows
+
+
+def _flatten_hall_record(record, keys, rank, state=None):
     final_metrics = record.get("stage_metrics", {}).get("final", {}) or {}
     row = {
         "rank": rank,
@@ -3671,6 +3824,9 @@ def _flatten_hall_record(record, keys, rank):
     )
     for metric in metric_names:
         row[f"final_{metric}"] = final_metrics.get(metric)
+    row.update(_monthly_performance_summary(final_metrics.get("monthly_returns")))
+    if state is not None:
+        row.update(_range_reporting_summary(state))
     for stage in AUTO_STAGE_ORDER:
         metrics = record.get("stage_metrics", {}).get(stage, {})
         for metric in metric_names:
@@ -3681,8 +3837,9 @@ def _flatten_hall_record(record, keys, rank):
     return row
 
 
-def _candidate_summary(record, rank, parameter_file):
-    return {
+def _candidate_summary(record, rank, parameter_file, state=None):
+    final_metrics = record.get("stage_metrics", {}).get("final", {}) or {}
+    summary = {
         "rank": rank,
         "candidate_id": record.get("candidate_id"),
         "decision": record.get("decision", "WATCH"),
@@ -3698,30 +3855,99 @@ def _candidate_summary(record, rank, parameter_file):
         "stage_metrics": record.get("stage_metrics", {}),
         "effective_params": record.get("effective_params") or record.get("params") or {},
     }
+    summary["monthly_performance"] = _monthly_performance_summary(
+        final_metrics.get("monthly_returns")
+    )
+    if state is not None:
+        summary["time_summary"] = _range_reporting_summary(state)
+    return summary
 
 
-def _save_auto_workbook(output_dir, hall_rows, importance_rows):
+def _save_auto_workbook(
+    output_dir, hall_rows, importance_rows, state=None, filename="auto_report.xlsx",
+    best_monthly_returns=None,
+):
     if not hall_rows:
         return None
     try:
         import pandas as pd
         from openpyxl import load_workbook
+        from openpyxl.chart import BarChart, Reference
         from openpyxl.formatting.rule import ColorScaleRule
-        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
         from openpyxl.utils import get_column_letter
         from openpyxl.worksheet.table import Table, TableStyleInfo
     except ImportError:
         return None
 
-    output_path = Path(output_dir) / "auto_report.xlsx"
+    state = state or {}
+    time_summary = _range_reporting_summary(state)
+    best = hall_rows[0]
+    dashboard_rows = [
+        {"Section": "Campaign", "Metric": "Status", "Value": state.get("status")},
+        {"Section": "Campaign", "Metric": "Cycles completed", "Value": state.get("cycles_completed")},
+        {"Section": "Campaign", "Metric": "Total evaluations", "Value": state.get("total_evaluations")},
+        {"Section": "Campaign", "Metric": "Started at", "Value": time_summary["campaign_started_at"]},
+        {"Section": "Campaign", "Metric": "Last updated at", "Value": time_summary["campaign_updated_at"]},
+        {"Section": "Campaign", "Metric": "Elapsed hours", "Value": time_summary["campaign_elapsed_hours"]},
+        {"Section": "Test window", "Metric": "Main test start", "Value": time_summary["test_start"]},
+        {"Section": "Test window", "Metric": "Main test end (exclusive)", "Value": time_summary["test_end"]},
+        {"Section": "Test window", "Metric": "Historical stability start", "Value": time_summary["stability_start"]},
+        {"Section": "Test window", "Metric": "Historical stability end", "Value": time_summary["stability_end"]},
+        {"Section": "Best candidate", "Metric": "Candidate", "Value": best.get("candidate_id")},
+        {"Section": "Best candidate", "Metric": "Decision", "Value": best.get("decision")},
+        {"Section": "Best candidate", "Metric": "Robust score", "Value": best.get("robust_score")},
+        {"Section": "Best candidate", "Metric": "Total profit %", "Value": best.get("final_total_profit_percent")},
+        {"Section": "Best candidate", "Metric": "Maximum drawdown %", "Value": best.get("final_maximum_drawdown")},
+        {"Section": "Best candidate", "Metric": "Closed trades", "Value": best.get("final_closed_trades")},
+        {"Section": "Best candidate", "Metric": "Win rate %", "Value": best.get("final_win_rate")},
+        {"Section": "Last 12 months", "Metric": "Months observed", "Value": best.get("last_12_months_observed")},
+        {"Section": "Last 12 months", "Metric": "Profitable months", "Value": best.get("last_12_profitable_months")},
+        {"Section": "Last 12 months", "Metric": "Months with profit >= 8%", "Value": best.get("last_12_months_ge_8pct")},
+        {"Section": "Last 12 months", "Metric": "Losing months", "Value": best.get("last_12_losing_months")},
+        {"Section": "Last 12 months", "Metric": "Compound return %", "Value": best.get("last_12_compound_return_pct")},
+        {"Section": "Last 12 months", "Metric": "Average month %", "Value": best.get("last_12_average_month_pct")},
+        {"Section": "Last 12 months", "Metric": "Best month %", "Value": best.get("last_12_best_month_pct")},
+        {"Section": "Last 12 months", "Metric": "Worst month %", "Value": best.get("last_12_worst_month_pct")},
+    ]
+    monthly_columns = [
+        "rank", "decision", "candidate_id", "test_start", "test_end",
+        "months_observed", "profitable_months", "months_ge_8pct", "losing_months",
+        "positive_month_ratio", "compound_return_pct", "average_month_pct",
+        "best_month_pct", "worst_month_pct", "last_12_months_observed",
+        "last_12_profitable_months", "last_12_months_ge_8pct",
+        "last_12_losing_months", "last_12_positive_month_ratio",
+        "last_12_compound_return_pct", "last_12_average_month_pct",
+        "last_12_best_month_pct", "last_12_worst_month_pct",
+    ]
+    monthly_rows = [
+        {key: row.get(key) for key in monthly_columns} for row in hall_rows
+    ]
+    best_monthly_rows = _monthly_return_rows(
+        best_monthly_returns or [], best.get("test_start")
+    )
+    output_path = Path(output_dir) / filename
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        pd.DataFrame(dashboard_rows).to_excel(writer, sheet_name="Dashboard", index=False)
         pd.DataFrame(hall_rows).to_excel(writer, sheet_name="Hall of Fame", index=False)
+        pd.DataFrame(monthly_rows).to_excel(
+            writer, sheet_name="Monthly Analysis", index=False
+        )
+        pd.DataFrame(
+            best_monthly_rows,
+            columns=("Month", "Return %", "Profitable", "Profit >= 8%"),
+        ).to_excel(writer, sheet_name="Best Monthly Returns", index=False)
         pd.DataFrame(importance_rows).to_excel(
             writer, sheet_name="Parameter Importance", index=False
         )
     workbook = load_workbook(output_path)
     header_fill = PatternFill("solid", fgColor="17365D")
     header_font = Font(color="FFFFFF", bold=True)
+    section_colors = {
+        "Campaign": "D9EAF7", "Test window": "E2F0D9",
+        "Best candidate": "FFF2CC", "Last 12 months": "E4DFEC",
+    }
+    thin_gray = Side(style="thin", color="D9E1F2")
     for index, worksheet in enumerate(workbook.worksheets, start=1):
         worksheet.freeze_panes = "A2"
         worksheet.sheet_view.showGridLines = False
@@ -3729,6 +3955,7 @@ def _save_auto_workbook(output_dir, hall_rows, importance_rows):
             cell.fill = header_fill
             cell.font = header_font
             cell.alignment = Alignment(horizontal="center")
+        worksheet.auto_filter.ref = worksheet.dimensions
         for column_index, cells in enumerate(worksheet.columns, start=1):
             width = min(38, max(10, max(len(str(cell.value or "")) for cell in cells[:200]) + 2))
             worksheet.column_dimensions[get_column_letter(column_index)].width = width
@@ -3757,6 +3984,88 @@ def _save_auto_workbook(output_dir, hall_rows, importance_rows):
                         end_type="max", end_color="63BE7B",
                     ),
                 )
+        for header, column in headers.items():
+            header_text = str(header or "")
+            if "ratio" in header_text:
+                for cell in worksheet.iter_rows(
+                    min_row=2, max_row=worksheet.max_row,
+                    min_col=column, max_col=column,
+                ):
+                    cell[0].number_format = "0.0%"
+            elif header_text.endswith("_pct") or header_text.endswith("_percent"):
+                for cell in worksheet.iter_rows(
+                    min_row=2, max_row=worksheet.max_row,
+                    min_col=column, max_col=column,
+                ):
+                    cell[0].number_format = "0.00"
+        if worksheet.title == "Dashboard":
+            worksheet.sheet_properties.tabColor = "4472C4"
+            worksheet.column_dimensions["A"].width = 20
+            worksheet.column_dimensions["B"].width = 30
+            worksheet.column_dimensions["C"].width = 24
+            for row in range(2, worksheet.max_row + 1):
+                section = worksheet.cell(row, 1).value
+                fill = PatternFill("solid", fgColor=section_colors.get(section, "FFFFFF"))
+                for column in range(1, 4):
+                    cell = worksheet.cell(row, column)
+                    cell.fill = fill
+                    cell.border = Border(bottom=thin_gray)
+                worksheet.cell(row, 1).font = Font(bold=True, color="17365D")
+                if worksheet.cell(row, 2).value in {
+                    "Total profit %", "Maximum drawdown %", "Win rate %",
+                    "Compound return %", "Average month %", "Best month %", "Worst month %",
+                }:
+                    worksheet.cell(row, 3).number_format = "0.00"
+        elif worksheet.title == "Hall of Fame":
+            worksheet.sheet_properties.tabColor = "70AD47"
+            decision_column = headers.get("decision")
+            if decision_column:
+                decision_fills = {
+                    "ACCEPT": PatternFill("solid", fgColor="C6EFCE"),
+                    "WATCH": PatternFill("solid", fgColor="FFEB9C"),
+                    "REJECT": PatternFill("solid", fgColor="FFC7CE"),
+                }
+                for row in range(2, worksheet.max_row + 1):
+                    decision = worksheet.cell(row, decision_column).value
+                    if decision in decision_fills:
+                        worksheet.cell(row, decision_column).fill = decision_fills[decision]
+                        worksheet.cell(row, decision_column).font = Font(bold=True)
+        elif worksheet.title == "Monthly Analysis":
+            worksheet.sheet_properties.tabColor = "8064A2"
+        elif worksheet.title == "Best Monthly Returns":
+            worksheet.sheet_properties.tabColor = "5B9BD5"
+            return_column = headers.get("Return %")
+            if return_column and worksheet.max_row >= 2:
+                letter = get_column_letter(return_column)
+                worksheet.conditional_formatting.add(
+                    f"{letter}2:{letter}{worksheet.max_row}",
+                    ColorScaleRule(
+                        start_type="min", start_color="F8696B",
+                        mid_type="num", mid_value=0, mid_color="FFEB84",
+                        end_type="max", end_color="63BE7B",
+                    ),
+                )
+        else:
+            worksheet.sheet_properties.tabColor = "F4B183"
+
+    hall_sheet = workbook["Hall of Fame"]
+    hall_headers = {cell.value: cell.column for cell in hall_sheet[1]}
+    profit_column = hall_headers.get("final_total_profit_percent")
+    if profit_column and hall_sheet.max_row >= 2:
+        chart = BarChart()
+        chart.title = "Top candidates: total profit %"
+        chart.y_axis.title = "Profit %"
+        chart.height = 7
+        chart.width = 13
+        last_row = min(hall_sheet.max_row, 11)
+        chart.add_data(
+            Reference(hall_sheet, min_col=profit_column, min_row=1, max_row=last_row),
+            titles_from_data=True,
+        )
+        chart.set_categories(
+            Reference(hall_sheet, min_col=1, min_row=2, max_row=last_row)
+        )
+        workbook["Dashboard"].add_chart(chart, "E2")
     workbook.save(output_path)
     return output_path
 
@@ -3788,10 +4097,10 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         summary_path = candidates_dir / summary_name
         _write_json(parameter_path, record["effective_params"])
         summary = _candidate_summary(
-            record, rank, Path("candidates") / parameter_name
+            record, rank, Path("candidates") / parameter_name, state=state
         )
         _write_json(summary_path, summary)
-        row = _flatten_hall_record(record, keys, rank)
+        row = _flatten_hall_record(record, keys, rank, state=state)
         row["parameter_file"] = str(Path("candidates") / parameter_name).replace("\\", "/")
         row["summary_file"] = str(Path("candidates") / summary_name).replace("\\", "/")
         # Keep reusable file locations with the decision columns, before metrics/params.
@@ -3835,7 +4144,18 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
             importance_rows,
         )
     workbook = (
-        _save_auto_workbook(output_dir, hall_rows, importance_rows)
+        _save_auto_workbook(
+            output_dir,
+            hall_rows,
+            importance_rows,
+            state=state,
+            best_monthly_returns=(
+                (ranked_hall[0].get("stage_metrics", {}).get("final", {}) or {}).get(
+                    "monthly_returns"
+                )
+                if ranked_hall else None
+            ),
+        )
         if excel_enabled else None
     )
     summary = {
@@ -3851,7 +4171,17 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "best_decision": ranked_hall[0].get("decision") if ranked_hall else None,
         "best_recency_score": ranked_hall[0].get("recency_score") if ranked_hall else None,
         "best_params": ranked_hall[0]["effective_params"] if ranked_hall else None,
+        "time_summary": _range_reporting_summary(state),
+        "best_monthly_performance": (
+            _monthly_performance_summary(
+                (ranked_hall[0].get("stage_metrics", {}).get("final", {}) or {}).get(
+                    "monthly_returns"
+                )
+            )
+            if ranked_hall else None
+        ),
         "date_protocol": state.get("date_protocol"),
+        "time_summary": _range_reporting_summary(state),
         "optimizer_features": state.get("optimizer_features"),
         "advanced_from_cycle": state.get("advanced_from_cycle"),
         "bootstrap": state.get("bootstrap"),
@@ -3859,6 +4189,89 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "updated_at": state["updated_at"],
     }
     _write_json(output_dir / "auto_summary.json", summary)
+
+
+def refresh_auto_report_monthly(output_dir, top_n=None, workers=1):
+    """Backfill rich monthly analytics for an existing completed campaign."""
+    output_dir = Path(output_dir)
+    state = _load_json(output_dir / "auto_state.json", {}) or {}
+    hall = _load_json(output_dir / "hall_of_fame.json", []) or []
+    if not state or not hall:
+        raise ValueError("auto_state.json and hall_of_fame.json are required")
+    ranges = (state.get("config") or {}).get("ranges", {}) or {}
+    final_range = ranges.get("final")
+    if not isinstance(final_range, (list, tuple)) or len(final_range) != 2:
+        raise ValueError("campaign does not contain a valid final range")
+    strategy_spec = (state.get("config") or {}).get("strategy", "ma")
+    limit = len(hall) if top_n is None else min(len(hall), max(1, int(top_n)))
+    selected = hall[:limit]
+    record_by_id = {str(record.get("candidate_id")): record for record in selected}
+    tasks = [
+        (
+            index,
+            str(record.get("candidate_id")),
+            "monthly_refresh",
+            record.get("effective_params") or record.get("params") or {},
+            _parse_bound(final_range[0]),
+            _parse_bound(final_range[1]),
+            strategy_spec,
+        )
+        for index, record in enumerate(selected, start=1)
+    ]
+    worker_count = min(max(1, int(workers)), len(tasks))
+    if worker_count > 1:
+        pool = multiprocessing.Pool(worker_count)
+        evaluated = pool.imap_unordered(_evaluate_random_window_task, tasks, chunksize=1)
+    else:
+        pool = None
+        evaluated = map(_evaluate_random_window_task, tasks)
+    completed = 0
+    for (
+        _test_index, candidate_id, _window_id, _params, _start, _end,
+        result, _duration, error,
+    ) in evaluated:
+        if error or result is None:
+            if pool is not None:
+                pool.terminate()
+                pool.join()
+            raise RuntimeError(f"monthly refresh failed for {candidate_id}: {error}")
+        record = record_by_id[candidate_id]
+        final_metrics = record.setdefault("stage_metrics", {}).setdefault("final", {})
+        monthly_returns = [
+            float(value) for value in result.get("monthly_returns", [])
+            if _finite_number(value) is not None
+        ]
+        final_metrics.update({
+            "monthly_returns": monthly_returns,
+            "profit_more_than_8%": sum(value >= 0.08 for value in monthly_returns),
+            "range_start": final_range[0],
+            "range_end": final_range[1],
+        })
+        completed += 1
+        _show_loading_progress("Refreshing monthly analytics", completed, limit)
+    if pool is not None:
+        pool.close()
+        pool.join()
+    state["report_enrichment"] = {
+        "monthly_candidates": limit,
+        "monthly_threshold": 0.08,
+        "updated_at": _timestamp_now(),
+    }
+    _write_json(output_dir / "auto_state.json", state)
+    importance = _load_json(output_dir / "parameter_importance.json", {}) or {}
+    keys = tuple((state.get("config") or {}).get("parameter_grid", {}))
+    _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled=True)
+    cycles_completed = int(state.get("cycles_completed", 0) or 0)
+    if cycles_completed > 0:
+        _write_auto_cycle_snapshot(
+            output_dir,
+            hall,
+            cycles_completed,
+            (state.get("config") or {}).get("snapshot_top", len(hall)),
+            (state.get("config") or {}).get("parameter_grid", {}),
+            state,
+        )
+    return output_dir / "auto_report.xlsx"
 
 
 def _merge_hall_of_fame(
@@ -4803,7 +5216,7 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
     _write_json(snapshot_dir / f"top_{top_n}.json", selected)
     if selected:
         rows = [
-            _flatten_hall_record(record, tuple(grid), rank)
+            _flatten_hall_record(record, tuple(grid), rank, state=state)
             for rank, record in enumerate(selected, 1)
         ]
         for row, record in zip(rows, selected):
@@ -4828,7 +5241,7 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
         _write_json(snapshot_dir / "best_params.json", selected[0]["effective_params"])
         _write_json(
             snapshot_dir / "best_candidate_summary.json",
-            _candidate_summary(selected[0], 1, Path("best_params.json")),
+            _candidate_summary(selected[0], 1, Path("best_params.json"), state=state),
         )
         params_dir = snapshot_dir / "params"
         summaries_dir = snapshot_dir / "summaries"
@@ -4842,8 +5255,34 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
             )
             _write_json(
                 summaries_dir / f"rank_{rank:03d}_summary.json",
-                _candidate_summary(record, rank, parameter_file),
+                _candidate_summary(record, rank, parameter_file, state=state),
             )
+        snapshot_importance = _load_json(
+            output_dir / "parameter_importance.json", {}
+        ) or {}
+        importance_rows = [
+            {"rank": rank, "parameter": key, **item}
+            for rank, (key, item) in enumerate(
+                sorted(
+                    snapshot_importance.items(),
+                    key=lambda pair: pair[1].get("weight", 0),
+                    reverse=True,
+                ),
+                start=1,
+            )
+        ]
+        _save_auto_workbook(
+            snapshot_dir,
+            rows,
+            importance_rows,
+            state=state,
+            filename="snapshot_report.xlsx",
+            best_monthly_returns=(
+                (selected[0].get("stage_metrics", {}).get("final", {}) or {}).get(
+                    "monthly_returns"
+                )
+            ),
+        )
     run_manifest = _load_json(output_dir / "research_manifest.json", {}) or {}
     auto_ranges = state.get("config", {}).get("ranges", {}) or {}
     development_range = auto_ranges.get("final")
@@ -4864,6 +5303,21 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
             else None
         ),
         "holdout_status": "development results; sealed holdout not consumed",
+        "best_candidate": (
+            {
+                "candidate_id": selected[0].get("candidate_id"),
+                "decision": selected[0].get("decision"),
+                "robust_score": selected[0].get("robust_score"),
+                "final_metrics": selected[0].get("stage_metrics", {}).get("final", {}),
+                "monthly_performance": _monthly_performance_summary(
+                    (selected[0].get("stage_metrics", {}).get("final", {}) or {}).get(
+                        "monthly_returns"
+                    )
+                ),
+            }
+            if selected else None
+        ),
+        "colored_workbook": "snapshot_report.xlsx" if selected else None,
         "run_fingerprints": run_manifest.get("fingerprints"),
         "created_at": _timestamp_now(),
     }
@@ -6727,9 +7181,11 @@ def run_staged_optimization(args):
                 "strategy": _adapter_from_args(args).identifier,
                 "ranking": "random-window audit when available, then robust score",
                 "date_protocol": state.get("date_protocol"),
-                "development_range": [args.auto_stress_start, development_end],
+                "development_range": [args.auto_validation_start, development_end],
                 "development_end_exclusive": development_end,
-                "holdout_status": "development results; later data not consumed",
+                "holdout_status": (
+                    "recency-first optimization consumed data through the latest candle"
+                ),
                 "run_fingerprints": run_manifest.get("fingerprints"),
                 "created_at": _timestamp_now(),
             })
@@ -7197,6 +7653,13 @@ Tips:
         "--data-audit", choices=("strict", "warn", "off"), default="strict",
         help="pre-run market-data gate; gaps/zero volume remain warnings in strict mode",
     )
+    execution.add_argument(
+        "--refresh-auto-report", action="store_true",
+        help=(
+            "re-evaluate saved Auto finalists for monthly analytics and rebuild "
+            "the colored report/snapshot"
+        ),
+    )
 
     ranges = parser.add_argument_group("standard search ranges and robustness")
     ranges.add_argument(
@@ -7209,7 +7672,7 @@ Tips:
     ranges.add_argument(
         "--rolling-development-months", type=int,
         default=DEFAULT_ROLLING_DEVELOPMENT_MONTHS, metavar="N",
-        help="development history retained before reporting-only OOS",
+        help="recent history ending at the latest candle (default: 24 months)",
     )
     ranges.add_argument(
         "--rolling-oos-months", type=int, default=DEFAULT_ROLLING_OOS_MONTHS,
@@ -7228,7 +7691,7 @@ Tips:
     ranges.add_argument(
         "--rolling-stress-months", type=int,
         default=DEFAULT_ROLLING_STRESS_MONTHS, metavar="N",
-        help="oldest part of rolling development used by Auto Stress",
+        help="small historical stability slice immediately before the recent window",
     )
     ranges.add_argument(
         "--rolling-validation-months", type=int,
@@ -7459,14 +7922,21 @@ Tips:
     auto.add_argument(
         "--auto-stress-start", default=DEFAULT_DEVELOPMENT_START,
         metavar="DATE|INDEX",
-        help="start of stress testing and the complete final range",
+        help="inclusive start of the older stability-only stress slice",
+    )
+    auto.add_argument(
+        "--auto-stress-end", default=None, metavar="DATE|INDEX",
+        help=(
+            "exclusive end of the older stability slice; in fixed mode defaults "
+            "to --auto-validation-start"
+        ),
     )
     auto.add_argument(
         "--auto-end", default=DEFAULT_DEVELOPMENT_END,
         metavar="DATE|INDEX|latest",
         help=(
-            "exclusive candidate-search end; later data is reserved for nested "
-            "walk-forward and the final sealed holdout"
+            "exclusive candidate-search end; auto policy sets this immediately "
+            "after the latest candle"
         ),
     )
     auto.add_argument(
@@ -7949,6 +8419,14 @@ def main(argv=None):
         print(f"Range: {args.start} -> {args.end}")
         return
     multiprocessing.freeze_support()
+    if args.refresh_auto_report:
+        report_path = refresh_auto_report_monthly(
+            args.output_dir,
+            top_n=getattr(args, "snapshot_top", 100),
+            workers=args.workers,
+        )
+        print(f"Refreshed Auto report: {report_path}")
+        return
     if args.auto and args.output_dir == DEFAULT_OUTPUT_DIR:
         protocol_tag = (
             f"{str(args.auto_stress_start)[:10].replace('-', '')}_"

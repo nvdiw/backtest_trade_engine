@@ -20,13 +20,14 @@ from optimize import (
     _latest_market_end, _learn_mutation_guidance, _learn_parameter_importance,
     _load_frozen_date_protocol,
     _market_data_coverage, _open_csv_text,
+    _monthly_performance_summary,
     _resolve_csv_path,
     _read_candidate_plan, _read_surrogate_history_cache,
     _representative_surrogate_history, _run_random_window_audit,
     _restore_auto_resume_args, _select_surrogate_candidates,
     _staged_seed_data, _write_staged_ranking, _write_surrogate_history_cache,
     _robust_validation_score, _time_normalized_score,
-    build_parser, grid_size,
+    _auto_ranges, build_parser, grid_size,
     iter_grid_candidates,
     param_grid, run_auto_optimization, run_optimization, run_staged_optimization,
 )
@@ -61,16 +62,25 @@ class OptimizerSearchTests(unittest.TestCase):
             "interval_seconds": 900.0,
         })
 
-        self.assertEqual(protocol["development_start"], "2023-03-01")
-        self.assertEqual(protocol["validation_start"], "2023-09-01")
-        self.assertEqual(protocol["discovery_start"], "2024-03-01")
-        self.assertEqual(protocol["development_end"], "2025-06-01")
+        self.assertEqual(protocol["development_start"], "2024-08-01")
+        self.assertEqual(protocol["stability_start"], "2024-05-01")
+        self.assertEqual(protocol["stability_end"], "2024-08-01")
+        self.assertEqual(protocol["validation_start"], "2024-08-01")
+        self.assertEqual(protocol["discovery_start"], "2025-02-01")
+        self.assertEqual(protocol["development_end"], "2026-08-01")
         self.assertEqual(protocol["research_end"], "2026-02-01")
         self.assertEqual(protocol["holdout_start"], "2026-03-01")
         self.assertEqual(protocol["holdout_end"], "2026-08-01")
-        self.assertEqual(args.auto_end, "2025-06-01")
+        self.assertEqual(args.auto_stress_end, "2024-08-01")
+        self.assertEqual(args.auto_end, "2026-08-01")
         self.assertEqual(args.wf_end, "2026-02-01")
         self.assertEqual(args.holdout_start, "2026-03-01")
+
+        ranges = _auto_ranges(args, args.auto_end)
+        self.assertEqual(ranges["stress"], ["2024-05-01", "2024-08-01"])
+        self.assertEqual(ranges["validation"], ["2024-08-01", "2025-02-01"])
+        self.assertEqual(ranges["discovery"], ["2025-02-01", "2026-08-01"])
+        self.assertEqual(ranges["final"], ["2024-08-01", "2026-08-01"])
 
     def test_fixed_date_policy_preserves_manual_boundaries(self):
         args = build_parser().parse_args([
@@ -813,10 +823,11 @@ class OptimizerSearchTests(unittest.TestCase):
             saved = json.loads(
                 (Path(temp_dir) / "best_params.json").read_text(encoding="utf-8")
             )
-            workbook = load_workbook(
-                Path(temp_dir) / "auto_report.xlsx", read_only=True
-            )
+            workbook = load_workbook(Path(temp_dir) / "auto_report.xlsx")
             auto_sheets = workbook.sheetnames
+            dashboard_status = workbook["Dashboard"]["C2"].value
+            dashboard_header_color = workbook["Dashboard"]["A1"].fill.fgColor.rgb
+            dashboard_chart_count = len(workbook["Dashboard"]._charts)
             workbook.close()
             completed_checkpoints_removed = not (
                 Path(temp_dir) / "cycles" / "cycle_000001" / "checkpoints"
@@ -829,7 +840,13 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(saved["x"], 4)
         self.assertEqual(saved["slippage_rate"], 0.0001)
         self.assertEqual(best["params"], {"x": 4})
-        self.assertEqual(auto_sheets, ["Hall of Fame", "Parameter Importance"])
+        self.assertEqual(auto_sheets, [
+            "Dashboard", "Hall of Fame", "Monthly Analysis",
+            "Best Monthly Returns", "Parameter Importance",
+        ])
+        self.assertEqual(dashboard_status, "completed")
+        self.assertEqual(dashboard_header_color, "0017365D")
+        self.assertEqual(dashboard_chart_count, 1)
         self.assertTrue(completed_checkpoints_removed)
 
     def test_auto_resume_recovers_a_missing_cycle_boundary_snapshot(self):
@@ -866,8 +883,13 @@ class OptimizerSearchTests(unittest.TestCase):
             ):
                 run_auto_optimization(args, grid={"x": [1, 2]})
             recovered = manifest.is_file()
+            snapshot_workbook = (
+                Path(temp_dir) / "snapshots" / "cycles_000001" /
+                "snapshot_report.xlsx"
+            ).is_file()
 
         self.assertTrue(recovered)
+        self.assertTrue(snapshot_workbook)
 
     def test_next_auto_cycle_continues_from_hall_of_fame_winner(self):
         args = build_parser().parse_args([
@@ -1085,6 +1107,16 @@ class OptimizerSearchTests(unittest.TestCase):
 
 
 class PerformanceScoreTests(unittest.TestCase):
+    def test_monthly_summary_counts_true_eight_percent_months_and_recent_year(self):
+        returns = [0.01, 0.08, -0.03, 0.12] + [0.02] * 9
+        summary = _monthly_performance_summary(returns)
+
+        self.assertEqual(summary["months_observed"], 13)
+        self.assertEqual(summary["months_ge_8pct"], 2)
+        self.assertEqual(summary["last_12_months_observed"], 12)
+        self.assertEqual(summary["last_12_months_ge_8pct"], 2)
+        self.assertEqual(summary["last_12_losing_months"], 1)
+
     def score(self, **overrides):
         values = {
             "return_percent": 20,

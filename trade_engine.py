@@ -1460,6 +1460,7 @@ class TradeEngine:
         monthly_returns = [float(value) for value in (monthly_returns or ())]
         profit_months = sum(value > 0 for value in monthly_returns)
         loss_months = sum(value < 0 for value in monthly_returns)
+        profit_more_than_8 = sum(value >= 0.08 for value in monthly_returns)
         return_percent = (
             final_balance * 100.0 / float(first_balance) - 100.0
             if first_balance else 0.0
@@ -1501,6 +1502,7 @@ class TradeEngine:
             "win_rate": round(win_rate, 6),
             "profit_months": int(profit_months),
             "loss_months": int(loss_months),
+            "profit_more_than_8%": int(profit_more_than_8),
             "trade_profits": list(account.profits_lst),
             "monthly_returns": monthly_returns,
             **score_metrics,
@@ -1785,7 +1787,10 @@ class TradeEngine:
             "short_losses": state["total_short"] - state["total_wins_short"],
             "maximum_drawdown": round(max_drawdown, 2),
             "win_rate": round(win_rate, 2),
-            "profit_more_than_8%": profit_months_count,
+            "profit_more_than_8%": sum(
+                value >= 8.0 for value in monthly_profits
+                if value is not None and math.isfinite(float(value))
+            ),
             "profit_months": profit_months_count,
             "loss_months": loss_months_count,
             "score": score,
