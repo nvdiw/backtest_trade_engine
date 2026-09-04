@@ -166,11 +166,16 @@ python ma_strategy.py --no-chart
 ```text
 outputs/
 ├── trades/data_orders.csv
+├── trades/data_orders_summary.csv # مقایسه کامل TOTAL/LONG/SHORT
 ├── trades/data_orders.xlsx       # پیش‌فرض؛ غیرفعال‌سازی با --no-excel
 └── monthly/monthly_data_orders.csv
 ```
 
-فایل XLSX دارای سربرگ ثابت، فیلتر، رنگ‌بندی سود و زیان و برگه‌های جداگانه Overview، All Trades، Main Strategy، RSI Strategy و Scale Strategy است. فایل CSV خام برای پردازش برنامه‌ای نیز حفظ می‌شود.
+گزارش Excel اکنون با Dashboard مقایسه Long/Short شروع می‌شود و برگه‌های Side Comparison، Monthly Analysis، Exit Reasons، Long Trades و Short Trades و نمودارهای سود تجمعی و ماهانه را دارد. CSV اصلی نیز ستون‌های استاندارد `side`، `outcome` و سود تجمعی کل/Long/Short را ذخیره می‌کند.
+
+Long و Short مستقل محاسبه می‌شوند: سود خالص و ناخالص، سهم بازده، win rate، profit factor، expectancy، میانگین برد و باخت، payoff ratio، بهترین و بدترین معامله، کارمزد، زمان نگهداری، drawdown مستقل هر جهت، زنجیره باخت، لیکویید و پوزیشن باز. مجموع `long_profit + short_profit` با realized profit برابر است؛ اختلاف احتمالی فقط از گردکردن خروجی است.
+
+فایل XLSX دارای سربرگ ثابت، فیلتر، رنگ‌بندی معنایی و برگه‌های جزئیات است؛ فایل CSV خام برای پردازش برنامه‌ای نیز حفظ می‌شود.
 
 نتیجه نهایی شامل موجودی نهایی، سود کل، realized و unrealized، تعداد پوزیشن باز، درصد بازده، تعداد معاملات بسته، برد و باخت، win rate، maximum drawdown، score، profit factor، expectancy، Calmar ratio و آمار بخش‌های MA، RSI و Scale است.
 
@@ -321,8 +326,9 @@ score از بازده، maximum drawdown، Calmar ratio، profit factor، expect
 
 ```text
 optimization_results.csv     تمام کاندیدهای تکمیل‌شده و checkpoint
-optimization_results.xlsx    برگه‌های رتبه‌بندی، پارامترها، معیارهای اصلی، RSI و Scale
+optimization_results.xlsx    داشبورد برنده، رتبه‌بندی، پارامترها، معیارهای جهت/ریسک، RSI و Scale
 best_params.json              برنده نهایی
+best_params_manifest.json     وضعیت برنده، مبنای انتخاب و راهنمای نقش فایل‌ها
 optimization_summary.json     مشخصات اجرا و معیارهای برنده
 top_results.json              تعداد --top-n از بهترین نتایج
 best_training_params.json     برنده train در حالت validation
@@ -347,6 +353,8 @@ Validation   2023-09-01 -> 2024-03-01
 Stress       2023-03-01 -> 2023-09-01
 Final        2023-03-01 -> 2025-06-01
 ```
+
+برای استفاده همیشه `best_params.json` ریشه همان پوشه خروجی را بردارید. فایل `best_params_manifest.json` صریحاً مشخص می‌کند نتیجه نهایی است یا موقت و توضیح می‌دهد چرا نسخه‌های داخل cycle/checkpoint انتخاب اصلی نیستند. در Optimize معمولی، ردیف دقیق برنده در Rankings علامت می‌خورد و نام فایل در Dashboard هم تکرار می‌شود.
 
 Nested research از ابتدای rolling Development شروع می‌شود و چهار Fold دوماهه‌ی OOS را پس از مرز `2025-06-01` تا `2026-02-01` گزارش می‌کند. فوریه Embargo است و داده‌ی `2026-03-01` به بعد برای Holdout یک‌باره بسته می‌ماند؛ Holdout فعلی تا آخرین کندل `2026-07-31 23:45:00` ادامه دارد. Manifest هر snapshot پایان exclusive داده‌ی مصرف‌شده را نگه می‌دارد؛ Seed هم‌پوشان یا بدون Provenance فقط به‌صورت تشخیصی اجرا می‌شود و نمی‌تواند همه‌ی Gateها را پاس کند.
 
@@ -427,6 +435,7 @@ Auto از نتایج Discovery یاد می‌گیرد کدام پارامتره�
 ```text
 auto_state.json              وضعیت دقیق کمپین، چرخه و مرحله
 best_params.json             بهترین پارامتر مقاوم Hall of Fame
+best_params_manifest.json    مسیر برنده اصلی و وضعیت نهایی/موقت آن
 hall_of_fame.json/.csv       برندگان پایدار بین چرخه‌ها
 parameter_importance.json/.csv اولویت یادگرفته‌شده پارامترها
 auto_summary.json            خلاصه وضعیت و بهترین نتیجه

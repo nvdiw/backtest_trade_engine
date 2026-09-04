@@ -116,6 +116,14 @@ class AccountState:
     save_money: float = 0.0
     trade_power: bool = True
     total_liquids: int = 0
+    long_profits: list = field(default_factory=list)
+    short_profits: list = field(default_factory=list)
+    long_fees: list = field(default_factory=list)
+    short_fees: list = field(default_factory=list)
+    long_durations_minutes: list = field(default_factory=list)
+    short_durations_minutes: list = field(default_factory=list)
+    long_liquidations: int = 0
+    short_liquidations: int = 0
 
     def __post_init__(self):
         if self.balance_without_fee is None:
@@ -130,6 +138,21 @@ class AccountState:
         for name in _ACCOUNT_STATE_FIELD_NAMES:
             if name in result:
                 setattr(self, name, result[name])
+
+    def record_closed_trade(self, side, result, *, liquidated=False):
+        """Keep allocation-light directional history for reports and optimization."""
+        if not result or side not in {"long", "short"}:
+            return
+        getattr(self, f"{side}_profits").append(float(result.get("profit", 0.0) or 0.0))
+        getattr(self, f"{side}_fees").append(float(result.get("total_fee", 0.0) or 0.0))
+        duration = (
+            int(result.get("days", 0) or 0) * 24 * 60
+            + int(result.get("hours", 0) or 0) * 60
+            + int(result.get("minutes", 0) or 0)
+        )
+        getattr(self, f"{side}_durations_minutes").append(duration)
+        if liquidated:
+            setattr(self, f"{side}_liquidations", getattr(self, f"{side}_liquidations") + 1)
 
 
 _ACCOUNT_STATE_FIELD_NAMES = tuple(item.name for item in fields(AccountState))
@@ -512,6 +535,7 @@ class TradeEngine:
             remaining_open_equity,
         )
         account.apply_result(result)
+        account.record_closed_trade("long", result)
         return result
 
     def close_short(
@@ -552,6 +576,7 @@ class TradeEngine:
             remaining_open_equity,
         )
         account.apply_result(result)
+        account.record_closed_trade("short", result)
         return result
 
     def check_liquidation_long(
@@ -586,6 +611,8 @@ class TradeEngine:
             remaining_open_equity,
         )
         account.apply_result(result)
+        if result and result.get("liquidated"):
+            account.record_closed_trade("long", result, liquidated=True)
         return result
 
     def check_liquidation_short(
@@ -620,6 +647,8 @@ class TradeEngine:
             remaining_open_equity,
         )
         account.apply_result(result)
+        if result and result.get("liquidated"):
+            account.record_closed_trade("short", result, liquidated=True)
         return result
 
 
@@ -842,10 +871,10 @@ class TradeEngine:
             round(margin , 2),
             leverage,
             trade_amount_percent,
-            round(profit, 2),
-            round(profit_percent, 2),
-            round(pnl_percent, 2),
-            round(total_fee, 4),
+            profit,
+            profit_percent,
+            pnl_percent,
+            total_fee,
             days,
             hours,
             minutes,
@@ -1112,10 +1141,10 @@ class TradeEngine:
             round(margin , 2),
             leverage,
             trade_amount_percent,
-            round(profit, 2),
-            round(profit_percent, 2),
-            round(pnl_percent, 2),
-            round(total_fee, 4),
+            profit,
+            profit_percent,
+            pnl_percent,
+            total_fee,
             days,
             hours,
             minutes,
@@ -1320,10 +1349,10 @@ class TradeEngine:
             round(margin, 2),
             leverage,
             trade_amount_percent,
-            round(profit, 2),
-            round(profit_percent, 2),
-            round(pnl_percent, 2),
-            round(total_fee, 4),
+            profit,
+            profit_percent,
+            pnl_percent,
+            total_fee,
             days,
             hours,
             minutes,
@@ -1361,6 +1390,184 @@ class TradeEngine:
             'hours': hours,
             'minutes': minutes,
             'total_liquids': total_liquids
+        }
+
+    @staticmethod
+    def calculate_side_metrics(
+        profits,
+        *,
+        first_balance,
+        fees=(),
+        durations_minutes=(),
+        liquidations=0,
+        open_positions=0,
+    ):
+        """Summarize one direction using net closed-trade results.
+
+        Directional drawdown is the drawdown of an isolated curve that starts at
+        ``first_balance`` and applies only that side's net profits in close order.
+        This makes Long and Short risk directly comparable without pretending
+        that either side had a separate live account during the backtest.
+        """
+        values = [float(value or 0.0) for value in (profits or ())]
+        fee_values = [float(value or 0.0) for value in (fees or ())]
+        duration_values = [float(value or 0.0) for value in (durations_minutes or ())]
+        wins = [value for value in values if value > 0]
+        losses = [value for value in values if value <= 0]
+        negative_losses = [value for value in values if value < 0]
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(negative_losses))
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = 5.0
+        else:
+            profit_factor = 0.0
+
+        equity = peak = float(first_balance or 0.0)
+        maximum_drawdown = 0.0
+        consecutive_losses = max_consecutive_losses = 0
+        for value in values:
+            equity += value
+            peak = max(peak, equity)
+            if peak > 0:
+                maximum_drawdown = min(
+                    maximum_drawdown, (equity / peak - 1.0) * 100.0
+                )
+            if value <= 0:
+                consecutive_losses += 1
+                max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
+            else:
+                consecutive_losses = 0
+
+        trades = len(values)
+        avg_win = gross_profit / len(wins) if wins else 0.0
+        avg_loss = sum(negative_losses) / len(negative_losses) if negative_losses else 0.0
+        payoff_ratio = avg_win / abs(avg_loss) if avg_loss else (5.0 if avg_win else 0.0)
+        net_profit = sum(values)
+        return {
+            "trades": trades,
+            "wins": len(wins),
+            "losses": len(losses),
+            "breakeven_trades": sum(value == 0 for value in values),
+            "win_rate": len(wins) * 100.0 / trades if trades else 0.0,
+            "net_profit": net_profit,
+            "return_contribution_percent": (
+                net_profit * 100.0 / float(first_balance) if first_balance else 0.0
+            ),
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": profit_factor,
+            "expectancy": net_profit / trades if trades else 0.0,
+            "expectancy_percent": (
+                (net_profit / trades) * 100.0 / float(first_balance)
+                if trades and first_balance else 0.0
+            ),
+            "average_win": avg_win,
+            "average_loss": avg_loss,
+            "payoff_ratio": payoff_ratio,
+            "best_trade": max(values) if values else 0.0,
+            "worst_trade": min(values) if values else 0.0,
+            "total_fees": sum(fee_values),
+            "average_duration_minutes": (
+                sum(duration_values) / len(duration_values) if duration_values else 0.0
+            ),
+            "maximum_drawdown": maximum_drawdown,
+            "max_consecutive_losses": max_consecutive_losses,
+            "liquidations": int(liquidations or 0),
+            "open_positions": int(open_positions or 0),
+        }
+
+    @classmethod
+    def calculate_directional_metrics(
+        cls,
+        *,
+        first_balance,
+        long_profits=(),
+        short_profits=(),
+        long_fees=(),
+        short_fees=(),
+        long_durations_minutes=(),
+        short_durations_minutes=(),
+        long_liquidations=0,
+        short_liquidations=0,
+        long_open_positions=0,
+        short_open_positions=0,
+    ):
+        """Return a flat optimizer/JSON-friendly Long-versus-Short comparison."""
+        sides = {}
+        for side, profits, fees, durations, liquidations, open_positions in (
+            (
+                "long", long_profits, long_fees, long_durations_minutes,
+                long_liquidations, long_open_positions,
+            ),
+            (
+                "short", short_profits, short_fees, short_durations_minutes,
+                short_liquidations, short_open_positions,
+            ),
+        ):
+            sides[side] = cls.calculate_side_metrics(
+                profits,
+                first_balance=first_balance,
+                fees=fees,
+                durations_minutes=durations,
+                liquidations=liquidations,
+                open_positions=open_positions,
+            )
+        flat = {
+            f"{side}_{metric}": value
+            for side, metrics in sides.items()
+            for metric, value in metrics.items()
+        }
+        long_profit = sides["long"]["net_profit"]
+        short_profit = sides["short"]["net_profit"]
+        contribution_base = abs(long_profit) + abs(short_profit)
+        flat.update({
+            "long_profit": long_profit,
+            "short_profit": short_profit,
+            "stronger_side": (
+                "LONG" if long_profit > short_profit
+                else "SHORT" if short_profit > long_profit
+                else "BALANCED"
+            ),
+            "directional_profit_gap": abs(long_profit - short_profit),
+            "long_profit_contribution_share_percent": (
+                long_profit * 100.0 / contribution_base if contribution_base else 0.0
+            ),
+            "short_profit_contribution_share_percent": (
+                short_profit * 100.0 / contribution_base if contribution_base else 0.0
+            ),
+        })
+        return flat
+
+    @staticmethod
+    def _overview_side_metrics(label, metrics):
+        """Map flat directional metrics to human-readable workbook labels."""
+        prefix = label.lower()
+        return {
+            f"{label} net profit": metrics.get(f"{prefix}_net_profit", 0.0),
+            f"{label} return contribution %": metrics.get(
+                f"{prefix}_return_contribution_percent", 0.0
+            ),
+            f"{label} trades": metrics.get(f"{prefix}_trades", 0),
+            f"{label} wins": metrics.get(f"{prefix}_wins", 0),
+            f"{label} losses": metrics.get(f"{prefix}_losses", 0),
+            f"{label} win rate %": metrics.get(f"{prefix}_win_rate", 0.0),
+            f"{label} profit factor": metrics.get(f"{prefix}_profit_factor", 0.0),
+            f"{label} expectancy": metrics.get(f"{prefix}_expectancy", 0.0),
+            f"{label} payoff ratio": metrics.get(f"{prefix}_payoff_ratio", 0.0),
+            f"{label} average win": metrics.get(f"{prefix}_average_win", 0.0),
+            f"{label} average loss": metrics.get(f"{prefix}_average_loss", 0.0),
+            f"{label} best trade": metrics.get(f"{prefix}_best_trade", 0.0),
+            f"{label} worst trade": metrics.get(f"{prefix}_worst_trade", 0.0),
+            f"{label} maximum drawdown %": metrics.get(
+                f"{prefix}_maximum_drawdown", 0.0
+            ),
+            f"{label} fees": metrics.get(f"{prefix}_total_fees", 0.0),
+            f"{label} liquidations": metrics.get(f"{prefix}_liquidations", 0),
+            f"{label} average duration minutes": metrics.get(
+                f"{prefix}_average_duration_minutes", 0.0
+            ),
         }
 
     @staticmethod
@@ -1476,6 +1683,19 @@ class TradeEngine:
             liquidations=account.total_liquids,
             closed_trades=closed_trades,
         )
+        directional_metrics = self.calculate_directional_metrics(
+            first_balance=first_balance,
+            long_profits=account.long_profits,
+            short_profits=account.short_profits,
+            long_fees=account.long_fees,
+            short_fees=account.short_fees,
+            long_durations_minutes=account.long_durations_minutes,
+            short_durations_minutes=account.short_durations_minutes,
+            long_liquidations=account.long_liquidations,
+            short_liquidations=account.short_liquidations,
+            long_open_positions=sum(position.side == "long" for position in positions),
+            short_open_positions=sum(position.side == "short" for position in positions),
+        )
         result = {
             "final_balance_static": round(static_balance, 6),
             "final_balance_dynamic": round(final_balance, 6),
@@ -1506,6 +1726,7 @@ class TradeEngine:
             "trade_profits": list(account.profits_lst),
             "monthly_returns": monthly_returns,
             **score_metrics,
+            **directional_metrics,
         }
         if extra_metrics:
             result.update(dict(extra_metrics))
@@ -1527,6 +1748,15 @@ class TradeEngine:
                 hours=hours,
                 minutes=minutes,
                 overview_metrics={
+                    "Capital": {
+                        "Starting balance": first_balance,
+                        "Final balance": final_balance,
+                        "Total profit": total_profit,
+                        "Realized profit": realized_profit,
+                        "Unrealized profit": unrealized_profit,
+                        "Total profit %": return_percent,
+                        "Total fees": account.deducting_fee_total,
+                    },
                     "Performance": {
                         "Optimizer score": score_metrics["score"],
                         "Maximum drawdown %": account.max_drawdown,
@@ -1534,7 +1764,9 @@ class TradeEngine:
                         "Profit factor": score_metrics["profit_factor"],
                         "Expectancy %": score_metrics["expectancy_percent"],
                         "Calmar ratio": score_metrics["calmar_ratio"],
-                    }
+                    },
+                    "Long": self._overview_side_metrics("Long", directional_metrics),
+                    "Short": self._overview_side_metrics("Short", directional_metrics),
                 },
                 file_name=str(output_file),
             )
@@ -1611,6 +1843,34 @@ class TradeEngine:
         profit_factor = score_metrics["profit_factor"]
         expectancy_pct = score_metrics["expectancy_percent"]
         calmar_ratio = score_metrics["calmar_ratio"]
+        directional_metrics = self.calculate_directional_metrics(
+            first_balance=first_balance,
+            long_profits=state.get("long_profits", ()),
+            short_profits=state.get("short_profits", ()),
+            long_fees=state.get("long_fees", ()),
+            short_fees=state.get("short_fees", ()),
+            long_durations_minutes=state.get("long_durations_minutes", ()),
+            short_durations_minutes=state.get("short_durations_minutes", ()),
+            long_liquidations=state.get("long_liquidations", 0),
+            short_liquidations=state.get("short_liquidations", 0),
+            long_open_positions=sum(
+                position.side == "long" for position in open_positions
+            ),
+            short_open_positions=sum(
+                position.side == "short" for position in open_positions
+            ),
+        )
+        # Compatibility for callers that still provide aggregate counters only.
+        for side in ("long", "short"):
+            if not state.get(f"{side}_profits") and state.get(f"total_{side}", 0):
+                total = int(state[f"total_{side}"])
+                wins_for_side = int(state[f"total_wins_{side}"])
+                directional_metrics.update({
+                    f"{side}_trades": total,
+                    f"{side}_wins": wins_for_side,
+                    f"{side}_losses": total - wins_for_side,
+                    f"{side}_win_rate": wins_for_side * 100.0 / total,
+                })
 
         if self.verbose:
             self._print_backtest_report(
@@ -1639,6 +1899,7 @@ class TradeEngine:
                 rsi_losses=rsi_losses,
                 rsi_winrate=rsi_winrate,
                 rsi_profit=rsi_profit,
+                directional_metrics=directional_metrics,
             )
 
         total_profit = balance - first_balance
@@ -1701,6 +1962,8 @@ class TradeEngine:
                         if state["count_closed_orders"] else 0
                     ),
                 },
+                "Long": self._overview_side_metrics("Long", directional_metrics),
+                "Short": self._overview_side_metrics("Short", directional_metrics),
                 "RSI": {
                     "RSI trades": rsi_total,
                     "RSI wins": rsi_wins,
@@ -1827,6 +2090,7 @@ class TradeEngine:
             "scale_short_losses": state["scale_ma_short_losses"],
             "scale_short_winrate": scale_short_winrate,
             "scale_short_profit": state["scale_ma_short_total_profit"],
+            **directional_metrics,
         }
         if state.get("research"):
             # These compact series are emitted only for finalists/audits.  They
@@ -1848,6 +2112,7 @@ class TradeEngine:
     @staticmethod
     def _print_backtest_report(**report):
         state = report["state"]
+        directional = report.get("directional_metrics", {})
         print("✅ BACKTEST FINISHED")
         print("Closed Trades:", state["count_closed_orders"], "( Longs:", state["total_long"], "| Shorts:", state["total_short"], ")")
         print("Count open Trades:", len(state["open_positions"]))
@@ -1871,6 +2136,23 @@ class TradeEngine:
         print("count_profit_months:", report["profit_months_count"])
         print("count_loss_months:", report["loss_months_count"])
         print("Total score:", report["score"])
+
+        print("\n================ LONG vs SHORT ======================\n")
+        for side in ("long", "short"):
+            label = side.upper()
+            print(
+                f"{label}: {directional.get(f'{side}_trades', 0)} trades | "
+                f"{directional.get(f'{side}_win_rate', 0):.2f}% win rate | "
+                f"{directional.get(f'{side}_net_profit', 0):.2f} net profit | "
+                f"PF {directional.get(f'{side}_profit_factor', 0):.2f} | "
+                f"expectancy {directional.get(f'{side}_expectancy', 0):.2f} | "
+                f"DD {directional.get(f'{side}_maximum_drawdown', 0):.2f}% | "
+                f"fees {directional.get(f'{side}_total_fees', 0):.2f}"
+            )
+        print(
+            "Stronger side:", directional.get("stronger_side", "BALANCED"),
+            "| Net-profit gap:", round(directional.get("directional_profit_gap", 0), 2),
+        )
 
         print("\n================ SCALE ENTRY REPORT ================\n")
         print("===== LONG SCALE ENTRY =====")
@@ -2052,10 +2334,10 @@ class TradeEngine:
             round(margin, 2),
             leverage,
             trade_amount_percent,
-            round(profit, 2),
-            round(profit_percent, 2),
-            round(pnl_percent, 2),
-            round(total_fee, 4),
+            profit,
+            profit_percent,
+            pnl_percent,
+            total_fee,
             days,
             hours,
             minutes,

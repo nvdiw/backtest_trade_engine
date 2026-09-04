@@ -80,6 +80,9 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertEqual(account.count_closed_orders, 1)
         self.assertEqual(account.total_wins, 1)
         self.assertEqual(account.total_wins_long, 1)
+        self.assertEqual(account.long_profits, [closed["profit"]])
+        self.assertEqual(account.short_profits, [])
+        self.assertEqual(account.long_durations_minutes, [15])
 
     def test_position_is_mutable_strategy_state(self):
         account = AccountState(balance=100.0)
@@ -153,6 +156,28 @@ class TradeEngineStateTests(unittest.TestCase):
         self.assertEqual(liquid_account.total_liquids, 1)
         self.assertEqual(liquid_account.total_losses, 1)
         self.assertEqual(liquid_account.profits_lst, [-100.0])
+        self.assertEqual(liquid_account.long_profits, [-100.0])
+        self.assertEqual(liquid_account.long_liquidations, 1)
+
+    def test_directional_metrics_compare_profit_quality_and_drawdown(self):
+        metrics = TradeEngine.calculate_directional_metrics(
+            first_balance=1000,
+            long_profits=[100, -25, 50],
+            short_profits=[-40, -10],
+            long_fees=[2, 1, 1],
+            short_fees=[1, 1],
+            long_durations_minutes=[60, 30, 90],
+            short_durations_minutes=[15, 45],
+            short_liquidations=1,
+        )
+
+        self.assertEqual(metrics["stronger_side"], "LONG")
+        self.assertEqual(metrics["long_profit"], 125)
+        self.assertEqual(metrics["short_profit"], -50)
+        self.assertEqual(metrics["long_profit_factor"], 6)
+        self.assertEqual(metrics["long_win_rate"], 200 / 3)
+        self.assertLess(metrics["short_maximum_drawdown"], 0)
+        self.assertEqual(metrics["short_liquidations"], 1)
 
     def test_slippage_is_adverse_on_both_sides_of_a_round_trip(self):
         baseline = TradeEngine(optimize=True, verbose=False, slippage_rate=0.0)

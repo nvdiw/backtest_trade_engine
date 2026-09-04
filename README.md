@@ -154,13 +154,16 @@ Unless disabled, files are written below `--output-dir`:
 ```text
 outputs/
 ├── trades/data_orders.csv
+├── trades/data_orders_summary.csv # TOTAL/LONG/SHORT quality and risk comparison
 ├── trades/data_orders.xlsx       # default; disable with --no-excel
 └── monthly/monthly_data_orders.csv
 ```
 
-The XLSX workbook freezes every header row, enables filters, applies profit/loss color coding, and separates Overview, All Trades, Main Strategy, RSI Strategy, and Scale Strategy into individual sheets. The raw CSV remains available for scripts and data tools.
+The XLSX workbook freezes headers, enables filters, applies semantic profit/loss and Long/Short color coding, and keeps the detailed strategy sheets. The raw CSV remains available for scripts and data tools.
 
-The result dictionary includes final balance, total/realized/unrealized profit, open positions, return percent, closed trades, wins/losses, win rate, maximum drawdown, score, profit factor, expectancy, Calmar ratio, and MA/RSI/Scale sub-strategy statistics.
+The result dictionary includes final balance, total/realized/unrealized profit, open positions, return percent, closed trades, wins/losses, win rate, maximum drawdown, score, profit factor, expectancy, Calmar ratio, and MA/RSI/Scale sub-strategy statistics. Long and Short are also reported independently with net/gross profit, return contribution, win rate, profit factor, expectancy, average win/loss, payoff ratio, best/worst trade, fees, duration, isolated directional drawdown, loss streak, liquidations, and open-position counts. `long_profit + short_profit` reconciles to realized profit (subject only to output rounding).
+
+The Excel trade report starts with a Long-vs-Short dashboard and includes Side Comparison, Monthly Analysis, Exit Reasons, Long Trades, Short Trades, and cumulative/monthly charts. The raw trade CSV adds normalized `side`, `outcome`, and total/Long/Short cumulative-profit columns.
 
 ### Interactive chart controls
 
@@ -307,8 +310,9 @@ With validation, robust score equals validation score minus `overfit_penalty × 
 
 ```text
 optimization_results.csv     every completed candidate/checkpoint
-optimization_results.xlsx    ranked, parameter, core, RSI, and Scale sheets
+optimization_results.xlsx    winner dashboard, rankings, parameters, directional/risk, RSI, and Scale sheets
 best_params.json              final selected winner
+best_params_manifest.json     explicit winner status, selection basis, and file-role guide
 optimization_summary.json     metadata and winner metrics
 top_results.json              top --top-n candidates
 best_training_params.json     training winner with validation
@@ -391,7 +395,9 @@ Every new cycle records its parent in `training_parent.json`. After the first co
 
 Candidate reports put decisions and critical risk/performance metrics before parameter columns. `candidate_catalog.csv/json` provides the reusable ranking, while `candidates/rank_NNN_params.json` and the matching summary file make every finalist directly inspectable. `ACCEPT` means eligible for independent Research, `WATCH` means promising but below one or more Auto thresholds, and `REJECT` prevents a fragile high-score result from becoming `best_params.json`.
 
-`auto_report.xlsx` and each 50-cycle `snapshot_report.xlsx` provide a colored decision dashboard rather than only raw columns. They include campaign start/update time, elapsed hours, exact test and historical-stability ranges, a Top-candidate profit chart, decision colors, aggregate monthly statistics, the number of months returning at least 8%, the same statistics for the latest 12 observed months, and a month-by-month sheet for the best candidate. Finalists retain compact monthly equity returns so these counts reflect actual monthly performance; discovery candidates do not carry this extra payload.
+`auto_report.xlsx` and each 50-cycle `snapshot_report.xlsx` provide a colored decision dashboard rather than only raw columns. They include campaign start/update time, elapsed hours, exact test and historical-stability ranges, Top-candidate and Long-vs-Short charts, decision colors, directional metrics, aggregate monthly statistics, the number of months returning at least 8%, the same statistics for the latest 12 observed months, and a month-by-month sheet for the best candidate. Finalists retain compact monthly equity returns so these counts reflect actual monthly performance; discovery candidates do not carry this extra payload.
+
+Always load the root `best_params.json` in the output directory. `best_params_manifest.json` says whether it is final or provisional and explains why cycle/checkpoint copies are not the preferred file. Standard optimization also marks the exact selected row in the Excel Rankings sheet and repeats the filename on the Dashboard.
 
 | Auto option | Default | Meaning |
 |---|---:|---|
@@ -434,6 +440,7 @@ Auto checkpoints are flushed per result and stored per cycle/stage. Result table
 ```text
 auto_state.json              exact campaign/cycle/stage checkpoint
 best_params.json             best robust Hall-of-Fame parameters
+best_params_manifest.json    canonical winner pointer and final/provisional status
 hall_of_fame.json/.csv       cross-cycle robust winners
 parameter_importance.json/.csv learned mutation priorities
 auto_summary.json            campaign status and best result

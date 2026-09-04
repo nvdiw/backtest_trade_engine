@@ -315,6 +315,22 @@ RESULT_COLUMNS = [
     "total_fees", "saved_money", "liquidations", "total_profit_percent",
     "closed_trades", "wins", "losses", "long_trades", "long_wins",
     "long_losses", "short_trades", "short_wins", "short_losses",
+    "long_profit", "short_profit", "stronger_side", "directional_profit_gap",
+    "long_profit_contribution_share_percent", "short_profit_contribution_share_percent",
+    "long_breakeven_trades", "long_win_rate", "long_net_profit",
+    "long_return_contribution_percent", "long_gross_profit", "long_gross_loss",
+    "long_profit_factor", "long_expectancy", "long_expectancy_percent",
+    "long_average_win", "long_average_loss", "long_payoff_ratio",
+    "long_best_trade", "long_worst_trade", "long_total_fees",
+    "long_average_duration_minutes", "long_maximum_drawdown",
+    "long_max_consecutive_losses", "long_liquidations", "long_open_positions",
+    "short_breakeven_trades", "short_win_rate", "short_net_profit",
+    "short_return_contribution_percent", "short_gross_profit", "short_gross_loss",
+    "short_profit_factor", "short_expectancy", "short_expectancy_percent",
+    "short_average_win", "short_average_loss", "short_payoff_ratio",
+    "short_best_trade", "short_worst_trade", "short_total_fees",
+    "short_average_duration_minutes", "short_maximum_drawdown",
+    "short_max_consecutive_losses", "short_liquidations", "short_open_positions",
     "maximum_drawdown", "win_rate", "profit_months", "loss_months",
     "score", "profit_factor", "expectancy_percent", "calmar_ratio",
     "rsi_total_trades", "rsi_wins", "rsi_losses", "rsi_winrate",
@@ -332,6 +348,11 @@ IMPORTANT_RESULT_COLUMNS = [
     "total_profit_percent", "total_profit", "maximum_drawdown",
     "closed_trades", "win_rate", "profit_factor", "expectancy_percent",
     "calmar_ratio", "liquidations", "final_balance", "total_fees",
+    "stronger_side", "long_profit", "short_profit", "directional_profit_gap",
+    "long_trades", "long_win_rate", "long_profit_factor",
+    "long_expectancy", "long_maximum_drawdown", "long_liquidations",
+    "short_trades", "short_win_rate", "short_profit_factor",
+    "short_expectancy", "short_maximum_drawdown", "short_liquidations",
 ]
 
 DERIVED_RESULT_COLUMNS = ["objective_score", "profit_per_trade"]
@@ -1883,13 +1904,17 @@ def _write_json(path, payload):
     _replace_with_retry(temporary, path)
 
 
-def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows=5000):
+def _save_optimizer_workbook(
+    results_path, output_path, parameter_keys, max_rows=5000, selected_best=None
+):
     """Create a filterable, frozen-header XLSX companion to the raw CSV."""
     try:
         import pandas as pd
         from openpyxl import load_workbook
+        from openpyxl.chart import BarChart, Reference
+        from openpyxl.chart.label import DataLabelList
         from openpyxl.formatting.rule import ColorScaleRule
-        from openpyxl.styles import Alignment, Font, PatternFill
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
         from openpyxl.utils import get_column_letter
         from openpyxl.worksheet.table import Table, TableStyleInfo
     except ImportError:
@@ -1900,9 +1925,15 @@ def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows
         return None
     max_rows = max(1, int(max_rows))
     ranked = None
+    selected_index = selected_best.get("index") if selected_best else None
+    selected_export_row = None
     for chunk in pd.read_csv(results_path, chunksize=50_000):
         if chunk.empty:
             continue
+        if selected_index is not None and "test_index" in chunk:
+            match = chunk[chunk["test_index"] == selected_index]
+            if not match.empty:
+                selected_export_row = match.iloc[[0]].copy()
         score_column = "objective_score" if "objective_score" in chunk else "score"
         chunk = chunk.sort_values(score_column, ascending=False, na_position="last").head(max_rows)
         ranked = chunk if ranked is None else pd.concat([ranked, chunk], ignore_index=True)
@@ -1911,14 +1942,95 @@ def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows
         ).head(max_rows)
     if ranked is None or ranked.empty:
         return None
+    if (
+        selected_export_row is not None
+        and selected_index not in set(ranked.get("test_index", ()))
+    ):
+        ranked = pd.concat([ranked, selected_export_row], ignore_index=True)
+    ranked = ranked.reset_index(drop=True)
+    ranked.insert(0, "rank", range(1, len(ranked) + 1))
+    if selected_index is None:
+        selected_index = ranked.iloc[0].get("test_index")
+    selections = [
+        "SELECTED WINNER - USE best_params.json"
+        if row.get("test_index") == selected_index else ""
+        for _, row in ranked.iterrows()
+    ]
+    if not any(selections):
+        selections[0] = "RANK #1 IN EXPORTED ROWS - CHECK best_params_manifest.json"
+    ranked.insert(1, "selection", selections)
 
     def existing(columns):
         return [column for column in columns if column in ranked.columns]
 
-    identity = existing(["test_index", "score", "objective_score", "duration_s"])
+    identity = existing([
+        "rank", "selection", "test_index", "score", "objective_score", "duration_s"
+    ])
+    selected_rows = ranked[ranked["test_index"] == selected_index]
+    best = selected_rows.iloc[0] if not selected_rows.empty else ranked.iloc[0]
+    dashboard_rows = [
+        {"Section": "Winner", "Metric": "Recommended parameter file", "Value": "best_params.json"},
+        {"Section": "Winner", "Metric": "Selection status", "Value": best.get("selection")},
+        {"Section": "Winner", "Metric": "Test index", "Value": best.get("test_index")},
+        {
+            "Section": "Winner", "Metric": "Selected score",
+            "Value": (
+                selected_best.get("selection_score")
+                if selected_best and selected_best.get("selection_score") is not None
+                else best.get("objective_score")
+            ),
+        },
+        {"Section": "Performance", "Metric": "Total profit %", "Value": best.get("total_profit_percent")},
+        {"Section": "Performance", "Metric": "Total profit", "Value": best.get("total_profit")},
+        {"Section": "Performance", "Metric": "Maximum drawdown %", "Value": best.get("maximum_drawdown")},
+        {"Section": "Performance", "Metric": "Closed trades", "Value": best.get("closed_trades")},
+        {"Section": "Performance", "Metric": "Win rate %", "Value": best.get("win_rate")},
+        {"Section": "Performance", "Metric": "Profit factor", "Value": best.get("profit_factor")},
+        {"Section": "Direction", "Metric": "Stronger side", "Value": best.get("stronger_side")},
+        {"Section": "Long", "Metric": "Long net profit", "Value": best.get("long_profit")},
+        {"Section": "Long", "Metric": "Long trades", "Value": best.get("long_trades")},
+        {"Section": "Long", "Metric": "Long win rate %", "Value": best.get("long_win_rate")},
+        {"Section": "Long", "Metric": "Long profit factor", "Value": best.get("long_profit_factor")},
+        {"Section": "Long", "Metric": "Long max drawdown %", "Value": best.get("long_maximum_drawdown")},
+        {"Section": "Short", "Metric": "Short net profit", "Value": best.get("short_profit")},
+        {"Section": "Short", "Metric": "Short trades", "Value": best.get("short_trades")},
+        {"Section": "Short", "Metric": "Short win rate %", "Value": best.get("short_win_rate")},
+        {"Section": "Short", "Metric": "Short profit factor", "Value": best.get("short_profit_factor")},
+        {"Section": "Short", "Metric": "Short max drawdown %", "Value": best.get("short_maximum_drawdown")},
+    ]
+    best_param_values = (
+        dict(selected_best.get("params", {})) if selected_best
+        else {key: best.get(key) for key in parameter_keys}
+    )
+    best_params = pd.DataFrame([
+        {
+            "parameter": key,
+            "value": value,
+            "role": "optimized" if key in parameter_keys else "fixed/base",
+        }
+        for key, value in best_param_values.items()
+    ])
     sheets = {
+        "Dashboard": pd.DataFrame(dashboard_rows),
         "Rankings": ranked,
+        "Best Parameters": best_params,
         "Parameters": ranked[identity + existing(parameter_keys)],
+        "Directional Metrics": ranked[identity + existing([
+            "stronger_side", "long_profit", "short_profit", "directional_profit_gap",
+            "long_trades", "long_wins", "long_losses", "long_win_rate",
+            "long_profit_factor", "long_expectancy", "long_average_win",
+            "long_average_loss", "long_payoff_ratio", "long_maximum_drawdown",
+            "long_total_fees", "long_liquidations", "short_trades", "short_wins",
+            "short_losses", "short_win_rate", "short_profit_factor",
+            "short_expectancy", "short_average_win", "short_average_loss",
+            "short_payoff_ratio", "short_maximum_drawdown", "short_total_fees",
+            "short_liquidations",
+        ])],
+        "Risk Quality": ranked[identity + existing([
+            "total_profit_percent", "total_profit", "maximum_drawdown", "closed_trades",
+            "win_rate", "profit_factor", "expectancy_percent", "calmar_ratio",
+            "liquidations", "total_fees", "profit_per_trade",
+        ])],
         "RSI Metrics": ranked[identity + [
             column for column in ranked.columns if column.startswith("rsi_")
         ]],
@@ -1945,6 +2057,11 @@ def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows
     workbook = load_workbook(output_path)
     header_fill = PatternFill("solid", fgColor="17365D")
     header_font = Font(color="FFFFFF", bold=True)
+    section_fills = {
+        "Winner": "FFF2CC", "Performance": "D9EAF7", "Direction": "E4DFEC",
+        "Long": "E2F0D9", "Short": "FCE4D6",
+    }
+    thin_gray = Side(style="thin", color="D9E1F2")
     for table_index, worksheet in enumerate(workbook.worksheets, start=1):
         worksheet.freeze_panes = "A2"
         worksheet.auto_filter.ref = worksheet.dimensions
@@ -1968,7 +2085,11 @@ def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows
             )
             worksheet.add_table(table)
         headers = {cell.value: cell.column for cell in worksheet[1]}
-        for metric in ("score", "objective_score", "total_profit", "win_rate"):
+        for metric in (
+            "score", "objective_score", "total_profit", "total_profit_percent",
+            "win_rate", "long_profit", "short_profit", "long_win_rate",
+            "short_win_rate", "profit_factor",
+        ):
             column = headers.get(metric)
             if column and worksheet.max_row >= 3:
                 letter = get_column_letter(column)
@@ -1980,12 +2101,230 @@ def _save_optimizer_workbook(results_path, output_path, parameter_keys, max_rows
                         end_type="max", end_color="63BE7B",
                     ),
                 )
+        for header, column in headers.items():
+            header_text = str(header or "").lower()
+            if header_text.endswith(("_percent", "_pct")) or any(token in header_text for token in (
+                "profit_percent", "win_rate", "drawdown", "contribution_share_percent",
+            )):
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row, column).number_format = '0.00"%";[Red]-0.00"%"'
+            elif any(token in header_text for token in (
+                "profit", "fees", "expectancy", "average_win", "average_loss",
+                "best_trade", "worst_trade",
+            )) and "factor" not in header_text:
+                for row in range(2, worksheet.max_row + 1):
+                    worksheet.cell(row, column).number_format = '$#,##0.00;[Red]-$#,##0.00'
+        if worksheet.title == "Dashboard":
+            worksheet.sheet_properties.tabColor = "4472C4"
+            worksheet.column_dimensions["A"].width = 18
+            worksheet.column_dimensions["B"].width = 31
+            worksheet.column_dimensions["C"].width = 24
+            for row in range(2, worksheet.max_row + 1):
+                section = str(worksheet.cell(row, 1).value or "")
+                fill = PatternFill("solid", fgColor=section_fills.get(section, "F2F2F2"))
+                for column in range(1, 4):
+                    worksheet.cell(row, column).fill = fill
+                    worksheet.cell(row, column).border = Border(bottom=thin_gray)
+                worksheet.cell(row, 1).font = Font(bold=True, color="17365D")
+                metric = str(worksheet.cell(row, 2).value or "").lower()
+                if "%" in metric or "drawdown" in metric:
+                    worksheet.cell(row, 3).number_format = '0.00"%";[Red]-0.00"%"'
+                elif "profit" in metric and "factor" not in metric:
+                    worksheet.cell(row, 3).number_format = '$#,##0.00;[Red]-$#,##0.00'
+        elif worksheet.title == "Rankings":
+            worksheet.sheet_properties.tabColor = "70AD47"
+            worksheet.freeze_panes = "D2"
+            for cell in worksheet[2]:
+                cell.fill = PatternFill("solid", fgColor="C6EFCE")
+                cell.font = Font(bold=True, color="006100")
+        elif worksheet.title == "Directional Metrics":
+            worksheet.sheet_properties.tabColor = "8064A2"
+            worksheet.freeze_panes = "D2"
+            for header, column in headers.items():
+                header_text = str(header or "")
+                if header_text.startswith("long_"):
+                    worksheet.cell(1, column).fill = PatternFill("solid", fgColor="548235")
+                elif header_text.startswith("short_"):
+                    worksheet.cell(1, column).fill = PatternFill("solid", fgColor="C0504D")
+
+    rankings_ws = workbook["Rankings"]
+    dashboard_ws = workbook["Dashboard"]
+
+    def add_dashboard_detail_table(start_row, start_column, title, headers, rows):
+        end_column = start_column + len(headers) - 1
+        dashboard_ws.merge_cells(
+            start_row=start_row, start_column=start_column,
+            end_row=start_row, end_column=end_column,
+        )
+        title_cell = dashboard_ws.cell(start_row, start_column, title)
+        title_cell.fill = PatternFill("solid", fgColor="17365D")
+        title_cell.font = Font(color="FFFFFF", bold=True, size=11)
+        title_cell.alignment = Alignment(horizontal="left", vertical="center")
+        dashboard_ws.row_dimensions[start_row].height = 22
+        for offset, header in enumerate(headers):
+            cell = dashboard_ws.cell(start_row + 1, start_column + offset, header)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.font = Font(color="17365D", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for row_offset, row_values in enumerate(rows, start=2):
+            for column_offset, value in enumerate(row_values):
+                cell = dashboard_ws.cell(
+                    start_row + row_offset, start_column + column_offset, value
+                )
+                cell.border = Border(bottom=thin_gray)
+                cell.alignment = Alignment(
+                    horizontal="right" if isinstance(value, (int, float)) else "left"
+                )
+                header = headers[column_offset]
+                if header in {"Profit %", "Drawdown %"}:
+                    cell.number_format = '0.00"%";[Red]-0.00"%"'
+                elif "Profit" in header or header == "Gap":
+                    cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                elif header in {"Score"}:
+                    cell.number_format = '0.000'
+                if header == "Long Profit":
+                    cell.fill = PatternFill("solid", fgColor="E2F0D9")
+                elif header == "Short Profit":
+                    cell.fill = PatternFill("solid", fgColor="FCE4D6")
+        widths = {
+            "Rank": 8, "Test": 10, "Score": 12, "Profit %": 12,
+            "Net Profit": 15, "Drawdown %": 13, "Long Profit": 15,
+            "Short Profit": 15, "Gap": 14, "Stronger Side": 14,
+        }
+        for offset, header in enumerate(headers):
+            letter = get_column_letter(start_column + offset)
+            dashboard_ws.column_dimensions[letter].width = widths.get(header, 13)
+
+    top_rows = []
+    for _, row in ranked.head(10).iterrows():
+        top_rows.append([
+            row.get("rank"), row.get("test_index"), row.get("objective_score"),
+            row.get("total_profit_percent"), row.get("total_profit"),
+            row.get("maximum_drawdown"), row.get("long_profit"),
+            row.get("short_profit"), row.get("stronger_side"),
+        ])
+    add_dashboard_detail_table(
+        2, 14, "Top 10 exact results - score, profit and risk",
+        ["Rank", "Test", "Score", "Profit %", "Net Profit", "Drawdown %",
+         "Long Profit", "Short Profit", "Stronger Side"],
+        top_rows,
+    )
+
+    directional_rows = []
+    for _, row in ranked.head(10).iterrows():
+        directional_rows.append([
+            row.get("rank"), row.get("long_profit"), row.get("short_profit"),
+            row.get("directional_profit_gap"), row.get("stronger_side"),
+        ])
+    add_dashboard_detail_table(
+        18, 14, "Top 10 directional breakdown - exact net profit",
+        ["Rank", "Long Profit", "Short Profit", "Gap", "Stronger Side"],
+        directional_rows,
+    )
+
+    ranking_headers = {cell.value: cell.column for cell in rankings_ws[1]}
+    category_column = ranking_headers.get("rank")
+    score_column = ranking_headers.get("objective_score")
+    if category_column and score_column:
+        last_row = min(rankings_ws.max_row, 11)
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 10
+        chart.title = "Top 10 candidates by objective score"
+        chart.y_axis.title = "Objective score"
+        chart.y_axis.numFmt = "0.000"
+        chart.height = 7
+        chart.width = 14
+        chart.add_data(
+            Reference(rankings_ws, min_col=score_column, min_row=1, max_row=last_row),
+            titles_from_data=True,
+        )
+        chart.set_categories(
+            Reference(rankings_ws, min_col=category_column, min_row=2, max_row=last_row)
+        )
+        chart.legend = None
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+        chart.dLbls.numFmt = "0.000"
+        chart.series[0].graphicalProperties.solidFill = "8064A2"
+        chart.series[0].graphicalProperties.line.solidFill = "5F497A"
+        dashboard_ws.add_chart(chart, "E2")
+
+    directional_ws = workbook["Directional Metrics"]
+    directional_headers = {cell.value: cell.column for cell in directional_ws[1]}
+    rank_column = directional_headers.get("rank")
+    long_column = directional_headers.get("long_profit")
+    short_column = directional_headers.get("short_profit")
+    if rank_column and long_column and short_column:
+        last_row = min(directional_ws.max_row, 11)
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 11
+        chart.title = "Top candidates: Long vs Short net profit"
+        chart.y_axis.title = "Net profit ($)"
+        chart.y_axis.numFmt = '$#,##0'
+        chart.height = 7
+        chart.width = 14
+        for column in (long_column, short_column):
+            chart.add_data(
+                Reference(directional_ws, min_col=column, min_row=1, max_row=last_row),
+                titles_from_data=True,
+            )
+        chart.set_categories(
+            Reference(directional_ws, min_col=rank_column, min_row=2, max_row=last_row)
+        )
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+        chart.dLbls.numFmt = '$#,##0'
+        for series, color in zip(chart.series, ("70AD47", "C0504D")):
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = color
+        dashboard_ws.add_chart(chart, "E18")
     workbook.save(output_path)
     return output_path
 
 
+def _write_best_params_manifest(
+    output_dir,
+    *,
+    status,
+    selection_basis,
+    metrics=None,
+    candidate_id=None,
+    rank=1,
+):
+    """Publish an unambiguous pointer without polluting strategy parameter JSON."""
+    metrics = metrics or {}
+    key_metrics = {
+        key: metrics.get(key) for key in (
+            "score", "objective_score", "total_profit_percent", "maximum_drawdown",
+            "closed_trades", "win_rate", "profit_factor", "stronger_side",
+            "long_profit", "long_win_rate", "long_profit_factor",
+            "short_profit", "short_win_rate", "short_profit_factor",
+        ) if key in metrics
+    }
+    _write_json(Path(output_dir) / "best_params_manifest.json", {
+        "schema_version": 1,
+        "recommended_file": "best_params.json",
+        "instruction": "Use best_params.json for the selected winner in this directory.",
+        "status": status,
+        "rank": rank,
+        "candidate_id": candidate_id,
+        "selection_basis": selection_basis,
+        "key_metrics": key_metrics,
+        "file_roles": {
+            "best_params.json": "canonical parameters to load",
+            "best_candidate_summary.json": "human/audit details when present",
+            "best_training_params.json": "training-only reference; not preferred over validated best_params.json",
+            "cycles/*/best_params.json": "intermediate Auto-cycle winners; not preferred over root best_params.json",
+            "cycles/*/checkpoints/*/best_params.json": "provisional checkpoints; not a final winner",
+        },
+        "updated_at": _timestamp_now(),
+    })
+
+
 def _write_best_files(output_dir, best, mode, requested_tests, completed, elapsed, seed,
-                      metadata=None):
+                      metadata=None, final=False):
     if best is None:
         return
     _write_json(Path(output_dir) / "best_params.json", best["params"])
@@ -1997,12 +2336,31 @@ def _write_best_files(output_dir, best, mode, requested_tests, completed, elapse
         "elapsed_seconds": round(elapsed, 3),
         "best_test_index": best["index"],
         "best_duration_seconds": round(best["duration"], 4),
+        "recommended_params_file": "best_params.json",
+        "best_params_manifest": "best_params_manifest.json",
         "best_params": best["params"],
         "best_metrics": best["result"],
     }
     if metadata:
         summary.update(metadata)
     _write_json(Path(output_dir) / "optimization_summary.json", summary)
+    validated = bool(metadata and metadata.get("best_robust_score") is not None)
+    _write_best_params_manifest(
+        output_dir,
+        status="final" if final else "provisional_checkpoint",
+        selection_basis=(
+            "rank #1 by validation-adjusted robust score"
+            if validated else "rank #1 by optimizer objective score"
+        ),
+        metrics={
+            **best["result"],
+            "objective_score": (
+                metadata.get("best_robust_score")
+                if validated else _score(best["result"])
+            ),
+        },
+        candidate_id=f"test-{best['index']}",
+    )
 
 
 def _result_row(keys, index, params, result, duration, objective_score=None):
@@ -3820,7 +4178,13 @@ def _flatten_hall_record(record, keys, rank, state=None):
     metric_names = (
         "score", "time_normalized_score", "total_profit", "total_profit_percent", "closed_trades",
         "win_rate", "maximum_drawdown", "profit_factor", "expectancy_percent",
-        "calmar_ratio", "liquidations",
+        "calmar_ratio", "liquidations", "stronger_side", "directional_profit_gap",
+        "long_profit", "long_trades", "long_wins", "long_losses", "long_win_rate",
+        "long_profit_factor", "long_expectancy", "long_maximum_drawdown",
+        "long_total_fees", "long_liquidations", "short_profit", "short_trades",
+        "short_wins", "short_losses", "short_win_rate", "short_profit_factor",
+        "short_expectancy", "short_maximum_drawdown", "short_total_fees",
+        "short_liquidations",
     )
     for metric in metric_names:
         row[f"final_{metric}"] = final_metrics.get(metric)
@@ -3873,6 +4237,7 @@ def _save_auto_workbook(
         import pandas as pd
         from openpyxl import load_workbook
         from openpyxl.chart import BarChart, Reference
+        from openpyxl.chart.label import DataLabelList
         from openpyxl.formatting.rule import ColorScaleRule
         from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
         from openpyxl.utils import get_column_letter
@@ -3895,12 +4260,24 @@ def _save_auto_workbook(
         {"Section": "Test window", "Metric": "Historical stability start", "Value": time_summary["stability_start"]},
         {"Section": "Test window", "Metric": "Historical stability end", "Value": time_summary["stability_end"]},
         {"Section": "Best candidate", "Metric": "Candidate", "Value": best.get("candidate_id")},
+        {"Section": "Best candidate", "Metric": "Recommended parameter file", "Value": "best_params.json"},
         {"Section": "Best candidate", "Metric": "Decision", "Value": best.get("decision")},
         {"Section": "Best candidate", "Metric": "Robust score", "Value": best.get("robust_score")},
         {"Section": "Best candidate", "Metric": "Total profit %", "Value": best.get("final_total_profit_percent")},
         {"Section": "Best candidate", "Metric": "Maximum drawdown %", "Value": best.get("final_maximum_drawdown")},
         {"Section": "Best candidate", "Metric": "Closed trades", "Value": best.get("final_closed_trades")},
         {"Section": "Best candidate", "Metric": "Win rate %", "Value": best.get("final_win_rate")},
+        {"Section": "Direction", "Metric": "Stronger side", "Value": best.get("final_stronger_side")},
+        {"Section": "Long", "Metric": "Long net profit", "Value": best.get("final_long_profit")},
+        {"Section": "Long", "Metric": "Long trades", "Value": best.get("final_long_trades")},
+        {"Section": "Long", "Metric": "Long win rate %", "Value": best.get("final_long_win_rate")},
+        {"Section": "Long", "Metric": "Long profit factor", "Value": best.get("final_long_profit_factor")},
+        {"Section": "Long", "Metric": "Long maximum drawdown %", "Value": best.get("final_long_maximum_drawdown")},
+        {"Section": "Short", "Metric": "Short net profit", "Value": best.get("final_short_profit")},
+        {"Section": "Short", "Metric": "Short trades", "Value": best.get("final_short_trades")},
+        {"Section": "Short", "Metric": "Short win rate %", "Value": best.get("final_short_win_rate")},
+        {"Section": "Short", "Metric": "Short profit factor", "Value": best.get("final_short_profit_factor")},
+        {"Section": "Short", "Metric": "Short maximum drawdown %", "Value": best.get("final_short_maximum_drawdown")},
         {"Section": "Last 12 months", "Metric": "Months observed", "Value": best.get("last_12_months_observed")},
         {"Section": "Last 12 months", "Metric": "Profitable months", "Value": best.get("last_12_profitable_months")},
         {"Section": "Last 12 months", "Metric": "Months with profit >= 8%", "Value": best.get("last_12_months_ge_8pct")},
@@ -3926,10 +4303,27 @@ def _save_auto_workbook(
     best_monthly_rows = _monthly_return_rows(
         best_monthly_returns or [], best.get("test_start")
     )
+    directional_columns = [
+        column for column in hall_rows[0]
+        if column in {"rank", "decision", "candidate_id"}
+        or column.startswith("final_long_")
+        or column.startswith("final_short_")
+        or column in {"final_stronger_side", "final_directional_profit_gap"}
+    ]
+    directional_rows = [
+        {column: row.get(column) for column in directional_columns}
+        for row in hall_rows
+    ]
     output_path = Path(output_dir) / filename
-    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    staging_path = output_path.with_name(
+        f".{output_path.stem}.building{output_path.suffix}"
+    )
+    with pd.ExcelWriter(staging_path, engine="openpyxl") as writer:
         pd.DataFrame(dashboard_rows).to_excel(writer, sheet_name="Dashboard", index=False)
         pd.DataFrame(hall_rows).to_excel(writer, sheet_name="Hall of Fame", index=False)
+        pd.DataFrame(directional_rows).to_excel(
+            writer, sheet_name="Directional Metrics", index=False
+        )
         pd.DataFrame(monthly_rows).to_excel(
             writer, sheet_name="Monthly Analysis", index=False
         )
@@ -3940,16 +4334,20 @@ def _save_auto_workbook(
         pd.DataFrame(importance_rows).to_excel(
             writer, sheet_name="Parameter Importance", index=False
         )
-    workbook = load_workbook(output_path)
+    workbook = load_workbook(staging_path)
     header_fill = PatternFill("solid", fgColor="17365D")
     header_font = Font(color="FFFFFF", bold=True)
     section_colors = {
         "Campaign": "D9EAF7", "Test window": "E2F0D9",
         "Best candidate": "FFF2CC", "Last 12 months": "E4DFEC",
+        "Direction": "E4DFEC", "Long": "E2F0D9", "Short": "FCE4D6",
     }
     thin_gray = Side(style="thin", color="D9E1F2")
     for index, worksheet in enumerate(workbook.worksheets, start=1):
-        worksheet.freeze_panes = "A2"
+        worksheet.freeze_panes = (
+            "D2" if worksheet.title in {"Hall of Fame", "Directional Metrics"}
+            else "A2"
+        )
         worksheet.sheet_view.showGridLines = False
         for cell in worksheet[1]:
             cell.fill = header_fill
@@ -3971,7 +4369,8 @@ def _save_auto_workbook(
         for metric in (
             "robust_score", "recency_score", "stage_consistency_score",
             "worst_stage_percentile", "final_total_profit_percent",
-            "weight", "effect",
+            "final_total_profit", "final_long_profit", "final_short_profit",
+            "final_maximum_drawdown", "final_win_rate", "weight", "effect",
         ):
             column = headers.get(metric)
             if column and worksheet.max_row >= 3:
@@ -4018,6 +4417,14 @@ def _save_auto_workbook(
                     worksheet.cell(row, 3).number_format = "0.00"
         elif worksheet.title == "Hall of Fame":
             worksheet.sheet_properties.tabColor = "70AD47"
+            rank_column = headers.get("rank")
+            if rank_column:
+                medal_colors = {2: "FFD966", 3: "D9E1F2", 4: "F4B183"}
+                for row, color in medal_colors.items():
+                    if row <= worksheet.max_row:
+                        cell = worksheet.cell(row, rank_column)
+                        cell.fill = PatternFill("solid", fgColor=color)
+                        cell.font = Font(bold=True, color="17365D")
             decision_column = headers.get("decision")
             if decision_column:
                 decision_fills = {
@@ -4032,6 +4439,14 @@ def _save_auto_workbook(
                         worksheet.cell(row, decision_column).font = Font(bold=True)
         elif worksheet.title == "Monthly Analysis":
             worksheet.sheet_properties.tabColor = "8064A2"
+        elif worksheet.title == "Directional Metrics":
+            worksheet.sheet_properties.tabColor = "A5A5A5"
+            for header, column in headers.items():
+                header_text = str(header or "")
+                if header_text.startswith("final_long_"):
+                    worksheet.cell(1, column).fill = PatternFill("solid", fgColor="548235")
+                elif header_text.startswith("final_short_"):
+                    worksheet.cell(1, column).fill = PatternFill("solid", fgColor="C0504D")
         elif worksheet.title == "Best Monthly Returns":
             worksheet.sheet_properties.tabColor = "5B9BD5"
             return_column = headers.get("Return %")
@@ -4048,6 +4463,84 @@ def _save_auto_workbook(
         else:
             worksheet.sheet_properties.tabColor = "F4B183"
 
+    dashboard_sheet = workbook["Dashboard"]
+
+    def add_auto_dashboard_table(start_row, start_column, title, headers, rows):
+        end_column = start_column + len(headers) - 1
+        dashboard_sheet.merge_cells(
+            start_row=start_row, start_column=start_column,
+            end_row=start_row, end_column=end_column,
+        )
+        title_cell = dashboard_sheet.cell(start_row, start_column, title)
+        title_cell.fill = PatternFill("solid", fgColor="17365D")
+        title_cell.font = Font(color="FFFFFF", bold=True, size=11)
+        title_cell.alignment = Alignment(horizontal="left", vertical="center")
+        dashboard_sheet.row_dimensions[start_row].height = 22
+        for offset, header in enumerate(headers):
+            cell = dashboard_sheet.cell(start_row + 1, start_column + offset, header)
+            cell.fill = PatternFill("solid", fgColor="D9EAF7")
+            cell.font = Font(color="17365D", bold=True)
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        for row_offset, row_values in enumerate(rows, start=2):
+            for column_offset, value in enumerate(row_values):
+                cell = dashboard_sheet.cell(
+                    start_row + row_offset, start_column + column_offset, value
+                )
+                cell.border = Border(bottom=thin_gray)
+                cell.alignment = Alignment(
+                    horizontal="right" if isinstance(value, (int, float)) else "left"
+                )
+                header = headers[column_offset]
+                if header in {"Profit %", "Drawdown %"}:
+                    cell.number_format = '0.00"%";[Red]-0.00"%"'
+                elif "Profit" in header or header == "Gap":
+                    cell.number_format = '$#,##0.00;[Red]-$#,##0.00'
+                elif header == "Score":
+                    cell.number_format = "0.000"
+                if header == "Long Profit":
+                    cell.fill = PatternFill("solid", fgColor="E2F0D9")
+                elif header == "Short Profit":
+                    cell.fill = PatternFill("solid", fgColor="FCE4D6")
+                elif header == "Decision":
+                    decision_colors = {
+                        "ACCEPT": "C6EFCE", "WATCH": "FFEB9C", "REJECT": "FFC7CE"
+                    }
+                    if value in decision_colors:
+                        cell.fill = PatternFill("solid", fgColor=decision_colors[value])
+                        cell.font = Font(bold=True)
+        widths = {
+            "Rank": 8, "Decision": 11, "Candidate": 18, "Score": 12,
+            "Profit %": 12, "Net Profit": 15, "Drawdown %": 13,
+            "Long Profit": 15, "Short Profit": 15, "Gap": 14,
+            "Stronger Side": 14,
+        }
+        for offset, header in enumerate(headers):
+            dashboard_sheet.column_dimensions[
+                get_column_letter(start_column + offset)
+            ].width = widths.get(header, 13)
+
+    add_auto_dashboard_table(
+        2, 14, "Top 10 exact results - snapshot / Hall of Fame",
+        ["Rank", "Decision", "Candidate", "Score", "Profit %", "Net Profit",
+         "Drawdown %", "Long Profit", "Short Profit", "Stronger Side"],
+        [[
+            row.get("rank"), row.get("decision"), row.get("candidate_id"),
+            row.get("robust_score"), row.get("final_total_profit_percent"),
+            row.get("final_total_profit"), row.get("final_maximum_drawdown"),
+            row.get("final_long_profit"), row.get("final_short_profit"),
+            row.get("final_stronger_side"),
+        ] for row in hall_rows[:10]],
+    )
+    add_auto_dashboard_table(
+        18, 14, "Top 10 directional breakdown - exact net profit",
+        ["Rank", "Long Profit", "Short Profit", "Gap", "Stronger Side"],
+        [[
+            row.get("rank"), row.get("final_long_profit"),
+            row.get("final_short_profit"), row.get("final_directional_profit_gap"),
+            row.get("final_stronger_side"),
+        ] for row in hall_rows[:10]],
+    )
+
     hall_sheet = workbook["Hall of Fame"]
     hall_headers = {cell.value: cell.column for cell in hall_sheet[1]}
     profit_column = hall_headers.get("final_total_profit_percent")
@@ -4055,6 +4548,7 @@ def _save_auto_workbook(
         chart = BarChart()
         chart.title = "Top candidates: total profit %"
         chart.y_axis.title = "Profit %"
+        chart.y_axis.numFmt = '0.00"%"'
         chart.height = 7
         chart.width = 13
         last_row = min(hall_sheet.max_row, 11)
@@ -4065,9 +4559,62 @@ def _save_auto_workbook(
         chart.set_categories(
             Reference(hall_sheet, min_col=1, min_row=2, max_row=last_row)
         )
-        workbook["Dashboard"].add_chart(chart, "E2")
-    workbook.save(output_path)
-    return output_path
+        chart.legend = None
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+        chart.dLbls.numFmt = '0.00"%"'
+        chart.series[0].graphicalProperties.solidFill = "4472C4"
+        chart.series[0].graphicalProperties.line.solidFill = "2F5597"
+        dashboard_sheet.add_chart(chart, "E2")
+    directional_sheet = workbook["Directional Metrics"]
+    directional_headers = {cell.value: cell.column for cell in directional_sheet[1]}
+    rank_column = directional_headers.get("rank")
+    long_profit_column = directional_headers.get("final_long_profit")
+    short_profit_column = directional_headers.get("final_short_profit")
+    if rank_column and long_profit_column and short_profit_column:
+        chart = BarChart()
+        chart.type = "col"
+        chart.style = 11
+        chart.title = "Top candidates: Long vs Short net profit"
+        chart.y_axis.title = "Net profit ($)"
+        chart.y_axis.numFmt = '$#,##0'
+        chart.height = 7
+        chart.width = 13
+        last_row = min(directional_sheet.max_row, 11)
+        for column in (long_profit_column, short_profit_column):
+            chart.add_data(
+                Reference(
+                    directional_sheet, min_col=column, min_row=1, max_row=last_row
+                ),
+                titles_from_data=True,
+            )
+        chart.set_categories(
+            Reference(
+                directional_sheet, min_col=rank_column, min_row=2, max_row=last_row
+            )
+        )
+        chart.dLbls = DataLabelList()
+        chart.dLbls.showVal = True
+        chart.dLbls.numFmt = '$#,##0'
+        for series, color in zip(chart.series, ("70AD47", "C0504D")):
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = color
+        dashboard_sheet.add_chart(chart, "E18")
+    workbook.save(staging_path)
+    try:
+        _replace_with_retry(staging_path, output_path)
+        return output_path
+    except PermissionError:
+        fallback_path = output_path.with_name(
+            f"{output_path.stem}_latest{output_path.suffix}"
+        )
+        _replace_with_retry(staging_path, fallback_path)
+        print(
+            f"Warning: {output_path.name} is open or locked; wrote the newest "
+            f"workbook to {fallback_path.name}. Close the workbook before the next "
+            "cycle to restore normal in-place updates."
+        )
+        return fallback_path
 
 
 def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled=True):
@@ -4171,6 +4718,8 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "best_decision": ranked_hall[0].get("decision") if ranked_hall else None,
         "best_recency_score": ranked_hall[0].get("recency_score") if ranked_hall else None,
         "best_params": ranked_hall[0]["effective_params"] if ranked_hall else None,
+        "recommended_params_file": "best_params.json",
+        "best_params_manifest": "best_params_manifest.json",
         "time_summary": _range_reporting_summary(state),
         "best_monthly_performance": (
             _monthly_performance_summary(
@@ -4189,6 +4738,28 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "updated_at": state["updated_at"],
     }
     _write_json(output_dir / "auto_summary.json", summary)
+    if ranked_hall:
+        best_record = ranked_hall[0]
+        best_metrics = (best_record.get("stage_metrics", {}).get("final", {}) or {})
+        _write_best_params_manifest(
+            output_dir,
+            status=(
+                "final" if state.get("status") == "completed"
+                else "best_available_auto_checkpoint"
+            ),
+            selection_basis=(
+                "rank #1 robust Hall-of-Fame candidate across Auto stages; "
+                "root best_params.json supersedes cycle/checkpoint copies"
+            ),
+            metrics={**best_metrics, "objective_score": best_record.get("robust_score")},
+            candidate_id=best_record.get("candidate_id"),
+        )
+    elif state.get("checkpoint_best_params"):
+        _write_best_params_manifest(
+            output_dir,
+            status="provisional_checkpoint",
+            selection_basis="best available Auto checkpoint; no Hall-of-Fame finalist yet",
+        )
 
 
 def refresh_auto_report_monthly(output_dir, top_n=None, workers=1):
@@ -5030,6 +5601,9 @@ def run_auto_optimization(args, grid=None):
             excel_enabled=bool(args.excel_top),
         )
         print("\nAuto mode stopped safely. Use --auto --resume to continue.")
+        if (output_dir / "best_params.json").is_file():
+            print(f"BEST AVAILABLE PARAMETER FILE: {output_dir / 'best_params.json'}")
+            print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
         return hall[0] if hall else None
 
     state.update({"status": "completed", "updated_at": _timestamp_now()})
@@ -5042,6 +5616,9 @@ def run_auto_optimization(args, grid=None):
         f"Auto campaign stopped after {state['cycles_completed']} completed cycle(s). "
         f"Resume with --auto --resume."
     )
+    if (output_dir / "best_params.json").is_file():
+        print(f"USE THIS PARAMETER FILE: {output_dir / 'best_params.json'}")
+        print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
     return hall[0] if hall else None
 
 
@@ -5140,7 +5717,13 @@ def _staged_report_rows(records):
         for metric in (
             "score", "total_profit", "total_profit_percent", "closed_trades",
             "win_rate", "maximum_drawdown", "profit_factor",
-            "expectancy_percent", "calmar_ratio", "liquidations",
+            "expectancy_percent", "calmar_ratio", "liquidations", "stronger_side",
+            "directional_profit_gap", "long_profit", "long_trades", "long_wins",
+            "long_losses", "long_win_rate", "long_profit_factor", "long_expectancy",
+            "long_maximum_drawdown", "long_total_fees", "long_liquidations",
+            "short_profit", "short_trades", "short_wins", "short_losses",
+            "short_win_rate", "short_profit_factor", "short_expectancy",
+            "short_maximum_drawdown", "short_total_fees", "short_liquidations",
         ):
             row[metric] = final_metrics.get(metric)
         row.update({key: effective.get(key) for key in parameter_keys})
@@ -5159,6 +5742,13 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
     _write_rows_atomic(output_dir / "candidate_catalog.csv", fieldnames, rows)
     _write_json(output_dir / f"top_{max(1, int(top_n))}.json", ranked)
     _write_json(output_dir / "best_params.json", ranked[0]["effective_params"])
+    _write_best_params_manifest(
+        output_dir,
+        status="final",
+        selection_basis="rank #1 robust winner across completed staged optimization phases",
+        metrics=ranked[0].get("stage_metrics", {}).get("final", {}),
+        candidate_id=ranked[0].get("candidate_id"),
+    )
     _write_json(
         output_dir / "best_candidate_summary.json",
         _candidate_summary(ranked[0], 1, Path("best_params.json")),
@@ -5171,6 +5761,13 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
             snapshot_dir / f"top_{max(1, int(top_n))}.json", ranked
         )
         _write_json(snapshot_dir / "best_params.json", ranked[0]["effective_params"])
+        _write_best_params_manifest(
+            snapshot_dir,
+            status="immutable_snapshot",
+            selection_basis="rank #1 staged winner captured by this snapshot",
+            metrics=ranked[0].get("stage_metrics", {}).get("final", {}),
+            candidate_id=ranked[0].get("candidate_id"),
+        )
         _write_json(
             snapshot_dir / "best_candidate_summary.json",
             _candidate_summary(ranked[0], 1, Path("best_params.json")),
@@ -5239,6 +5836,13 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
             row.update({key: value for key, value in original.items() if key not in core_keys})
         _write_rows_atomic(snapshot_dir / f"top_{top_n}.csv", list(rows[0]), rows)
         _write_json(snapshot_dir / "best_params.json", selected[0]["effective_params"])
+        _write_best_params_manifest(
+            snapshot_dir,
+            status="immutable_snapshot",
+            selection_basis="rank #1 plateau-adjusted Auto winner at this cycle boundary",
+            metrics=selected[0].get("stage_metrics", {}).get("final", {}),
+            candidate_id=selected[0].get("candidate_id"),
+        )
         _write_json(
             snapshot_dir / "best_candidate_summary.json",
             _candidate_summary(selected[0], 1, Path("best_params.json"), state=state),
@@ -5572,7 +6176,12 @@ def _run_random_window_audit(args, candidates, output_dir, block, final_end):
             for metric in (
                 "total_profit", "total_profit_percent", "closed_trades", "win_rate",
                 "maximum_drawdown", "profit_factor", "expectancy_percent",
-                "calmar_ratio", "liquidations",
+                "calmar_ratio", "liquidations", "stronger_side", "directional_profit_gap",
+                "long_profit", "long_trades", "long_win_rate", "long_profit_factor",
+                "long_expectancy", "long_maximum_drawdown", "long_total_fees",
+                "long_liquidations", "short_profit", "short_trades", "short_win_rate",
+                "short_profit_factor", "short_expectancy", "short_maximum_drawdown",
+                "short_total_fees", "short_liquidations",
             )
         })
         result_rows.append(row)
@@ -5595,6 +6204,13 @@ def _run_random_window_audit(args, candidates, output_dir, block, final_end):
     _write_json(output_dir / "random_window_summary.json", summaries)
     if summaries:
         _write_json(output_dir / "best_params.json", summaries[0]["effective_params"])
+        _write_best_params_manifest(
+            output_dir,
+            status="final_random_window_audit",
+            selection_basis="rank #1 finalist by independent random-window robustness audit",
+            metrics=summaries[0],
+            candidate_id=summaries[0].get("candidate_id"),
+        )
     return summaries[0] if summaries else None
 
 
@@ -7205,6 +7821,9 @@ def run_staged_optimization(args):
 
     state.update({"status": "completed", "updated_at": _timestamp_now()})
     _write_json(state_path, state)
+    if (output_dir / "best_params.json").is_file():
+        print(f"USE THIS PARAMETER FILE: {output_dir / 'best_params.json'}")
+        print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
     return archive[0] if archive else None
 
 
@@ -7458,6 +8077,7 @@ def run_optimization(args, grid=None):
                 "params": validated_best["params"],
                 "result": validated_best["result"],
                 "duration": validated_best["duration"],
+                "selection_score": validated_best["robust_score"],
             }
             run_metadata.update({
                 "best_robust_score": validated_best["robust_score"],
@@ -7478,6 +8098,7 @@ def run_optimization(args, grid=None):
             output_dir / "optimization_results.xlsx",
             keys,
             max_rows=excel_top,
+            selected_best=best,
         )
         if excel_top else None
     )
@@ -7485,7 +8106,7 @@ def run_optimization(args, grid=None):
         run_metadata["excel_report"] = str(workbook_path)
     _write_best_files(
         output_dir, best, args.mode, requested_tests, completed, elapsed,
-        args.seed, run_metadata,
+        args.seed, run_metadata, final=True,
     )
     top_n = max(1, int(getattr(args, "top_n", 20)))
     _write_json(output_dir / "top_results.json", [
@@ -7498,7 +8119,8 @@ def run_optimization(args, grid=None):
         print(f"Excel report: {workbook_path}")
     if best:
         print(f"Best score: {_score(best['result']):.4f}")
-        print(f"Best params: {output_dir / 'best_params.json'}")
+        print(f"USE THIS PARAMETER FILE: {output_dir / 'best_params.json'}")
+        print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
     return best
 
 

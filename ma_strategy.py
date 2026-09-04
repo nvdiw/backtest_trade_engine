@@ -428,6 +428,14 @@ def ma_strategy(
 
     equity_curve = []
     profits_lst = []
+    long_profits = []
+    short_profits = []
+    long_fees = []
+    short_fees = []
+    long_durations_minutes = []
+    short_durations_minutes = []
+    long_liquidations = 0
+    short_liquidations = 0
     research_month_end_equity = {}
     chart_state = TradeEngine.create_chart_state(
         optimize=optimize,
@@ -551,6 +559,14 @@ def ma_strategy(
             save_money=save_money,
             trade_power=trade_power,
             total_liquids=total_liquids,
+            long_profits=long_profits,
+            short_profits=short_profits,
+            long_fees=long_fees,
+            short_fees=short_fees,
+            long_durations_minutes=long_durations_minutes,
+            short_durations_minutes=short_durations_minutes,
+            long_liquidations=long_liquidations,
+            short_liquidations=short_liquidations,
         )
 
     def apply_account_state(account):
@@ -560,6 +576,9 @@ def ma_strategy(
         nonlocal total_wins, total_wins_long, total_wins_short, total_losses
         nonlocal total_long, total_short, cooldown_until_index
         nonlocal profit_percent_per_month, save_money, trade_power, total_liquids
+        nonlocal long_profits, short_profits, long_fees, short_fees
+        nonlocal long_durations_minutes, short_durations_minutes
+        nonlocal long_liquidations, short_liquidations
         balance = account.balance
         balance_without_fee = account.balance_without_fee
         tactical_balance = account.tactical_balance
@@ -580,6 +599,14 @@ def ma_strategy(
         save_money = account.save_money
         trade_power = account.trade_power
         total_liquids = account.total_liquids
+        long_profits = account.long_profits
+        short_profits = account.short_profits
+        long_fees = account.long_fees
+        short_fees = account.short_fees
+        long_durations_minutes = account.long_durations_minutes
+        short_durations_minutes = account.short_durations_minutes
+        long_liquidations = account.long_liquidations
+        short_liquidations = account.short_liquidations
 
     # ---- get_ADX ----
     # reuse existing `indicator` instance (created above) to avoid re-initialization
@@ -2166,6 +2193,14 @@ def ma_strategy(
         total_short=total_short,
         max_drawdown=max_drawdown,
         total_liquids=total_liquids,
+        long_profits=long_profits,
+        short_profits=short_profits,
+        long_fees=long_fees,
+        short_fees=short_fees,
+        long_durations_minutes=long_durations_minutes,
+        short_durations_minutes=short_durations_minutes,
+        long_liquidations=long_liquidations,
+        short_liquidations=short_liquidations,
         lst_profit_percent_per_month=lst_profit_percent_per_month,
         monthly_stop_reasons=monthly_stop_reasons,
         research_monthly_returns=research_monthly_returns,

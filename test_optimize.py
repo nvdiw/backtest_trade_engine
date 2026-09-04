@@ -828,6 +828,11 @@ class OptimizerSearchTests(unittest.TestCase):
             dashboard_status = workbook["Dashboard"]["C2"].value
             dashboard_header_color = workbook["Dashboard"]["A1"].fill.fgColor.rgb
             dashboard_chart_count = len(workbook["Dashboard"]._charts)
+            dashboard_top_10_title = workbook["Dashboard"]["N2"].value
+            dashboard_direction_title = workbook["Dashboard"]["N18"].value
+            dashboard_chart_labels = [
+                chart.dLbls.showVal for chart in workbook["Dashboard"]._charts
+            ]
             workbook.close()
             completed_checkpoints_removed = not (
                 Path(temp_dir) / "cycles" / "cycle_000001" / "checkpoints"
@@ -841,12 +846,21 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(saved["slippage_rate"], 0.0001)
         self.assertEqual(best["params"], {"x": 4})
         self.assertEqual(auto_sheets, [
-            "Dashboard", "Hall of Fame", "Monthly Analysis",
+            "Dashboard", "Hall of Fame", "Directional Metrics", "Monthly Analysis",
             "Best Monthly Returns", "Parameter Importance",
         ])
         self.assertEqual(dashboard_status, "completed")
         self.assertEqual(dashboard_header_color, "0017365D")
-        self.assertEqual(dashboard_chart_count, 1)
+        self.assertEqual(dashboard_chart_count, 2)
+        self.assertEqual(
+            dashboard_top_10_title,
+            "Top 10 exact results - snapshot / Hall of Fame",
+        )
+        self.assertEqual(
+            dashboard_direction_title,
+            "Top 10 directional breakdown - exact net profit",
+        )
+        self.assertEqual(dashboard_chart_labels, [True, True])
         self.assertTrue(completed_checkpoints_removed)
 
     def test_auto_resume_recovers_a_missing_cycle_boundary_snapshot(self):
@@ -1066,22 +1080,42 @@ class OptimizerSearchTests(unittest.TestCase):
                 best = run_optimization(args, grid={"x": [1, 2, 3]})
             with (Path(temp_dir) / "best_params.json").open(encoding="utf-8") as file:
                 saved = json.load(file)
-            workbook = load_workbook(
-                Path(temp_dir) / "optimization_results.xlsx", read_only=True
+            manifest = json.loads(
+                (Path(temp_dir) / "best_params_manifest.json").read_text(encoding="utf-8")
             )
+            workbook = load_workbook(Path(temp_dir) / "optimization_results.xlsx")
             with (Path(temp_dir) / "optimization_results.csv").open(
                 encoding="utf-8"
             ) as results_file:
                 columns = next(csv.reader(results_file))
             sheet_names = workbook.sheetnames
+            dashboard_top_10_title = workbook["Dashboard"]["N2"].value
+            dashboard_direction_title = workbook["Dashboard"]["N18"].value
+            dashboard_chart_labels = [
+                chart.dLbls.showVal for chart in workbook["Dashboard"]._charts
+            ]
             workbook.close()
 
         self.assertEqual(best["params"]["x"], 3)
         self.assertEqual(saved["x"], 3)
         self.assertEqual(saved["funding_rate_per_8h"], 0.00005)
+        self.assertEqual(manifest["recommended_file"], "best_params.json")
+        self.assertEqual(manifest["status"], "final")
+        self.assertIn("Dashboard", sheet_names)
+        self.assertIn("Best Parameters", sheet_names)
+        self.assertIn("Directional Metrics", sheet_names)
         self.assertIn("Core Metrics", sheet_names)
         self.assertIn("RSI Metrics", sheet_names)
         self.assertIn("Scale Metrics", sheet_names)
+        self.assertEqual(
+            dashboard_top_10_title,
+            "Top 10 exact results - score, profit and risk",
+        )
+        self.assertEqual(
+            dashboard_direction_title,
+            "Top 10 directional breakdown - exact net profit",
+        )
+        self.assertEqual(dashboard_chart_labels, [True, True])
         self.assertIn("objective_score", columns)
         self.assertIn("profit_per_trade", columns)
         self.assertLess(columns.index("total_profit"), columns.index("x"))

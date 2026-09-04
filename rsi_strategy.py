@@ -361,6 +361,14 @@ def rsi_strategy(
     long_losses = 0
     short_wins = 0
     short_losses = 0
+    long_profits = []
+    short_profits = []
+    long_fees = []
+    short_fees = []
+    long_durations_minutes = []
+    short_durations_minutes = []
+    long_liquidations = 0
+    short_liquidations = 0
     equity_peak = first_balance
     maximum_drawdown = 0.0
     month_ends = {}
@@ -369,6 +377,7 @@ def rsi_strategy(
         nonlocal cash, position, total_fees, liquidations, cooldown_until
         nonlocal long_trades, short_trades, long_wins, long_losses
         nonlocal short_wins, short_losses
+        nonlocal long_liquidations, short_liquidations
         side = position["side"]
         exit_price = (
             float(raw_price)
@@ -395,12 +404,26 @@ def rsi_strategy(
         if liquidation:
             liquidations += 1
         if side == "long":
+            long_profits.append(net)
+            long_fees.append(costs)
+            long_durations_minutes.append(
+                max(0.0, (open_time_ns[candle_index] - position["entry_time_ns"]) / 60_000_000_000)
+            )
+            if liquidation:
+                long_liquidations += 1
             long_trades += 1
             if net > 0:
                 long_wins += 1
             else:
                 long_losses += 1
         else:
+            short_profits.append(net)
+            short_fees.append(costs)
+            short_durations_minutes.append(
+                max(0.0, (open_time_ns[candle_index] - position["entry_time_ns"]) / 60_000_000_000)
+            )
+            if liquidation:
+                short_liquidations += 1
             short_trades += 1
             if net > 0:
                 short_wins += 1
@@ -549,6 +572,19 @@ def rsi_strategy(
         liquidations=liquidations,
         closed_trades=closed_trades,
     )
+    directional_metrics = TradeEngine.calculate_directional_metrics(
+        first_balance=first_balance,
+        long_profits=long_profits,
+        short_profits=short_profits,
+        long_fees=long_fees,
+        short_fees=short_fees,
+        long_durations_minutes=long_durations_minutes,
+        short_durations_minutes=short_durations_minutes,
+        long_liquidations=long_liquidations,
+        short_liquidations=short_liquidations,
+        long_open_positions=int(position is not None and position["side"] == "long"),
+        short_open_positions=int(position is not None and position["side"] == "short"),
+    )
     result = {
         "final_balance_static": round(final_equity, 6),
         "final_balance_dynamic": round(final_equity, 6),
@@ -579,6 +615,7 @@ def rsi_strategy(
         "profit_factor": score_metrics["profit_factor"],
         "expectancy_percent": score_metrics["expectancy_percent"],
         "calmar_ratio": score_metrics["calmar_ratio"],
+        **directional_metrics,
     }
     if research:
         result["trade_profits"] = [float(value) for value in profits]

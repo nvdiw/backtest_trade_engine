@@ -14,6 +14,7 @@ Output columns:
 - total_losses
 - total_longs
 - total_shorts
+- long/short wins, losses, win rate, profit, fees, profit factor, expectancy
 - monthly_profit (sum of `profit`)
 - monthly_fee_paid (sum of `fee_paid`)
 - total_duration_minutes (sum of `duration_minutes_total`)
@@ -37,7 +38,7 @@ OUT_FILE = os.path.join('outputs', 'monthly', 'monthly_data_orders.csv')
 
 def summarize_monthly(df: pd.DataFrame) -> pd.DataFrame:
     # remove summary rows and ensure datetime parsing
-    df = df[df['type'].astype(str).str.upper() != 'SUMMARY'].copy()
+    df = df[~df['type'].astype(str).str.upper().str.startswith('SUMMARY')].copy()
 
     # parse close_time
     df['close_time'] = pd.to_datetime(df['close_time'], errors='coerce')
@@ -56,13 +57,46 @@ def summarize_monthly(df: pd.DataFrame) -> pd.DataFrame:
         total_trades = len(g)
         total_wins = (g['profit'] > 0).sum()
         total_losses = (g['profit'] <= 0).sum()
-        total_longs = (g['type'].astype(str).str.upper() == 'LONG').sum()
-        total_shorts = (g['type'].astype(str).str.upper() == 'SHORT').sum()
+        if 'side' in g.columns:
+            sides = g['side'].astype(str).str.upper()
+            inferred = g['type'].astype(str).str.upper().str.extract(
+                r'^(LONG|SHORT)', expand=False
+            )
+            sides = sides.where(sides.isin(('LONG', 'SHORT')), inferred)
+        else:
+            sides = g['type'].astype(str).str.upper().str.extract(r'^(LONG|SHORT)', expand=False)
+        long_group = g[sides == 'LONG']
+        short_group = g[sides == 'SHORT']
+        total_longs = len(long_group)
+        total_shorts = len(short_group)
         monthly_profit = g['profit'].sum(min_count=1)
         monthly_fee_paid = g['fee_paid'].sum(min_count=1) if 'fee_paid' in g.columns else None
         total_duration_minutes = g['duration_minutes_total'].sum(min_count=1) if 'duration_minutes_total' in g.columns else None
         win_rate = (total_wins / total_trades * 100) if total_trades > 0 else 0
         avg_profit_per_trade = (monthly_profit / total_trades) if total_trades > 0 else 0
+
+        def side_metrics(side_group):
+            side_profit = pd.to_numeric(side_group.get('profit'), errors='coerce').fillna(0.0)
+            side_fees = pd.to_numeric(side_group.get('fee_paid'), errors='coerce').fillna(0.0)
+            wins = int((side_profit > 0).sum())
+            losses = int((side_profit <= 0).sum())
+            gross_profit = float(side_profit[side_profit > 0].sum())
+            gross_loss = abs(float(side_profit[side_profit < 0].sum()))
+            return {
+                'wins': wins,
+                'losses': losses,
+                'win_rate': wins * 100.0 / len(side_group) if len(side_group) else 0.0,
+                'profit': float(side_profit.sum()),
+                'fees': float(side_fees.sum()),
+                'profit_factor': (
+                    gross_profit / gross_loss if gross_loss > 0
+                    else 5.0 if gross_profit > 0 else 0.0
+                ),
+                'expectancy': float(side_profit.mean()) if len(side_group) else 0.0,
+            }
+
+        long_metrics = side_metrics(long_group)
+        short_metrics = side_metrics(short_group)
 
         first_balance = g.sort_values('close_time').iloc[0]['balance_before'] if 'balance_before' in g.columns and not g.empty else None
         last_balance = g.sort_values('close_time').iloc[-1]['balance_after'] if 'balance_after' in g.columns and not g.empty else None
@@ -78,6 +112,20 @@ def summarize_monthly(df: pd.DataFrame) -> pd.DataFrame:
             'total_losses': int(total_losses),
             'total_longs': int(total_longs),
             'total_shorts': int(total_shorts),
+            'long_wins': long_metrics['wins'],
+            'long_losses': long_metrics['losses'],
+            'long_win_rate': long_metrics['win_rate'],
+            'long_profit': long_metrics['profit'],
+            'long_fees': long_metrics['fees'],
+            'long_profit_factor': long_metrics['profit_factor'],
+            'long_expectancy': long_metrics['expectancy'],
+            'short_wins': short_metrics['wins'],
+            'short_losses': short_metrics['losses'],
+            'short_win_rate': short_metrics['win_rate'],
+            'short_profit': short_metrics['profit'],
+            'short_fees': short_metrics['fees'],
+            'short_profit_factor': short_metrics['profit_factor'],
+            'short_expectancy': short_metrics['expectancy'],
             'monthly_profit': float(monthly_profit) if pd.notna(monthly_profit) else 0.0,
             'monthly_fee_paid': float(monthly_fee_paid) if pd.notna(monthly_fee_paid) else 0.0,
             'total_duration_minutes': float(total_duration_minutes) if pd.notna(total_duration_minutes) else 0.0,
