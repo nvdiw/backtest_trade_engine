@@ -75,7 +75,7 @@ class FixedEvaluationTests(unittest.TestCase):
             self.assertEqual(book['Trade Profits 1'].max_row, 3)
             self.assertEqual(book['Monthly Returns']['C2'].value, .1)
             self.assertEqual(book['Windows'].freeze_panes, 'A2')
-            self.assertEqual(len(book['Distribution']._charts), 1)
+            self.assertEqual(len(book['Charts']._charts), 1)
             book.close()
 
 

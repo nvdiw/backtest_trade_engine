@@ -1,5 +1,16 @@
 # Backtest Trade Engine
 
+[Independent long/short settings, adaptive Auto and chart layout](DIRECTIONAL_AUTO_GUIDE_FA.md)
+
+| Task | Command / setting | Behavior |
+|---|---|---|
+| Automatic directional campaign | `python optimize.py --autopilot -w 8` | Alternates long/short parameter families, then shared portfolio controls; exports snapshot audit workbooks automatically |
+| Tune one direction | `--profile long` or `--profile short` | Keeps the other direction at the supplied baseline |
+| Different MA periods | `long_ema_16_period`, `short_ema_16_period`, `long_ma_50_period`, `short_ma_50_period` | Independent indicators, warmup seeds and cross state; legacy keys remain fallback values |
+| Inspect readable charts | `Charts` sheet in newly generated workbooks | Larger separated charts, reduced label density; exact values remain in tables |
+
+Shared balance, costs and portfolio stop controls still couple economic results between directions. `--autopilot` defaults to eleven phases of ten cycles and one snapshot every 110 cycles. Existing `--auto` behavior remains available. Use a separate output directory for the new directional campaign.
+
 [Build a strategy with its own dataset and timeframe](STRATEGY_PLUGIN_GUIDE_FA.md) — includes the copy-ready `example_strategy.py` configured for `data_candle/btc_1m_data.csv`.
 
 [Research workflow: nested walk-forward, sealed holdout, Top 100 snapshots, and strategy plug-ins](RESEARCH_GUIDE_FA.md)
@@ -325,11 +336,11 @@ JSON writes are atomic. CSV is flushed after each batch for reliable resume. Wor
 
 `--auto` runs a resumable campaign until `Ctrl+C`. It uses the main `full` parameter grid by default; pass `--profile focused` only when a deliberately smaller search is wanted. An existing compatible checkpoint in the output directory is resumed automatically, even when `--resume` is omitted. A new campaign also warm-starts from compatible values in `--base-params` when that file exists.
 
-Date handling defaults to `--date-policy auto`. A new campaign works backwards from the latest valid candle, reserves the latest five calendar months as sealed Holdout, inserts a one-month Embargo, reserves the preceding eight months for reporting-only Research OOS, and uses the preceding 27 months for Auto Development. Resolved dates are frozen in campaign state and manifests, so appending candles never moves a resumed experiment. Use `--date-policy fixed` to preserve explicit `--auto-*`, `--wf-*`, and `--holdout-*` boundaries.
+Date handling defaults to `--date-policy auto`: current Auto searches the latest 24 development months through the newest candle, with earlier historical stability data. Resolved dates are frozen on resume. Research/holdout boundaries exist separately and are NOT automatically excluded from this recency-first Auto search. To preserve unseen evaluation, start with `--date-policy fixed` and an explicitly earlier `--auto-end`.
 
-With the current dataset ending at `2026-08-01 00:00:00` exclusive, Auto resolves to Stress `2023-03-01 -> 2023-09-01`, Validation `2023-09-01 -> 2024-03-01`, Discovery `2024-03-01 -> 2025-06-01`, Research through `2026-02-01`, Embargo through `2026-03-01`, and sealed Holdout through `2026-08-01`.
+The following dates illustrate a legacy, explicitly separated development/research protocol; they are not the current Auto defaults. Use `--dry-run` to see the actual dates for your campaign.
 
-The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final search-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 500 reach Validation, 250 reach Stress, 150 reach the internal walk-forward, and 100 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 10,000 deterministic score-quantile samples so startup cost stays bounded. A compact `surrogate_history_cache.json.gz` is bootstrapped from a blend of whole-history and recent cycles, updated incrementally, and reused after restart; continuous runs keep both candidate and surrogate history in memory. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. Auto is intentionally restricted to the pre-OOS search zone by default:
+The version-2 engine uses two cheap expanding Discovery rungs, full Discovery, Validation, Stress, three disjoint walk-forward folds, and a final search-history test. With the defaults, 2,000 candidates are reduced by successive halving before the expensive stages; 500 reach Validation, 250 reach Stress, 150 reach the internal walk-forward, and 100 reach Final. Large campaigns retain every historical result, while surrogate fitting uses up to 10,000 deterministic score-quantile samples so startup cost stays bounded. A compact `surrogate_history_cache.json.gz` is bootstrapped from a blend of whole-history and recent cycles, updated incrementally, and reused after restart; continuous runs keep both candidate and surrogate history in memory. Resume shows progress for storage preparation, candidate generation, model training, and pool scoring. Example of an explicitly configured pre-OOS search zone:
 
 ```text
 Discovery    2024-03-01 -> 2025-06-01
@@ -339,7 +350,7 @@ Walk-forward three disjoint folds inside 2023-03-01 -> 2024-03-01
 Final        2023-03-01 -> 2025-06-01
 ```
 
-Nested research starts from the rolling Development start and reports four two-month OOS folds after the `2025-06-01` boundary through `2026-02-01`. February is the Embargo; the sealed range begins at `2026-03-01` and currently includes every candle through `2026-07-31 23:45:00`. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
+In that separated-date example, nested research starts from the Development start and reports four two-month OOS folds after the `2025-06-01` boundary through `2026-02-01`. February is the Embargo; the sealed range begins at `2026-03-01` and currently includes every candle through `2026-07-31 23:45:00`. Snapshot manifests record their exclusive development end; overlapping or unverifiable performance-selected seeds are rejected unless explicitly run as contaminated diagnostics, which can never pass all acceptance gates.
 
 ```powershell
 # Start an unlimited campaign; its dated output directory is selected automatically
@@ -361,7 +372,7 @@ python .\optimize.py --auto --auto-cycles 2 -w 16 `
 
 After the first cycle, Auto mode can create numeric values not present in the coarse grid. For example, an elite value of `20` in `[10, 20, 30]` produces local tests such as `19` and `21`. Float gaps become finer across cycles. Values remain inside the original numeric bounds, boolean/enum parameters remain discrete, invalid relationships are rejected, and previously planned discovery combinations are not repeated.
 
-Auto mode learns parameter importance from completed Discovery results. Once enough full-Discovery history exists, an internal dependency-free Extra Trees ensemble learns nonlinear parameter interactions. It scores a larger unevaluated pool and selects 55% for predicted quality, 20% for model uncertainty, and 25% for random exploration. Local Hall-of-Fame mutations and crossover still feed that pool, so the model guides the existing search instead of replacing it.
+Auto mode learns parameter importance from completed Discovery results. Once enough full-Discovery history exists, an internal dependency-free Extra Trees ensemble learns nonlinear parameter interactions. It checks ranking quality on held-back search configurations, then scores a larger unevaluated pool. Predicted-quality allocation adapts from 25% to 50%; uncertainty and diversity each receive 20%, leaving 10% to 35% for random exploration. Local Hall-of-Fame mutations and crossover still feed that pool, so the model guides the existing search instead of replacing it.
 
 Staged Auto mode searches one related parameter family at a time and locks each
 phase winner into the next phase. The default 50-cycle block is Signal (10), Exit

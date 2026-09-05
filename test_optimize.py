@@ -827,11 +827,11 @@ class OptimizerSearchTests(unittest.TestCase):
             auto_sheets = workbook.sheetnames
             dashboard_status = workbook["Dashboard"]["C2"].value
             dashboard_header_color = workbook["Dashboard"]["A1"].fill.fgColor.rgb
-            dashboard_chart_count = len(workbook["Dashboard"]._charts)
+            dashboard_chart_count = len(workbook["Charts"]._charts)
             dashboard_top_10_title = workbook["Dashboard"]["N2"].value
             dashboard_direction_title = workbook["Dashboard"]["N18"].value
             dashboard_chart_labels = [
-                chart.dLbls.showVal for chart in workbook["Dashboard"]._charts
+                chart.dLbls.showVal for chart in workbook["Charts"]._charts
             ]
             workbook.close()
             completed_checkpoints_removed = not (
@@ -847,7 +847,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(best["params"], {"x": 4})
         self.assertEqual(auto_sheets, [
             "Dashboard", "Hall of Fame", "Directional Metrics", "Monthly Analysis",
-            "Best Monthly Returns", "Parameter Importance",
+            "Best Monthly Returns", "Parameter Importance", "Charts",
         ])
         self.assertEqual(dashboard_status, "completed")
         self.assertEqual(dashboard_header_color, "0017365D")
@@ -860,7 +860,7 @@ class OptimizerSearchTests(unittest.TestCase):
             dashboard_direction_title,
             "Top 10 directional breakdown - exact net profit",
         )
-        self.assertEqual(dashboard_chart_labels, [True, True])
+        self.assertEqual(dashboard_chart_labels, [True, False])
         self.assertTrue(completed_checkpoints_removed)
 
     def test_auto_resume_recovers_a_missing_cycle_boundary_snapshot(self):
@@ -1092,7 +1092,7 @@ class OptimizerSearchTests(unittest.TestCase):
             dashboard_top_10_title = workbook["Dashboard"]["N2"].value
             dashboard_direction_title = workbook["Dashboard"]["N18"].value
             dashboard_chart_labels = [
-                chart.dLbls.showVal for chart in workbook["Dashboard"]._charts
+                chart.dLbls.showVal for chart in workbook["Charts"]._charts
             ]
             workbook.close()
 
@@ -1115,7 +1115,7 @@ class OptimizerSearchTests(unittest.TestCase):
             dashboard_direction_title,
             "Top 10 directional breakdown - exact net profit",
         )
-        self.assertEqual(dashboard_chart_labels, [True, True])
+        self.assertEqual(dashboard_chart_labels, [True, False])
         self.assertIn("objective_score", columns)
         self.assertIn("profit_per_trade", columns)
         self.assertLess(columns.index("total_profit"), columns.index("x"))

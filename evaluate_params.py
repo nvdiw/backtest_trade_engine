@@ -1,5 +1,7 @@
 """Evaluate ONE frozen configuration on reproducible random calendar windows."""
 
+from excel_charts import add_report_chart
+
 import argparse
 import json
 import math
@@ -161,7 +163,7 @@ def write_workbook(path, frame, summary, params, plan, records):
             chart.title = 'Window return distribution (overlapping samples)'
             chart.add_data(Reference(ws, min_col=2, min_row=1, max_row=len(distribution)+1), titles_from_data=True)
             chart.set_categories(Reference(ws, min_col=1, min_row=2, max_row=len(distribution)+1))
-            ws.add_chart(chart, 'D2')
+            add_report_chart(writer.book, chart)
     temporary.replace(path)
 
 

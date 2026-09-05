@@ -53,9 +53,9 @@ class TradeCSVLoggerWorkbookTests(unittest.TestCase):
                 for row in range(2, workbook["Overview"].max_row + 1)
             ]
             dashboard = workbook["Dashboard"]
-            dashboard_chart_count = len(dashboard._charts)
+            dashboard_chart_count = len(workbook["Charts"]._charts)
             labeled_charts = [
-                chart for chart in dashboard._charts
+                chart for chart in workbook["Charts"]._charts
                 if chart.dLbls is not None and chart.dLbls.showVal
             ]
             net_profit_panel_title = dashboard["N2"].value
@@ -70,12 +70,12 @@ class TradeCSVLoggerWorkbookTests(unittest.TestCase):
             [
                 "Dashboard", "Side Comparison", "Overview", "Monthly Analysis",
                 "Exit Reasons", "All Trades", "Long Trades", "Short Trades",
-                "Main Strategy", "RSI Strategy", "Scale Strategy",
+                "Main Strategy", "RSI Strategy", "Scale Strategy", "Charts",
             ],
         )
         self.assertEqual(freeze_panes[:5], ["A2"] * 5)
         self.assertEqual(freeze_panes[5:8], ["E2"] * 3)
-        self.assertEqual(freeze_panes[8:], ["A2"] * 3)
+        self.assertEqual(freeze_panes[8:], ["A2"] * 4)
         self.assertEqual(row_counts["Main Strategy"], 2)
         self.assertEqual(row_counts["RSI Strategy"], 2)
         self.assertEqual(row_counts["Scale Strategy"], 2)

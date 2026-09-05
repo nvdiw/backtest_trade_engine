@@ -1,5 +1,5 @@
 import json
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, make_dataclass
 from pathlib import Path
 
 
@@ -22,7 +22,13 @@ def _apply_common_tune(config, tune):
     field_names = {field.name for field in fields(config)}
     for key, value in tune.items():
         if key in field_names:
-            setattr(config, key, _coerce_like(getattr(config, key), value))
+            current = getattr(config, key)
+            if key.startswith(('long_', 'short_')) and key.split('_', 1)[1] in DIRECTIONAL_FIELDS:
+                current = getattr(config, key.split('_', 1)[1])
+                value = None if value is None else _coerce_like(current, value)
+                setattr(config, key, value)
+            else:
+                setattr(config, key, _coerce_like(current, value))
 
     # Backward-compatible tune aliases used by optimize.py and older runs.
     if 'trade_amount_percent_neworder' in tune:
@@ -362,9 +368,43 @@ class BaseStrategyConfig(
     """Shared settings used by MA and RSI strategies."""
 
 
-@dataclass
-class MAStrategyConfig(BaseStrategyConfig):
-    pass
+# Portfolio capital, monthly stops, costs and loss-streak controls remain shared.
+# None explicitly means inherit the legacy common value, including in saved JSON.
+DIRECTIONAL_FIELDS = tuple(dict.fromkeys([
+    *(f.name for group in (ScaleEntryConfig, EntryContextConfig, ExitRuleConfig,
+                           IndicatorPeriodConfig, ScoreWeightConfig)
+      for f in fields(group) if f.name != 'consecutive_losses_stop_until_month'),
+    'adx_filter', 'volume_filter', 'atr_filter', 'max_open_trades',
+    'cooldown_after_big_pnl', 'trade_amount_percent', 'leverage',
+    *(f.name for f in fields(SafeLeverageConfig) if f.name != 'save_money_recover_trigger_pct'),
+    *(f.name for f in fields(PositionsMonthlyFilter)
+      if not f.name.startswith(('rsi_long_', 'rsi_short_'))),
+]))
+# Optional defaults for the main strategy. Add any name from DIRECTIONAL_FIELDS.
+# Example: {'ema_16_period': 20, 'ma_50_period': 60}. Empty means legacy inheritance.
+MA_LONG_DEFAULTS = {}
+MA_SHORT_DEFAULTS = {}
+
+MAStrategyConfig = make_dataclass(
+    'MAStrategyConfig',
+    [(f'{side}_{name}', object, defaults.get(name))
+     for side, defaults in (('long', MA_LONG_DEFAULTS), ('short', MA_SHORT_DEFAULTS))
+     for name in DIRECTIONAL_FIELDS]
+    + [('long_enabled', bool, True), ('short_enabled', bool, True)],
+    bases=(BaseStrategyConfig,), namespace={'__module__': __name__},
+)
+
+
+def directional_config(config, side):
+    """Resolve a side once, outside the candle loop; never mutate shared config."""
+    if side not in ('long', 'short'):
+        raise ValueError('side must be long or short')
+    values = {f.name: getattr(config, f.name) for f in fields(BaseStrategyConfig)}
+    for name in DIRECTIONAL_FIELDS:
+        value = getattr(config, f'{side}_{name}', None)
+        if value is not None:
+            values[name] = value
+    return BaseStrategyConfig(**values)
 
 
 @dataclass

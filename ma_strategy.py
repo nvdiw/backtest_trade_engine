@@ -1,4 +1,4 @@
-﻿# NOTE: Strategy executes With candle Open prices, High prices, Low prices, Close prices
+# NOTE: Strategy executes With candle Open prices, High prices, Low prices, Close prices
 
 import argparse
 from collections import OrderedDict
@@ -16,6 +16,8 @@ from strategy_config import (
     build_ma_strategy_config,
     load_ma_strategy_tune,
     normalize_ma_strategy_tune,
+    directional_config,
+    DIRECTIONAL_FIELDS,
 )
 
 
@@ -59,6 +61,9 @@ _INDICATOR_CACHE = {
 
 def required_indicator_warmup(config):
     """Return preceding candles required to seed every configured indicator."""
+    if hasattr(config, 'long_enabled'):
+        return max(required_indicator_warmup(directional_config(config, side))
+                   for side in ('long', 'short'))
     return max(
         config.ema_16_period,
         config.ma_50_period,
@@ -76,6 +81,17 @@ def required_indicator_warmup(config):
 def maximum_optimizer_warmup(parameter_grid, base_tune=None):
     """Resolve one fixed warmup shared by every candidate in an optimizer pool."""
     config = build_ma_strategy_config(base_tune)
+    if any(key.startswith(('long_', 'short_')) for key in parameter_grid) or any(
+        getattr(config, f'{side}_{name}') is not None
+        for side in ('long', 'short') for name in DIRECTIONAL_FIELDS
+    ):
+        maxima = dict(base_tune or {})
+        for name, values in parameter_grid.items():
+            numeric = [v for v in values if isinstance(v, (int, float))]
+            if numeric:
+                current = maxima.get(name)
+                maxima[name] = max(numeric + ([current] if current is not None else []))
+        return required_indicator_warmup(build_ma_strategy_config(maxima))
 
     def largest(name):
         values = parameter_grid.get(name, ())
@@ -109,6 +125,110 @@ def _get_cached_indicator(kind, range_key, indicator_key, builder):
     if len(cache) > _INDICATOR_CACHE_LIMIT:
         cache.popitem(last=False)
     return value
+
+
+def _side_indicators(config, market, cached, fixed_warmup=None):
+    """Reuse identical arrays between directions; different periods have distinct keys."""
+    # A longer SHORT period must not silently change the LONG EMA seed.
+    # A pool-wide explicit warmup remains fixed for fair optimizer comparisons.
+    history_start = max(0, market['warmup_offset'] - max(required_indicator_warmup(config), int(fixed_warmup or 0)))
+    close = market['history_close_prices'][history_start:]
+    high, low = market['history_high_prices'][history_start:], market['history_low_prices'][history_start:]
+    offset = market['warmup_offset'] - history_start
+    original_cache = cached
+    def cached(kind, key, builder):
+        return original_cache(kind, (history_start, key), builder)
+    indicator = Indicator(close, period=None)
+    arrays = {}
+    for name, kind in (('ema_16', 'ema'), ('ma_50', 'ma'), ('ma_100', 'ma'), ('ma_200', 'ma')):
+        period = getattr(config, name + '_period')
+        method = indicator.get_EMA if kind == 'ema' else indicator.get_MA
+        arrays[name] = cached(kind, period, lambda p=period, m=method: m(p))[offset:]
+    arrays['adx'] = cached('adx', config.period_adx, lambda: indicator.get_ADX(high, low, close, period=config.period_adx))[offset:]
+    history_atr = cached('atr', config.period_atr, lambda: indicator.get_ATR(high, low, close, period=config.period_atr))
+    arrays['atr'] = history_atr[offset:]
+    arrays['atr_ma'] = cached('atr_ma', (config.period_atr, config.period_atr_ma),
+                            lambda: indicator.get_ATR_MA(history_atr, period=config.period_atr_ma))[offset:]
+    arrays['vol_avg_15_list'] = cached('vol_avg', config.period_vol_avg,
+                                     lambda: indicator.get_volume_avg(market['history_volume_prices'][history_start:], period=config.period_vol_avg))[offset:]
+    arrays['rsi_list'] = cached('rsi', config.period_rsi, lambda: indicator.get_RSI(close, period=config.period_rsi))[offset:]
+    return arrays
+
+
+def _new_cross_state():
+    return dict(cross_seen=False, last_cross_dir=None, last_cross_index=None,
+                last_trade_cross_index=None, last_cross_strongest_up_move_pct=0.0,
+                last_cross_strongest_down_move_pct=0.0)
+
+
+def _update_side_cross(state, arrays, i, prices, lookback):
+    fast, slow = arrays['ema_16'], arrays['ma_50']
+    if i <= 0 or any(v is None for v in (fast[i-1], slow[i-1], fast[i], slow[i])):
+        return
+    direction = ('bull' if fast[i-1] <= slow[i-1] and fast[i] > slow[i]
+                 else 'bear' if fast[i-1] >= slow[i-1] and fast[i] < slow[i] else None)
+    if direction:
+        window = np.asarray(prices[max(0, i-max(2, lookback)+1):i+1], dtype=float)
+        window = window[np.isfinite(window) & (window > 0)]
+        up = float(np.max(window / np.minimum.accumulate(window) - 1) * 100) if len(window) else 0.0
+        down = float(np.max(np.maximum.accumulate(window) / window - 1) * 100) if len(window) else 0.0
+        state.update(cross_seen=True, last_cross_dir=direction, last_cross_index=i,
+                     last_cross_strongest_up_move_pct=up, last_cross_strongest_down_move_pct=down)
+
+
+def _directional_leverage(config, capital, tactical_balance):
+    for tier in ('low', 'med', 'high'):
+        if max(0.0, capital) <= tactical_balance * getattr(config, f'safe_leverage_balance_pct_{tier}') / 100:
+            return getattr(config, f'safe_leverage_{tier}')
+    return config.leverage
+
+
+def _side_cross_events(arrays, prices, lookback):
+    """Locate crosses in NumPy once, then cache only the sparse cross events."""
+    fast = np.asarray(arrays['ema_16'], dtype=float)
+    slow = np.asarray(arrays['ma_50'], dtype=float)
+    indices = np.flatnonzero(((fast[:-1] <= slow[:-1]) & (fast[1:] > slow[1:])) |
+                             ((fast[:-1] >= slow[:-1]) & (fast[1:] < slow[1:]))) + 1
+    state, events = _new_cross_state(), {}
+    for index in indices:
+        _update_side_cross(state, arrays, int(index), prices, lookback)
+        events[int(index)] = {k: v for k, v in state.items() if k != 'last_trade_cross_index'}
+    return events
+
+
+def is_valid_candidate(params):
+    """Reject invalid side-specific periods and leverage tiers before evaluation."""
+    for side in ('long', 'short'):
+        for names in (('ema_16_period', 'ma_50_period', 'ma_100_period', 'ma_200_period'),
+                      ('safe_leverage_low', 'safe_leverage_med', 'safe_leverage_high', 'leverage')):
+            values = [params.get(f'{side}_{name}') if params.get(f'{side}_{name}') is not None
+                      else params.get(name) for name in names]
+            if all(v is not None for v in values) and values != sorted(values):
+                return False
+        for name in DIRECTIONAL_FIELDS:
+            value = params.get(f'{side}_{name}')
+            if value is not None and (name.startswith('period_') or name.endswith('_period')) and value < 1:
+                return False
+    return not (params.get('long_enabled') is False and params.get('short_enabled') is False)
+
+
+def canonicalize_candidate(params, baseline):
+    """Collapse inactive side parameters without altering the executed strategy."""
+    candidate = dict(params)
+    for side in ('long', 'short'):
+        prefix = side + '_'
+        for key in candidate:
+            if not key.startswith(prefix) or key not in baseline:
+                continue
+            name = key[len(prefix):]
+            inactive = candidate.get(prefix + 'enabled') is False and name != 'enabled'
+            inactive |= candidate.get(prefix + 'scale_in_enabled') is False and name.startswith(('scale_entry_', 'profit_scale_'))
+            inactive |= candidate.get(prefix + 'atr_filter') is False and name == 'entry_atr_threshold'
+            inactive |= candidate.get(prefix + 'volume_filter') is False and name in ('volume_spike_multiplier', 'entry_score_volume')
+            inactive |= candidate.get(prefix + 'adx_filter') is False and name in ('entry_adx_threshold', 'entry_score_adx')
+            if inactive:
+                candidate[key] = baseline[key]
+    return candidate
 
 # Main Trading Logic
 def ma_strategy(
@@ -144,6 +264,10 @@ def ma_strategy(
     render_chart = (show_chart or bool(chart_file)) and not optimize
 
     cfg = build_ma_strategy_config(tune)
+    long_cfg = directional_config(cfg, 'long')
+    short_cfg = directional_config(cfg, 'short')
+    independent_directions = long_cfg != short_cfg or not (cfg.long_enabled and cfg.short_enabled)
+    cooldowns = {'long': -1, 'short': -1}
     # Load preceding candles only to seed rolling/Wilder indicators. They are
     # excluded from trading, reporting, charts, and performance statistics.
     required_warmup = required_indicator_warmup(cfg)
@@ -174,7 +298,8 @@ def ma_strategy(
     history_volume_prices = market["history_volume_prices"]
     warmup_offset = market["warmup_offset"]
 
-    range_key = (market["data_start"], market["end"], warmup_offset)
+    data_stat = Path(DATA_FILE).stat()
+    range_key = (str(Path(DATA_FILE).resolve()), data_stat.st_mtime_ns, data_stat.st_size, market["data_start"], market["end"], warmup_offset)
 
     def _cached_indicator(kind, key, builder):
         return _get_cached_indicator(kind, range_key, key, builder)
@@ -472,6 +597,8 @@ def ma_strategy(
     # variables of rsi on monthly filter
     rsi_last_index_stop_loss_bar = 0
     rsi_in_cooldown = False
+    rsi_cooldowns = {'long': dict(rsi_in_cooldown=False, rsi_last_index_stop_loss_bar=0)}
+    rsi_cooldowns['short'] = dict(rsi_cooldowns['long']) if independent_directions else rsi_cooldowns['long']
 
     balance_without_fee = balance
     first_balance = balance
@@ -480,32 +607,45 @@ def ma_strategy(
     first_open_time = open_times[0]
     last_close_time = close_times[-1]
 
-    # ---- Get MA, EMA ----
-    indicator = Indicator(history_close_prices, period=None)
+    long_arrays = _side_indicators(long_cfg, market, _cached_indicator, indicator_warmup_candles)
+    short_arrays = _side_indicators(short_cfg, market, _cached_indicator, indicator_warmup_candles)
+    long_ema_16 = long_arrays['ema_16']
+    long_ma_50 = long_arrays['ma_50']
+    long_ma_100 = long_arrays['ma_100']
+    long_ma_200 = long_arrays['ma_200']
+    long_adx = long_arrays['adx']
+    long_atr = long_arrays['atr']
+    long_atr_ma = long_arrays['atr_ma']
+    long_vol_avg_15_list = long_arrays['vol_avg_15_list']
+    long_rsi_list = long_arrays['rsi_list']
+    short_ema_16 = short_arrays['ema_16']
+    short_ma_50 = short_arrays['ma_50']
+    short_ma_100 = short_arrays['ma_100']
+    short_ma_200 = short_arrays['ma_200']
+    short_adx = short_arrays['adx']
+    short_atr = short_arrays['atr']
+    short_atr_ma = short_arrays['atr_ma']
+    short_vol_avg_15_list = short_arrays['vol_avg_15_list']
+    short_rsi_list = short_arrays['rsi_list']
+    long_state = _new_cross_state()
+    shared_cross = all(getattr(long_cfg, name) == getattr(short_cfg, name) for name in ('ema_16_period', 'ma_50_period', 'sharp_move_lookback_candles'))
+    short_state = long_state if shared_cross and not independent_directions else _new_cross_state()
 
-    # MA/EMA
-    ema_16_period = cfg.ema_16_period
-    ma_50_period = cfg.ma_50_period
-    ma_100_period = cfg.ma_100_period
-    ma_200_period = cfg.ma_200_period
-
-    def _for_requested_range(values):
-        return values[warmup_offset:]
-
-    ema_16 = _for_requested_range(_cached_indicator(
-        "ema", ema_16_period, lambda: indicator.get_EMA(ema_16_period)
-    ))
-    ma_50 = _for_requested_range(_cached_indicator(
-        "ma", ma_50_period, lambda: indicator.get_MA(ma_50_period)
-    ))
-    ma_100 = _for_requested_range(_cached_indicator(
-        "ma", ma_100_period, lambda: indicator.get_MA(ma_100_period)
-    ))
-    ma_200 = _for_requested_range(_cached_indicator(
-        "ma", ma_200_period, lambda: indicator.get_MA(ma_200_period)
-    ))
-
-
+    ema_16 = long_ema_16
+    ma_50 = long_ma_50
+    ma_100 = long_ma_100
+    ma_200 = long_ma_200
+    adx = long_adx
+    atr = long_atr
+    atr_ma = long_atr_ma
+    vol_avg_15_list = long_vol_avg_15_list
+    rsi_list = long_rsi_list
+    ema_16_period = long_cfg.ema_16_period
+    ma_50_period = long_cfg.ma_50_period
+    ma_100_period = long_cfg.ma_100_period
+    ma_200_period = long_cfg.ma_200_period
+    long_cross_events = _cached_indicator('sharp_moves', (long_cfg.ema_16_period, long_cfg.ma_50_period, long_cfg.sharp_move_lookback_candles, required_indicator_warmup(long_cfg), int(indicator_warmup_candles or 0)), lambda: _side_cross_events(long_arrays, close_prices, long_cfg.sharp_move_lookback_candles))
+    short_cross_events = _cached_indicator('sharp_moves', (short_cfg.ema_16_period, short_cfg.ma_50_period, short_cfg.sharp_move_lookback_candles, required_indicator_warmup(short_cfg), int(indicator_warmup_candles or 0)), lambda: _side_cross_events(short_arrays, close_prices, short_cfg.sharp_move_lookback_candles))
 
     # ---- MANAGE TRADES ----
     trade_engine = TradeEngine(
@@ -569,7 +709,7 @@ def ma_strategy(
             short_liquidations=short_liquidations,
         )
 
-    def apply_account_state(account):
+    def apply_account_state(account, side=None):
         nonlocal balance, balance_without_fee, tactical_balance
         nonlocal deducting_fee_total, profits_lst, total_profit_percent
         nonlocal count_closed_orders, equity_curve, max_drawdown
@@ -595,6 +735,10 @@ def ma_strategy(
         total_long = account.total_long
         total_short = account.total_short
         cooldown_until_index = account.cooldown_until_index
+        if side is not None:
+            cooldowns[side] = account.cooldown_until_index
+            if not independent_directions:
+                cooldowns['long'] = cooldowns['short'] = account.cooldown_until_index
         profit_percent_per_month = account.profit_percent_per_month
         save_money = account.save_money
         trade_power = account.trade_power
@@ -607,78 +751,6 @@ def ma_strategy(
         short_durations_minutes = account.short_durations_minutes
         long_liquidations = account.long_liquidations
         short_liquidations = account.short_liquidations
-
-    # ---- get_ADX ----
-    # reuse existing `indicator` instance (created above) to avoid re-initialization
-    adx = _cached_indicator(
-        "adx",
-        period_adx,
-        lambda: indicator.get_ADX(
-            history_high_prices, history_low_prices, history_close_prices,
-            period=period_adx,
-        ),
-    )[warmup_offset:]
-
-    # ---- get_ATR ----
-    history_atr = _cached_indicator(
-        "atr",
-        period_atr,
-        lambda: indicator.get_ATR(
-            history_high_prices, history_low_prices, history_close_prices,
-            period=period_atr,
-        ),
-    )
-    atr = history_atr[warmup_offset:]
-    # ---- get_ATR_MA ----
-    atr_ma = _cached_indicator(
-        "atr_ma",
-        (period_atr, period_atr_ma),
-        lambda: indicator.get_ATR_MA(history_atr, period=period_atr_ma),
-    )[warmup_offset:]
-    # ---- get volume average ----
-    vol_avg_15_list = _cached_indicator(
-        "vol_avg",
-        period_vol_avg,
-        lambda: indicator.get_volume_avg(history_volume_prices, period=period_vol_avg),
-    )[warmup_offset:]
-
-    # ---- get RSI ----
-    rsi_list = _cached_indicator(
-        "rsi",
-        period_rsi,
-        lambda: indicator.get_RSI(history_close_prices, period=period_rsi),
-    )[warmup_offset:]
-
-    def _build_cross_sharp_moves():
-        cached_moves = {}
-        lookback = max(2, sharp_move_lookback_candles)
-        for cross_index in range(1, len(close_prices)):
-            if (
-                ema_16[cross_index - 1] is None
-                or ma_50[cross_index - 1] is None
-                or ema_16[cross_index] is None
-                or ma_50[cross_index] is None
-            ):
-                continue
-            crossed = (
-                ema_16[cross_index - 1] <= ma_50[cross_index - 1]
-                and ema_16[cross_index] > ma_50[cross_index]
-            ) or (
-                ema_16[cross_index - 1] >= ma_50[cross_index - 1]
-                and ema_16[cross_index] < ma_50[cross_index]
-            )
-            if crossed:
-                start_idx = max(0, cross_index - (lookback - 1))
-                cached_moves[cross_index] = strongest_directional_moves_pct(
-                    close_prices, start_idx, cross_index
-                )
-        return cached_moves
-
-    cross_sharp_moves = _cached_indicator(
-        "sharp_moves",
-        (ema_16_period, ma_50_period, sharp_move_lookback_candles),
-        _build_cross_sharp_moves,
-    )
 
     # you can use times for open/close orders
     # # ---- time filter mask (13:30 UTC close time) ----
@@ -693,6 +765,8 @@ def ma_strategy(
 
     # ---- MAIN ----
     for i in range(len(close_prices)):
+        if not independent_directions:
+            cooldowns['long'] = cooldowns['short'] = cooldown_until_index
         # A signal exists only after candle i closes, so it can be filled no
         # earlier than the next candle's open.
         execution_i = i + 1
@@ -742,39 +816,25 @@ def ma_strategy(
         if chart_data is not None:
             chart_data.append([i, total_money_static, total_money_dynamic])
 
-        if ema_16[i] is None or ma_50[i] is None or ma_100[i] is None or ma_200[i] is None:
+        long_ready = all(values[i] is not None for values in (long_ema_16, long_ma_50, long_ma_100, long_ma_200))
+        short_ready = all(values[i] is not None for values in (short_ema_16, short_ma_50, short_ma_100, short_ma_200))
+        if not long_ready and not short_ready:
             continue
-        
+
         for p in open_positions:
             if p.target_close_price_loss is None:
                 p.target_close_price_loss = p.entry_price
             if p.side == "long":
-                if close_prices[i] >= p.target_close_price_loss * (1 + loss_lock_step_pct):
-                    p.target_close_price_loss *= 1 + loss_lock_step_pct
+                if close_prices[i] >= p.target_close_price_loss * (1 + long_cfg.loss_lock_step_pct):
+                    p.target_close_price_loss *= 1 + long_cfg.loss_lock_step_pct
             elif p.side == "short":
-                if close_prices[i] <= p.target_close_price_loss * (1 - loss_lock_step_pct):
-                    p.target_close_price_loss *= 1 - loss_lock_step_pct
+                if close_prices[i] <= p.target_close_price_loss * (1 - short_cfg.loss_lock_step_pct):
+                    p.target_close_price_loss *= 1 - short_cfg.loss_lock_step_pct
 
-        # ----- Detect EMA16 / MA50 crosses (update cross state) -----
-        if i > 0 and ema_16[i-1] is not None and ma_50[i-1] is not None:
-            # bullish cross: EMA crosses above MA
-            if ema_16[i-1] <= ma_50[i-1] and ema_16[i] > ma_50[i]:
-                cross_seen = True
-                last_cross_dir = 'bull'
-                last_cross_index = i
-                (
-                    last_cross_strongest_up_move_pct,
-                    last_cross_strongest_down_move_pct,
-                ) = cross_sharp_moves[i]
-            # bearish cross: EMA crosses below MA
-            elif ema_16[i-1] >= ma_50[i-1] and ema_16[i] < ma_50[i]:
-                cross_seen = True
-                last_cross_dir = 'bear'
-                last_cross_index = i
-                (
-                    last_cross_strongest_up_move_pct,
-                    last_cross_strongest_down_move_pct,
-                ) = cross_sharp_moves[i]
+        if i in long_cross_events:
+            long_state.update(long_cross_events[i])
+        if short_state is not long_state and i in short_cross_events:
+            short_state.update(short_cross_events[i])
 
         # stop trading after N consecutive losses until next month starts
         if consecutive_losses_month_stop_filter and stop_trading_until_new_month_by_losses:
@@ -783,7 +843,7 @@ def ma_strategy(
                 loss_streak_until_month_stop = 0
             elif len(open_positions) == 0:
                 continue
-        
+
         # ===================== CHECK LIQUIDATION =====================
         liquidated_any = False
         for p in open_positions[:]:
@@ -808,7 +868,7 @@ def ma_strategy(
                     balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
                     remaining_open_equity=remaining_open_margin,
                 )
-                apply_account_state(account)
+                apply_account_state(account, 'long')
                 if liq_updates['liquidated']:
                     open_positions.remove(p)
                     liquidated_any = True
@@ -851,7 +911,7 @@ def ma_strategy(
                     balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
                     remaining_open_equity=remaining_open_margin,
                 )
-                apply_account_state(account)
+                apply_account_state(account, 'short')
                 if liq_updates['liquidated']:
                     open_positions.remove(p)
                     liquidated_any = True
@@ -883,14 +943,14 @@ def ma_strategy(
         if execution_i >= len(open_prices):
             continue
 
-        if rsi_trade_monthly_filter_on:
+        if long_cfg.rsi_trade_monthly_filter_on or short_cfg.rsi_trade_monthly_filter_on:
             # ---- close long when monthly filter is on
             long_positions_to_close = [
                 p for p in open_positions[:]
-                if p.side == "long" and p.reason == 'rsi_ma_strategy'
+                if p.side == "long" and p.reason == 'rsi_ma_strategy' and long_cfg.rsi_trade_monthly_filter_on
             ]
             for p in long_positions_to_close:
-                if rsi_list[i] >= rsi_long_close_monthly_profit or close_prices[i] >= p.entry_price * (1 + rsi_long_tp_pct) or close_prices[i] <= p.entry_price * (1 - rsi_long_sl_pct):
+                if long_rsi_list[i] >= rsi_long_close_monthly_profit or close_prices[i] >= p.entry_price * (1 + rsi_long_tp_pct) or close_prices[i] <= p.entry_price * (1 - rsi_long_sl_pct):
                     remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
                     remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
                     # remaining_open_equity = _open_positions_equity(close_prices[i], p)
@@ -900,7 +960,7 @@ def ma_strategy(
                     updates = trade_engine.close_long(
                         execution_i, open_prices, open_times, p, account,
                         fee_rate=fee_rate,
-                        cooldown_after_big_pnl=cooldown_after_big_pnl,
+                        cooldown_after_big_pnl=long_cfg.cooldown_after_big_pnl,
                         remaining_open_margin=remaining_open_margin,
                         remaining_open_margin_no_fee=remaining_open_margin_no_fee,
                         balance_before_close_snapshot=balance_before_close_batch,
@@ -909,12 +969,12 @@ def ma_strategy(
                         balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
                         remaining_open_equity=remaining_open_margin,
                     )
-                    apply_account_state(account)
+                    apply_account_state(account, 'long')
 
                     profit_order = updates['profit']
                     # remove position
                     open_positions.remove(p)
-                    
+
                     # sum all profits
                     rsi_profit_calculator += profit_order
 
@@ -926,12 +986,12 @@ def ma_strategy(
                             long_exit_reason_text = f"closed long when monthly filter is on and rsi is upper than: {rsi_long_close_monthly_profit}\n"
                             long_exit_reason_text += generate_close_reason_text(trade_id=p.trade_id, updates=updates)
                             long_close_reasons[execution_i] = long_exit_reason_text
-                    
+
                     # calculate last stop loss with rsi on mothly filter
-                    if rsi_cooldown_filter:
+                    if long_cfg.rsi_cooldown_filter:
                         if profit_order < 0:
-                            rsi_in_cooldown = True
-                            rsi_last_index_stop_loss_bar = i
+                            rsi_cooldowns['long']['rsi_in_cooldown'] = True
+                            rsi_cooldowns['long']['rsi_last_index_stop_loss_bar'] = i
 
                     # ---- RSI LONG STATS ----
                     rsi_long_total += 1
@@ -950,10 +1010,10 @@ def ma_strategy(
             # ---- close short when monthly filter is on
             short_positions_to_close = [
                 p for p in open_positions[:]
-                if p.side == "short" and p.reason == 'rsi_ma_strategy'
+                if p.side == "short" and p.reason == 'rsi_ma_strategy' and short_cfg.rsi_trade_monthly_filter_on
             ]
             for p in short_positions_to_close:
-                if rsi_list[i] <= rsi_short_close_monthly_profit or close_prices[i] <= p.entry_price * (1 - rsi_short_tp_pct) or close_prices[i] >= p.entry_price * (1 + rsi_short_sl_pct):
+                if short_rsi_list[i] <= rsi_short_close_monthly_profit or close_prices[i] <= p.entry_price * (1 - rsi_short_tp_pct) or close_prices[i] >= p.entry_price * (1 + rsi_short_sl_pct):
                     remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
                     remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
                     # remaining_open_equity = _open_positions_equity(close_prices[i], p)
@@ -963,7 +1023,7 @@ def ma_strategy(
                     updates = trade_engine.close_short(
                         execution_i, open_prices, open_times, p, account,
                         fee_rate=fee_rate,
-                        cooldown_after_big_pnl=cooldown_after_big_pnl,
+                        cooldown_after_big_pnl=short_cfg.cooldown_after_big_pnl,
                         remaining_open_margin=remaining_open_margin,
                         remaining_open_margin_no_fee=remaining_open_margin_no_fee,
                         balance_before_close_snapshot=balance_before_close_batch,
@@ -972,7 +1032,7 @@ def ma_strategy(
                         balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
                         remaining_open_equity=remaining_open_margin,
                     )
-                    apply_account_state(account)
+                    apply_account_state(account, 'short')
 
                     profit_order = updates['profit']
                     # remove position
@@ -988,12 +1048,12 @@ def ma_strategy(
                             short_exit_reason_text = f"closed short when monthly filter is on and rsi is lower than: {rsi_short_close_monthly_profit}\n"
                             short_exit_reason_text += generate_close_reason_text(trade_id=p.trade_id, updates=updates)
                             short_close_reasons[execution_i] = short_exit_reason_text
-                    
+
                     # calculate last stop loss with rsi on mothly filter
-                    if rsi_cooldown_filter:
+                    if short_cfg.rsi_cooldown_filter:
                         if profit_order < 0:
-                            rsi_in_cooldown = True
-                            rsi_last_index_stop_loss_bar = i
+                            rsi_cooldowns['short']['rsi_in_cooldown'] = True
+                            rsi_cooldowns['short']['rsi_last_index_stop_loss_bar'] = i
 
                     # ---- RSI SHORT STATS ----
                     rsi_short_total += 1
@@ -1030,49 +1090,49 @@ def ma_strategy(
                         save_money += rsi_profit_calculator
                         balance -= rsi_profit_calculator
                     rsi_profit_calculator = 0.0
-                    trade_power = True 
+                    trade_power = True
 
 
                 # ==== RSI OPEN LONG ====
-                if rsi_trade_monthly_filter_on:
+                if cfg.long_enabled and long_cfg.rsi_trade_monthly_filter_on:
 
                     momentum_up = (
                         close_prices[i] > close_prices[i-1]
                         and close_prices[i-1] > close_prices[i-2]
                     )
 
-                    lowest_rsi_last_n = min(rsi_list[i - lowest_rsi_last_n_value : i])
+                    lowest_rsi_last_n = min(long_rsi_list[i - long_cfg.lowest_rsi_last_n_value : i])
 
-                    rsi_now = rsi_list[i]
-                    rsi_prev = rsi_list[i-1]
+                    rsi_now = long_rsi_list[i]
+                    rsi_prev = long_rsi_list[i-1]
 
                     rsi_rejection_up = rsi_prev < rsi_now
 
                     rsi_distance_up = rsi_now - lowest_rsi_last_n
 
-                    if rsi_in_cooldown:
-                        if i > rsi_last_index_stop_loss_bar + rsi_cooldown_bars:
-                            rsi_in_cooldown = False
+                    if rsi_cooldowns['long']['rsi_in_cooldown']:
+                        if i > rsi_cooldowns['long']['rsi_last_index_stop_loss_bar'] + long_cfg.rsi_cooldown_bars:
+                            rsi_cooldowns['long']['rsi_in_cooldown'] = False
 
                     if (
                         lowest_rsi_last_n <= rsi_long_open_monthly_profit
-                        and rsi_now <= min(100, rsi_long_open_monthly_profit + rsi_entry_buffer)
+                        and rsi_now <= min(100, rsi_long_open_monthly_profit + long_cfg.rsi_entry_buffer)
                         and rsi_rejection_up
-                        and rsi_distance_up >= rsi_distance_threshold
+                        and rsi_distance_up >= long_cfg.rsi_distance_threshold
                         and momentum_up
-                        and len(open_positions) < rsi_max_open_trades
-                        and not rsi_in_cooldown
+                        and len(open_positions) < long_cfg.rsi_max_open_trades
+                        and not rsi_cooldowns['long']['rsi_in_cooldown']
                     ):
                         # ---- open long ----
                         account = capture_account_state()
                         updates = trade_engine.open_long(
                             execution_i, open_prices, open_times, account,
-                            trade_amount_percent=rsi_trade_amount_percent,
+                            trade_amount_percent=long_cfg.rsi_trade_amount_percent,
                             margin_balance=balance + sum(p.margin for p in open_positions),
                             margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
-                            leverage=rsi_leverage,
+                            leverage=long_cfg.rsi_leverage,
                         )
-                        apply_account_state(account)
+                        apply_account_state(account, 'long')
                         if updates is not None:
                             trade_reason = 'rsi_ma_strategy'
                             position = Position.from_open_result(
@@ -1085,7 +1145,7 @@ def ma_strategy(
                                 reason=trade_reason,
                             )
                             open_positions.append(position)
-                            
+
                             # open point on chart
                             if long_open_points is not None:
                                 long_open_points.append((execution_i, position.entry_price))
@@ -1095,52 +1155,52 @@ def ma_strategy(
                                     entry_reason_text = f"opened long when monthly filter is on and rsi is lower than: {rsi_long_open_monthly_profit}\n"
                                     entry_reason_text += generate_entry_reason_text(trade_id=position.trade_id, updates=updates)
                                     long_open_reasons[execution_i] = entry_reason_text
-                            
+
                             next_trade_id += 1
                             # record which cross enabled this trade and init trailing state
-                            last_trade_cross_index = last_cross_index
+                            long_state['last_trade_cross_index'] = long_state['last_cross_index']
                             updates = None
 
                 # ==== RSI OPEN SHORT ====
-                if rsi_trade_monthly_filter_on:
+                if cfg.short_enabled and short_cfg.rsi_trade_monthly_filter_on:
 
                     momentum_down = (
                         close_prices[i] < close_prices[i-1]
                         and close_prices[i-1] < close_prices[i-2]
                     )
 
-                    highest_rsi_last_n = max(rsi_list[i - highest_rsi_last_n_value : i])
+                    highest_rsi_last_n = max(short_rsi_list[i - short_cfg.highest_rsi_last_n_value : i])
 
-                    rsi_now = rsi_list[i]
-                    rsi_prev = rsi_list[i-1]
+                    rsi_now = short_rsi_list[i]
+                    rsi_prev = short_rsi_list[i-1]
 
                     rsi_rejection_down = rsi_prev > rsi_now
 
                     rsi_distance_down = highest_rsi_last_n - rsi_now
 
-                    if rsi_in_cooldown:
-                        if i > rsi_last_index_stop_loss_bar + rsi_cooldown_bars:
-                            rsi_in_cooldown = False
+                    if rsi_cooldowns['short']['rsi_in_cooldown']:
+                        if i > rsi_cooldowns['short']['rsi_last_index_stop_loss_bar'] + short_cfg.rsi_cooldown_bars:
+                            rsi_cooldowns['short']['rsi_in_cooldown'] = False
 
                     if (
                         highest_rsi_last_n >= rsi_short_open_monthly_profit
-                        and rsi_now >= max(0, rsi_short_open_monthly_profit - rsi_entry_buffer)
+                        and rsi_now >= max(0, rsi_short_open_monthly_profit - short_cfg.rsi_entry_buffer)
                         and rsi_rejection_down
-                        and rsi_distance_down >= rsi_distance_threshold
+                        and rsi_distance_down >= short_cfg.rsi_distance_threshold
                         and momentum_down
-                        and len(open_positions) < rsi_max_open_trades
-                        and not rsi_in_cooldown
+                        and len(open_positions) < short_cfg.rsi_max_open_trades
+                        and not rsi_cooldowns['short']['rsi_in_cooldown']
                     ):
                         # ---- open short ----
                         account = capture_account_state()
                         updates = trade_engine.open_short(
                             execution_i, open_prices, open_times, account,
-                            trade_amount_percent=rsi_trade_amount_percent,
+                            trade_amount_percent=short_cfg.rsi_trade_amount_percent,
                             margin_balance=balance + sum(p.margin for p in open_positions),
                             margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
-                            leverage=rsi_leverage,
+                            leverage=short_cfg.rsi_leverage,
                         )
-                        apply_account_state(account)
+                        apply_account_state(account, 'short')
                         if updates is not None:
                             trade_reason = 'rsi_ma_strategy'
                             position = Position.from_open_result(
@@ -1153,7 +1213,7 @@ def ma_strategy(
                                 reason=trade_reason,
                             )
                             open_positions.append(position)
-                            
+
                             # open point on chart
                             if short_open_points is not None:
                                 short_open_points.append((execution_i, position.entry_price))
@@ -1166,19 +1226,20 @@ def ma_strategy(
 
                             next_trade_id += 1
                             # record which cross enabled this trade and init trailing state
-                            last_trade_cross_index = last_cross_index
+                            short_state['last_trade_cross_index'] = short_state['last_cross_index']
                             updates = None
 
 
                 if not any(p.reason != "rsi_ma_strategy" for p in open_positions):
                     continue
-        
+
         # cooldown after good profit
-        if i < cooldown_until_index and len(open_positions) == 0:
+        if i < min(cooldowns.values()) and len(open_positions) == 0:
             continue
-        
+
         # Calculate MA Distance
-        ma_distance = abs(ema_16[i] - ma_50[i]) / ma_50[i]
+        long_ma_distance = abs(long_ema_16[i] - long_ma_50[i]) / long_ma_50[i] if long_ready else 0.0
+        short_ma_distance = abs(short_ema_16[i] - short_ma_50[i]) / short_ma_50[i] if short_ready else 0.0
 
         # Calculate Distance New Candle Move and Last Candle Move
         if i > 0:
@@ -1196,942 +1257,967 @@ def ma_strategy(
 
 
 
-        # ===================== OPEN LONG =====================
-        # Require that EMA/MA50 have crossed and the last cross was bullish,
-        # and avoid opening multiple trades for the same cross.
-        if not open_positions and i >= cooldown_until_index:
-            if cross_seen and last_trade_cross_index != last_cross_index:
+        skip_remaining_candle = False
+        for _long_pass in (None,):
+            if not long_ready:
+                break
+            # ===================== OPEN LONG =====================
+            # Require that EMA/MA50 have crossed and the last cross was bullish,
+            # and avoid opening multiple trades for the same cross.
+            if cfg.long_enabled and not open_positions and i >= cooldowns['long']:
+                if long_state['cross_seen'] and long_state['last_trade_cross_index'] != long_state['last_cross_index']:
 
-                entry_score = 0
-                entry_reasons = []
+                    entry_score = 0
+                    entry_reasons = []
 
-                # ===== ATR ENTRY FILTER =====
-                if atr_filter == True:
-                    if atr[i] is None or atr_ma[i] is None:
-                        continue
+                    # ===== ATR ENTRY FILTER =====
+                    if long_cfg.atr_filter == True:
+                        if long_atr[i] is None or long_atr_ma[i] is None:
+                            skip_remaining_candle = not independent_directions
+                            continue
 
-                    atr_ratio = atr[i] / atr_ma[i]
+                        atr_ratio = long_atr[i] / long_atr_ma[i]
 
-                    if atr_ratio < entry_atr_threshold:
-                        continue
+                        if atr_ratio < long_cfg.entry_atr_threshold:
+                            skip_remaining_candle = not independent_directions
+                            continue
+
+                    # ---- Positive Scores ----
+                    # 1) CONFIRMED BULL CROSS
+                    if long_state['last_cross_dir'] == 'bull' and long_state['last_cross_index'] is not None:
+                        # wait at least 1 candle after cross
+                        if i > long_state['last_cross_index']:
+                            # price acceptance above EMA after cross
+                            if close_prices[i] > long_ema_16[i]:
+                                entry_score += long_cfg.entry_score_cross
+                                entry_reasons.append(("Bull cross confirmed above EMA16", long_cfg.entry_score_cross))
+                    # 2) EMA 14 > Ma 50
+                    if long_ema_16[i] > long_ma_50[i]:
+                        entry_score += long_cfg.entry_score_ema_vs_ma50
+                        entry_reasons.append(("EMA16 above MA50", long_cfg.entry_score_ema_vs_ma50))
+                    # 3) Ma 130 > Ma 200
+                    if long_ma_100[i] >= long_ma_200[i]:
+                        entry_score += long_cfg.entry_score_ma_trend
+                        entry_reasons.append(("MA100 above/equal MA200", long_cfg.entry_score_ma_trend))
+                    # 4) ma_distance or last_candle_move is strong
+                    if long_ma_distance > long_cfg.ma_distance_threshold or last_candle_move > long_cfg.candle_move_threshold:
+                        entry_score += long_cfg.entry_score_ma_distance_or_candle
+                        entry_reasons.append(("Momentum strength (MA distance or candle move)", long_cfg.entry_score_ma_distance_or_candle))
+                    # 5) ===== ADX FILTER =====
+                    if long_cfg.adx_filter == True :
+                        if long_adx[i] != None and long_adx[i] >= long_cfg.entry_adx_threshold:
+                            entry_score += long_cfg.entry_score_adx
+                            entry_reasons.append(("ADX strength confirmation", long_cfg.entry_score_adx))
+                    # 6) ===== VOLUME FILTER =====
+                    if long_cfg.volume_filter:
+                        vol_now = volume_prices[i]
+                        vol_avg15 = long_vol_avg_15_list[i]
+                        if vol_now >= long_cfg.volume_spike_multiplier * vol_avg15:
+                            entry_score += long_cfg.entry_score_volume
+                            entry_reasons.append(("Volume spike confirmation", long_cfg.entry_score_volume))
+                    # ---- Negative Scores (late-entry guard)
+                    # 1) only penalize when a sharp move already happened AND price is overextended AND momentum is cooling
+                    if i >= long_cfg.impulse_lookback:
+                        impulse_pct = (close_prices[i] / close_prices[i - long_cfg.impulse_lookback] - 1.0) * 100
+                        if impulse_pct > long_cfg.impulse_move_threshold_pct:
+                            if long_atr[i] is not None and long_atr[i] > 0:
+                                extension = (close_prices[i] - long_ema_16[i]) / long_atr[i]
+                                overextended = extension > long_cfg.late_entry_atr_mult
+                            else:
+                                extension = (close_prices[i] - long_ema_16[i]) / long_ema_16[i]
+                                overextended = extension > long_cfg.late_entry_ema_pct
+
+                            body_now = close_prices[i] - open_prices[i]
+                            body_prev = close_prices[i - 1] - open_prices[i - 1]
+                            cooling = (body_now <= 0) or (body_prev > 0 and body_now < body_prev * long_cfg.late_entry_body_ratio)
+
+                            if overextended and cooling:
+                                entry_score -= long_cfg.entry_late_penalty
+                                entry_reasons.append(("Late-entry penalty: overextended + cooling", -long_cfg.entry_late_penalty))
+
+                    if entry_score >= long_cfg.entry_score_threshold:
+                        # ===== SKIP LOGIC =====
+                        if skip_logic and skip_trades_left > 0:
+                            skip_trades_left -= 1
+                            long_state['last_trade_cross_index'] = long_state['last_cross_index']
+                            TradeEngine.display(verbose, f"⏭️ SKIP LONG | skips left: {skip_trades_left}")
+                            skip_remaining_candle = not independent_directions
+                            continue
+                        entry_reason_text = build_score_reason_text(
+                            "LONG ENTRY SCORE REASONS",
+                            entry_reasons,
+                            entry_score,
+                            long_cfg.entry_score_threshold,
+                        )
+
+                        # ---- open long ----
+                        account = capture_account_state()
+                        updates = trade_engine.open_long(
+                            execution_i, open_prices, open_times, account,
+                            trade_amount_percent=long_cfg.trade_amount_percent,
+                            margin_balance=balance + sum(p.margin for p in open_positions),
+                            margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
+                            leverage=_directional_leverage(long_cfg, balance + sum(p.margin for p in open_positions), tactical_balance),
+                        )
+                        apply_account_state(account, 'long')
+                        if updates is not None:
+                            trade_reason = 'ma_strategy'
+                            position = Position.from_open_result(
+                                updates,
+                                trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                                side="long",
+                                entry_index=execution_i,
+                                high_price=open_prices[execution_i],
+                                low_price=open_prices[execution_i],
+                                reason=trade_reason,
+                            )
+                            open_positions.append(position)
+
+                            # open point on chart
+                            if long_open_points is not None:
+                                long_open_points.append((execution_i, position.entry_price))
+                                # open reason text
+                                if long_open_reasons is not None:
+                                    # default texts
+                                    entry_reason_text += generate_entry_reason_text(trade_id=position.trade_id, updates=updates)
+                                    long_open_reasons[execution_i] = entry_reason_text
+
+                            next_trade_id += 1
+                            # record which cross enabled this trade and init trailing state
+                            long_state['last_trade_cross_index'] = long_state['last_cross_index']
+                            updates = None
+
+            # ===================== SCALE ENTRY LONG =====================
+            if (
+                long_cfg.scale_in_enabled
+                and len(open_positions) < long_cfg.max_open_trades
+                and open_positions
+                and all(p.side == "long" for p in open_positions)
+                and i >= cooldowns['long']
+            ):
+                first_long_position = min(
+                    (p for p in open_positions
+                     if p.side == "long" and p.entry_index <= i),
+                    key=lambda x: x.entry_index,
+                    default=None
+                )
+                if first_long_position is not None:
+                    first_long_entry_price = first_long_position.entry_price
+                    long_scale_entry_profit_trigger_price = first_long_entry_price * (1 + long_cfg.scale_entry_profit_trigger_pct)
+                    long_scale_entry_loss_trigger_price = first_long_entry_price * (1 - long_cfg.scale_entry_loss_trigger_pct)
+                    long_scale_entry_reason = None
+                    if long_cfg.scale_entry_on_profit_enabled and close_prices[i] >= long_scale_entry_profit_trigger_price:
+                        long_scale_entry_reason = "profit"
+                    elif long_cfg.scale_entry_on_loss_enabled and close_prices[i] <= long_scale_entry_loss_trigger_price:
+                        long_scale_entry_reason = "loss"
+
+                    # count number of scales
+                    if long_scale_entry_reason == "profit":
+                        long_profit_scale_entry_attempts += 1
+                    elif long_scale_entry_reason == "loss":
+                        long_loss_scale_entry_attempts += 1
+
+                    long_profit_scale_entry_score = 0
+                    if long_scale_entry_reason == "profit" and long_cfg.profit_scale_entry_filter_enabled:
+                        # validate profit scale entry quality before adding to a winning position.
+                        if long_ema_16[i] > long_ma_50[i]:
+                            long_profit_scale_entry_score += 1
+                        if long_ma_100[i] > long_ma_200[i]:
+                            long_profit_scale_entry_score += 1
+                        if i > 0 and close_prices[i] > open_prices[i] and close_prices[i] > close_prices[i - 1]:
+                            long_profit_scale_entry_score += 1
+                        if long_atr[i] is not None and long_atr_ma[i] is not None and long_atr_ma[i] > 0:
+                            long_scale_entry_atr_ratio = long_atr[i] / long_atr_ma[i]
+                            if long_scale_entry_atr_ratio >= long_cfg.profit_scale_entry_atr_ratio_min:
+                                long_profit_scale_entry_score += 1
+                        if long_cfg.volume_filter:
+                            vol_now = volume_prices[i]
+                            vol_avg15 = long_vol_avg_15_list[i]
+                            if vol_now >= long_cfg.volume_spike_multiplier * vol_avg15:
+                                long_profit_scale_entry_score += 2
+                        if long_profit_scale_entry_score < long_cfg.profit_scale_entry_min_score:
+                            long_filtered_profit_scale_entries += 1
+                            long_scale_entry_reason = None
+
+                    if long_scale_entry_reason is not None:
+                        account = capture_account_state()
+                        updates = trade_engine.open_long(
+                            execution_i, open_prices, open_times, account,
+                            trade_amount_percent=long_cfg.scale_entry_amount_percent,
+                            margin_balance=balance + sum(p.margin for p in open_positions),
+                            margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
+                            leverage=_directional_leverage(long_cfg, balance + sum(p.margin for p in open_positions), tactical_balance),
+                        )
+                        apply_account_state(account, 'long')
+                        if updates is not None:
+
+                            # count profits, losses Scales
+                            if long_scale_entry_reason == "profit":
+                                long_profit_scale_entries += 1
+                            elif long_scale_entry_reason == "loss":
+                                long_loss_scale_entries += 1
+
+                            trade_reason = 'scale_ma_strategy'
+                            position = Position.from_open_result(
+                                updates,
+                                trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                                side="long",
+                                entry_index=execution_i,
+                                high_price=open_prices[execution_i],
+                                low_price=open_prices[execution_i],
+                                reason=trade_reason,
+                            )
+                            open_positions.append(position)
+                            next_trade_id += 1
+                            if long_open_points is not None:
+                                long_open_points.append((execution_i, position.entry_price))
+                                if long_open_reasons is not None:
+                                    long_scale_entry_text = (
+                                        f"LONG SCALE ENTRY\n"
+                                        f"Order size: {long_cfg.scale_entry_amount_percent*100:.2f}%\n"
+                                    )
+                                    if long_scale_entry_reason == "profit":
+                                        long_scale_entry_text += (
+                                            f"Price moved +{long_cfg.scale_entry_profit_trigger_pct*100:.2f}% from first LONG entry."
+                                        )
+
+                                        if long_cfg.profit_scale_entry_filter_enabled:
+                                            long_scale_entry_text += (
+                                                f"\nProfit filter score: {long_profit_scale_entry_score}/{long_cfg.profit_scale_entry_min_score}"
+                                            )
+
+                                    elif long_scale_entry_reason == "loss":
+                                        long_scale_entry_text += (
+                                            f"Price moved -{long_cfg.scale_entry_loss_trigger_pct*100:.2f}% from first LONG entry."
+                                        )
+
+                                    long_scale_entry_text += "\n\n" + generate_entry_reason_text(
+                                        trade_id=position.trade_id, updates=updates
+                                    )
+
+                                    long_open_reasons[execution_i] = long_scale_entry_text
+
+                        updates = None
+
+
+            # ===================== CLOSE LONG =====================
+            close_all_longs = False
+            long_exit_reason_text = None
+            for p in open_positions[:]:
+                if p.side != "long":
+                    continue
+                if p.entry_index is not None and p.entry_index > i:
+                    continue
+                exit_score = 0
+                exit_reasons = []
+                entry_price = p.entry_price
+
+                if p.highest_since_entry is None:
+                    p.highest_since_entry = entry_price
+                if high_prices[i] > p.highest_since_entry:
+                    p.highest_since_entry = high_prices[i]
 
                 # ---- Positive Scores ----
-                # 1) CONFIRMED BULL CROSS
-                if last_cross_dir == 'bull' and last_cross_index is not None:
-                    # wait at least 1 candle after cross
-                    if i > last_cross_index:
-                        # price acceptance above EMA after cross
-                        if close_prices[i] > ema_16[i]:
-                            entry_score += entry_score_cross
-                            entry_reasons.append(("Bull cross confirmed above EMA16", entry_score_cross))
-                # 2) EMA 14 > Ma 50
-                if ema_16[i] > ma_50[i]:
-                    entry_score += entry_score_ema_vs_ma50
-                    entry_reasons.append(("EMA16 above MA50", entry_score_ema_vs_ma50))
-                # 3) Ma 130 > Ma 200
-                if ma_100[i] >= ma_200[i]:
-                    entry_score += entry_score_ma_trend
-                    entry_reasons.append(("MA100 above/equal MA200", entry_score_ma_trend))
-                # 4) ma_distance or last_candle_move is strong
-                if ma_distance > ma_distance_threshold or last_candle_move > candle_move_threshold:
-                    entry_score += entry_score_ma_distance_or_candle
-                    entry_reasons.append(("Momentum strength (MA distance or candle move)", entry_score_ma_distance_or_candle))
-                # 5) ===== ADX FILTER =====
-                if adx_filter == True :
-                    if adx[i] != None and adx[i] >= entry_adx_threshold:
-                        entry_score += entry_score_adx
-                        entry_reasons.append(("ADX strength confirmation", entry_score_adx))
-                # 6) ===== VOLUME FILTER =====
-                if volume_filter:
-                    vol_now = volume_prices[i]
-                    vol_avg15 = vol_avg_15_list[i]
-                    if vol_now >= volume_spike_multiplier * vol_avg15:
-                        entry_score += entry_score_volume
-                        entry_reasons.append(("Volume spike confirmation", entry_score_volume))
-                # ---- Negative Scores (late-entry guard)
-                # 1) only penalize when a sharp move already happened AND price is overextended AND momentum is cooling
-                if i >= impulse_lookback:
-                    impulse_pct = (close_prices[i] / close_prices[i - impulse_lookback] - 1.0) * 100
-                    if impulse_pct > impulse_move_threshold_pct:
-                        if atr[i] is not None and atr[i] > 0:
-                            extension = (close_prices[i] - ema_16[i]) / atr[i]
-                            overextended = extension > late_entry_atr_mult
+                # 1) LOSS GUARD (based on dynamic loss-lock line)
+                if p.target_close_price_loss is not None:
+                    loss_pct = (p.target_close_price_loss - close_prices[i]) / p.target_close_price_loss
+                    if loss_pct >= long_cfg.loss_exit_pct_2:
+                        exit_score += long_cfg.exit_score_loss_guard_2
+                        exit_reasons.append((f"Loss guard triggered ({long_cfg.loss_exit_pct_2*100:.0f}%+ loss)", long_cfg.exit_score_loss_guard_2))
+                    if loss_pct >= long_cfg.loss_exit_pct_1:
+                        exit_score += long_cfg.exit_score_loss_guard_1
+                        exit_reasons.append((f"Loss guard triggered ({long_cfg.loss_exit_pct_1*100:.0f}%+ loss)", long_cfg.exit_score_loss_guard_1))
+
+                # 2) PROFIT GUARD
+                profit_pct = (close_prices[i] - entry_price) / entry_price
+                if profit_pct >= long_cfg.profit_exit_pct_2:
+                    exit_score += long_cfg.exit_score_profit_guard_2
+                    exit_reasons.append((f"Profit guard triggered ({long_cfg.profit_exit_pct_2*100:.0f}%+ profit)", long_cfg.exit_score_profit_guard_2))
+                if profit_pct >= long_cfg.profit_exit_pct_1:
+                    exit_score += long_cfg.exit_score_profit_guard_1
+                    exit_reasons.append((f"Profit guard triggered ({long_cfg.profit_exit_pct_1*100:.0f}%+ profit)", long_cfg.exit_score_profit_guard_1))
+
+                # 3) EMA SLOPE WEAKNESS
+                if i - long_cfg.slope_window >= 0 and long_ema_16[i] < long_ema_16[i - long_cfg.slope_window]:
+                    exit_score += long_cfg.exit_score_ema_slope
+                    exit_reasons.append(("EMA16 slope weakness", long_cfg.exit_score_ema_slope))
+                # 4) EMA16 CROSSED BELOW MA50
+                if long_ema_16[i] < long_ma_50[i]:
+                    exit_score += long_cfg.exit_score_ema_cross
+                    exit_reasons.append(("EMA16 crossed below MA50", long_cfg.exit_score_ema_cross))
+                # 5) MA TREND WEAKNESS (MA100 < MA200)
+                if long_ma_100[i] < long_ma_200[i]:
+                    exit_score += long_cfg.exit_score_ma_trend
+                    exit_reasons.append(("MA100 below MA200", long_cfg.exit_score_ma_trend))
+
+                # 6) TRAILING RETRACE EXIT
+                if p.entry_index is not None and i > p.entry_index:
+                    if p.highest_since_entry >= entry_price * (1 + long_cfg.trail_activate_pct):
+                        if close_prices[i] <= p.highest_since_entry * (1 - long_cfg.trail_retrace_pct):
+                            exit_score += long_cfg.exit_score_trailing
+                            exit_reasons.append(("Trailing retrace exit", long_cfg.exit_score_trailing))
+
+                # 7) ADX WEAKENING EXIT
+                if i - long_cfg.adx_exit_lookback >= 0:
+                    adx_now = long_adx[i]
+                    adx_prev = long_adx[i - long_cfg.adx_exit_lookback]
+                    if adx_now is not None and adx_prev is not None:
+                        if np.isfinite(adx_now) and np.isfinite(adx_prev):
+                            if adx_now < long_cfg.adx_exit_threshold and adx_now < adx_prev:
+                                exit_score += long_cfg.exit_score_adx
+                                exit_reasons.append(("ADX weakening", long_cfg.exit_score_adx))
+
+                # 8) STRONG OPPOSITE CANDLE
+                if long_atr[i] is not None and long_atr[i] > 0:
+                    if close_prices[i] < open_prices[i]:
+                        body = open_prices[i] - close_prices[i]
+                        if body >= long_atr[i] * long_cfg.opposite_atr_body_mult:
+                            exit_score += long_cfg.exit_score_opposite_candle
+                            exit_reasons.append(("Strong opposite bearish candle", long_cfg.exit_score_opposite_candle))
+
+                # Negative Scores:
+                # 1) POST-CROSS SHARP-MOVE PENALTY
+                if long_state['last_cross_index'] is not None and i > long_state['last_cross_index'] and long_cfg.post_cross_penalty_candles > 0:
+                    candles_since_cross = i - long_state['last_cross_index']
+                    if (
+                        long_state['last_cross_strongest_up_move_pct'] >= long_cfg.sharp_move_threshold_pct
+                        and candles_since_cross < long_cfg.post_cross_penalty_candles
+                        and long_ema_16[i] < long_ma_50[i]
+                    ):
+                        exit_score -= long_cfg.post_cross_penalty_score
+                        penalty_reason_text = (
+                            f"Post-cross sharp-move penalty ({candles_since_cross} candles since cross, "
+                            f"up-move={long_state['last_cross_strongest_up_move_pct']:.2f}%)"
+                        )
+                        exit_reasons.append((penalty_reason_text, -long_cfg.post_cross_penalty_score))
+                        if penalty_long_points is not None:
+                            penalty_long_points.append((i, close_prices[i]))
+                            if penalty_long_reasons is not None:
+                                penalty_long_reasons[i] = (
+                                    f"LONG penalty marker\n{penalty_reason_text}\nScore impact: -{long_cfg.post_cross_penalty_score}"
+                                )
+
+                if exit_score >= long_cfg.exit_score_threshold:
+                    long_exit_reason_text = build_score_reason_text(
+                        "LONG EXIT SCORE REASONS",
+                        exit_reasons,
+                        exit_score,
+                        long_cfg.exit_score_threshold,
+                    )
+                    close_all_longs = True
+                    break
+
+            if close_all_longs:
+                long_positions_to_close = [
+                    p for p in open_positions[:]
+                    if p.side == "long" and p.entry_index <= i
+                ]
+                for p in long_positions_to_close:
+                    remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
+                    remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
+                    # remaining_open_equity = _open_positions_equity(close_prices[i], p)
+                    close_price = open_prices[execution_i]
+                    account = capture_account_state()
+                    updates = trade_engine.close_long(
+                        execution_i, open_prices, open_times, p, account,
+                        fee_rate=fee_rate,
+                        cooldown_after_big_pnl=long_cfg.cooldown_after_big_pnl,
+                        remaining_open_margin=remaining_open_margin,
+                        remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                        balance_before_close_snapshot=balance_before_close_batch,
+                        balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                        balance_before_log_override=p.balance_before_trade,
+                        balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
+                        remaining_open_equity=remaining_open_margin,
+                    )
+                    apply_account_state(account, 'long')
+
+                    # count profit,loss scales positions
+                    if p.get('reason') == 'scale_ma_strategy':
+                        scale_ma_long_total += 1
+                        scale_ma_long_total_profit += updates['profit']
+
+                        if updates['profit'] > 0:
+                            scale_ma_long_wins += 1
                         else:
-                            extension = (close_prices[i] - ema_16[i]) / ema_16[i]
-                            overextended = extension > late_entry_ema_pct
+                            scale_ma_long_losses += 1
+                    # remove position
+                    open_positions.remove(p)
 
-                        body_now = close_prices[i] - open_prices[i]
-                        body_prev = close_prices[i - 1] - open_prices[i - 1]
-                        cooling = (body_now <= 0) or (body_prev > 0 and body_now < body_prev * late_entry_body_ratio)
+                    # close point on chart
+                    if long_close_points is not None:
+                        long_close_points.append((execution_i, close_price))
+                        # close reason text
+                        if long_close_reasons is not None:
+                            long_exit_reason_text += generate_close_reason_text(trade_id=p.trade_id, updates=updates)
+                            if len(long_positions_to_close) > 1:
+                                long_close_reasons[execution_i] = f"\n{long_exit_reason_text}\nBatch close: all open LONG positions closed together."
+                            else:
+                                long_close_reasons[execution_i] = long_exit_reason_text
 
-                        if overextended and cooling:
-                            entry_score -= entry_late_penalty
-                            entry_reasons.append(("Late-entry penalty: overextended + cooling", -entry_late_penalty))
-
-                if entry_score >= entry_score_threshold:
-                    # ===== SKIP LOGIC =====
-                    if skip_logic and skip_trades_left > 0:
-                        skip_trades_left -= 1
-                        last_trade_cross_index = last_cross_index
-                        TradeEngine.display(verbose, f"⏭️ SKIP LONG | skips left: {skip_trades_left}")
-                        continue
-                    entry_reason_text = build_score_reason_text(
-                        "LONG ENTRY SCORE REASONS",
-                        entry_reasons,
-                        entry_score,
-                        entry_score_threshold,
-                    )
-
-                    # ---- open long ----
-                    account = capture_account_state()
-                    updates = trade_engine.open_long(
-                        execution_i, open_prices, open_times, account,
-                        trade_amount_percent=trade_amount_percent,
-                        margin_balance=balance + sum(p.margin for p in open_positions),
-                        margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
-                        leverage=None,
-                    )
-                    apply_account_state(account)
-                    if updates is not None:
-                        trade_reason = 'ma_strategy'
-                        position = Position.from_open_result(
-                            updates,
-                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
-                            side="long",
-                            entry_index=execution_i,
-                            high_price=open_prices[execution_i],
-                            low_price=open_prices[execution_i],
-                            reason=trade_reason,
-                        )
-                        open_positions.append(position)
-                        
-                        # open point on chart
-                        if long_open_points is not None:
-                            long_open_points.append((execution_i, position.entry_price))
-                            # open reason text
-                            if long_open_reasons is not None:
-                                # default texts
-                                entry_reason_text += generate_entry_reason_text(trade_id=position.trade_id, updates=updates)
-                                long_open_reasons[execution_i] = entry_reason_text
-                        
-                        next_trade_id += 1
-                        # record which cross enabled this trade and init trailing state
-                        last_trade_cross_index = last_cross_index
-                        updates = None
-
-        # ===================== SCALE ENTRY LONG =====================
-        if (
-            scale_in_enabled
-            and len(open_positions) < max_open_trades
-            and open_positions
-            and all(p.side == "long" for p in open_positions)
-            and i >= cooldown_until_index
-        ):
-            first_long_position = min(
-                (p for p in open_positions
-                 if p.side == "long" and p.entry_index <= i),
-                key=lambda x: x.entry_index,
-                default=None
-            )
-            if first_long_position is not None:
-                first_long_entry_price = first_long_position.entry_price
-                long_scale_entry_profit_trigger_price = first_long_entry_price * (1 + scale_entry_profit_trigger_pct)
-                long_scale_entry_loss_trigger_price = first_long_entry_price * (1 - scale_entry_loss_trigger_pct)
-                long_scale_entry_reason = None
-                if scale_entry_on_profit_enabled and close_prices[i] >= long_scale_entry_profit_trigger_price:
-                    long_scale_entry_reason = "profit"
-                elif scale_entry_on_loss_enabled and close_prices[i] <= long_scale_entry_loss_trigger_price:
-                    long_scale_entry_reason = "loss"
-
-                # count number of scales
-                if long_scale_entry_reason == "profit":
-                    long_profit_scale_entry_attempts += 1
-                elif long_scale_entry_reason == "loss":
-                    long_loss_scale_entry_attempts += 1
-
-                long_profit_scale_entry_score = 0
-                if long_scale_entry_reason == "profit" and profit_scale_entry_filter_enabled:
-                    # validate profit scale entry quality before adding to a winning position.
-                    if ema_16[i] > ma_50[i]:
-                        long_profit_scale_entry_score += 1
-                    if ma_100[i] > ma_200[i]:
-                        long_profit_scale_entry_score += 1
-                    if i > 0 and close_prices[i] > open_prices[i] and close_prices[i] > close_prices[i - 1]:
-                        long_profit_scale_entry_score += 1
-                    if atr[i] is not None and atr_ma[i] is not None and atr_ma[i] > 0:
-                        long_scale_entry_atr_ratio = atr[i] / atr_ma[i]
-                        if long_scale_entry_atr_ratio >= profit_scale_entry_atr_ratio_min:
-                            long_profit_scale_entry_score += 1
-                    if volume_filter:
-                        vol_now = volume_prices[i]
-                        vol_avg15 = vol_avg_15_list[i]
-                        if vol_now >= volume_spike_multiplier * vol_avg15:
-                            long_profit_scale_entry_score += 2
-                    if long_profit_scale_entry_score < profit_scale_entry_min_score:
-                        long_filtered_profit_scale_entries += 1
-                        long_scale_entry_reason = None
-
-                if long_scale_entry_reason is not None:
-                    account = capture_account_state()
-                    updates = trade_engine.open_long(
-                        execution_i, open_prices, open_times, account,
-                        trade_amount_percent=scale_entry_amount_percent,
-                        margin_balance=balance + sum(p.margin for p in open_positions),
-                        margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
-                        leverage=None,
-                    )
-                    apply_account_state(account)
-                    if updates is not None:
-
-                        # count profits, losses Scales
-                        if long_scale_entry_reason == "profit":
-                            long_profit_scale_entries += 1
-                        elif long_scale_entry_reason == "loss":
-                            long_loss_scale_entries += 1
-                        
-                        trade_reason = 'scale_ma_strategy'
-                        position = Position.from_open_result(
-                            updates,
-                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
-                            side="long",
-                            entry_index=execution_i,
-                            high_price=open_prices[execution_i],
-                            low_price=open_prices[execution_i],
-                            reason=trade_reason,
-                        )
-                        open_positions.append(position)
-                        next_trade_id += 1
-                        if long_open_points is not None:
-                            long_open_points.append((execution_i, position.entry_price))
-                            if long_open_reasons is not None:
-                                long_scale_entry_text = (
-                                    f"LONG SCALE ENTRY\n"
-                                    f"Order size: {scale_entry_amount_percent*100:.2f}%\n"
-                                )
-                                if long_scale_entry_reason == "profit":
-                                    long_scale_entry_text += (
-                                        f"Price moved +{scale_entry_profit_trigger_pct*100:.2f}% from first LONG entry."
-                                    )
-
-                                    if profit_scale_entry_filter_enabled:
-                                        long_scale_entry_text += (
-                                            f"\nProfit filter score: {long_profit_scale_entry_score}/{profit_scale_entry_min_score}"
-                                        )
-
-                                elif long_scale_entry_reason == "loss":
-                                    long_scale_entry_text += (
-                                        f"Price moved -{scale_entry_loss_trigger_pct*100:.2f}% from first LONG entry."
-                                    )
-
-                                long_scale_entry_text += "\n\n" + generate_entry_reason_text(
-                                    trade_id=position.trade_id, updates=updates
-                                )
-
-                                long_open_reasons[execution_i] = long_scale_entry_text
-                                
                     updates = None
 
-
-        # ===================== CLOSE LONG =====================
-        close_all_longs = False
-        long_exit_reason_text = None
-        for p in open_positions[:]:
-            if p.side != "long":
-                continue
-            if p.entry_index is not None and p.entry_index > i:
-                continue
-            exit_score = 0
-            exit_reasons = []
-            entry_price = p.entry_price
-
-            if p.highest_since_entry is None:
-                p.highest_since_entry = entry_price
-            if high_prices[i] > p.highest_since_entry:
-                p.highest_since_entry = high_prices[i]
-
-            # ---- Positive Scores ----
-            # 1) LOSS GUARD (based on dynamic loss-lock line)
-            if p.target_close_price_loss is not None:
-                loss_pct = (p.target_close_price_loss - close_prices[i]) / p.target_close_price_loss
-                if loss_pct >= loss_exit_pct_2:
-                    exit_score += exit_score_loss_guard_2
-                    exit_reasons.append((f"Loss guard triggered ({loss_exit_pct_2*100:.0f}%+ loss)", exit_score_loss_guard_2))
-                if loss_pct >= loss_exit_pct_1:
-                    exit_score += exit_score_loss_guard_1
-                    exit_reasons.append((f"Loss guard triggered ({loss_exit_pct_1*100:.0f}%+ loss)", exit_score_loss_guard_1))
-
-            # 2) PROFIT GUARD
-            profit_pct = (close_prices[i] - entry_price) / entry_price
-            if profit_pct >= profit_exit_pct_2:
-                exit_score += exit_score_profit_guard_2
-                exit_reasons.append((f"Profit guard triggered ({profit_exit_pct_2*100:.0f}%+ profit)", exit_score_profit_guard_2))
-            if profit_pct >= profit_exit_pct_1:
-                exit_score += exit_score_profit_guard_1
-                exit_reasons.append((f"Profit guard triggered ({profit_exit_pct_1*100:.0f}%+ profit)", exit_score_profit_guard_1))
-
-            # 3) EMA SLOPE WEAKNESS
-            if i - slope_window >= 0 and ema_16[i] < ema_16[i - slope_window]:
-                exit_score += exit_score_ema_slope
-                exit_reasons.append(("EMA16 slope weakness", exit_score_ema_slope))
-            # 4) EMA16 CROSSED BELOW MA50
-            if ema_16[i] < ma_50[i]:
-                exit_score += exit_score_ema_cross
-                exit_reasons.append(("EMA16 crossed below MA50", exit_score_ema_cross))
-            # 5) MA TREND WEAKNESS (MA100 < MA200)
-            if ma_100[i] < ma_200[i]:
-                exit_score += exit_score_ma_trend
-                exit_reasons.append(("MA100 below MA200", exit_score_ma_trend))
-
-            # 6) TRAILING RETRACE EXIT
-            if p.entry_index is not None and i > p.entry_index:
-                if p.highest_since_entry >= entry_price * (1 + trail_activate_pct):
-                    if close_prices[i] <= p.highest_since_entry * (1 - trail_retrace_pct):
-                        exit_score += exit_score_trailing
-                        exit_reasons.append(("Trailing retrace exit", exit_score_trailing))
-
-            # 7) ADX WEAKENING EXIT
-            if i - adx_exit_lookback >= 0:
-                adx_now = adx[i]
-                adx_prev = adx[i - adx_exit_lookback]
-                if adx_now is not None and adx_prev is not None:
-                    if np.isfinite(adx_now) and np.isfinite(adx_prev):
-                        if adx_now < adx_exit_threshold and adx_now < adx_prev:
-                            exit_score += exit_score_adx
-                            exit_reasons.append(("ADX weakening", exit_score_adx))
-
-            # 8) STRONG OPPOSITE CANDLE
-            if atr[i] is not None and atr[i] > 0:
-                if close_prices[i] < open_prices[i]:
-                    body = open_prices[i] - close_prices[i]
-                    if body >= atr[i] * opposite_atr_body_mult:
-                        exit_score += exit_score_opposite_candle
-                        exit_reasons.append(("Strong opposite bearish candle", exit_score_opposite_candle))
-
-            # Negative Scores:
-            # 1) POST-CROSS SHARP-MOVE PENALTY
-            if last_cross_index is not None and i > last_cross_index and post_cross_penalty_candles > 0:
-                candles_since_cross = i - last_cross_index
-                if (
-                    last_cross_strongest_up_move_pct >= sharp_move_threshold_pct
-                    and candles_since_cross < post_cross_penalty_candles
-                    and ema_16[i] < ma_50[i]
-                ):
-                    exit_score -= post_cross_penalty_score
-                    penalty_reason_text = (
-                        f"Post-cross sharp-move penalty ({candles_since_cross} candles since cross, "
-                        f"up-move={last_cross_strongest_up_move_pct:.2f}%)"
-                    )
-                    exit_reasons.append((penalty_reason_text, -post_cross_penalty_score))
-                    if penalty_long_points is not None:
-                        penalty_long_points.append((i, close_prices[i]))
-                        if penalty_long_reasons is not None:
-                            penalty_long_reasons[i] = (
-                                f"LONG penalty marker\n{penalty_reason_text}\nScore impact: -{post_cross_penalty_score}"
-                            )
-
-            if exit_score >= exit_score_threshold:
-                long_exit_reason_text = build_score_reason_text(
-                    "LONG EXIT SCORE REASONS",
-                    exit_reasons,
-                    exit_score,
-                    exit_score_threshold,
-                )
-                close_all_longs = True
-                break
-
-        if close_all_longs:
-            long_positions_to_close = [
-                p for p in open_positions[:]
-                if p.side == "long" and p.entry_index <= i
-            ]
-            for p in long_positions_to_close:
-                remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
-                remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
-                # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                close_price = open_prices[execution_i]
-                account = capture_account_state()
-                updates = trade_engine.close_long(
-                    execution_i, open_prices, open_times, p, account,
-                    fee_rate=fee_rate,
-                    cooldown_after_big_pnl=cooldown_after_big_pnl,
-                    remaining_open_margin=remaining_open_margin,
-                    remaining_open_margin_no_fee=remaining_open_margin_no_fee,
-                    balance_before_close_snapshot=balance_before_close_batch,
-                    balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
-                    balance_before_log_override=p.balance_before_trade,
-                    balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
-                    remaining_open_equity=remaining_open_margin,
-                )
-                apply_account_state(account)
-                
-                # count profit,loss scales positions
-                if p.get('reason') == 'scale_ma_strategy':
-                    scale_ma_long_total += 1
-                    scale_ma_long_total_profit += updates['profit']
-
-                    if updates['profit'] > 0:
-                        scale_ma_long_wins += 1
+                    if profits_lst[-1] < 0:
+                        consecutive_losses += 1
+                        if consecutive_losses_month_stop_filter:
+                            loss_streak_until_month_stop += 1
+                            if (
+                                consecutive_losses_stop_until_month > 0
+                                and loss_streak_until_month_stop >= consecutive_losses_stop_until_month
+                            ):
+                                stop_trading_until_new_month_by_losses = True
+                                loss_streak_until_month_stop = 0
                     else:
-                        scale_ma_long_losses += 1
-                # remove position
-                open_positions.remove(p)
-                
-                # close point on chart
-                if long_close_points is not None:
-                    long_close_points.append((execution_i, close_price))
-                    # close reason text
-                    if long_close_reasons is not None:
-                        long_exit_reason_text += generate_close_reason_text(trade_id=p.trade_id, updates=updates)
-                        if len(long_positions_to_close) > 1:
-                            long_close_reasons[execution_i] = f"\n{long_exit_reason_text}\nBatch close: all open LONG positions closed together."
-                        else:
-                            long_close_reasons[execution_i] = long_exit_reason_text
-                
-                updates = None
-
-                if profits_lst[-1] < 0:
-                    consecutive_losses += 1
-                    if consecutive_losses_month_stop_filter:
-                        loss_streak_until_month_stop += 1
-                        if (
-                            consecutive_losses_stop_until_month > 0
-                            and loss_streak_until_month_stop >= consecutive_losses_stop_until_month
-                        ):
-                            stop_trading_until_new_month_by_losses = True
+                        consecutive_losses = 0
+                        if consecutive_losses_month_stop_filter:
                             loss_streak_until_month_stop = 0
-                else:
-                    consecutive_losses = 0
-                    if consecutive_losses_month_stop_filter:
-                        loss_streak_until_month_stop = 0
 
-                if consecutive_losses >= 2:
-                    skip_trades_left = 2
-                    consecutive_losses = 0
+                    if consecutive_losses >= 2:
+                        skip_trades_left = 2
+                        consecutive_losses = 0
 
-                used_save_money_for_monthly_loss = False
-                monthly_stop_reason = None
-                monthly_stop_value = None
-                log_tactical_balance = tactical_balance
+                    used_save_money_for_monthly_loss = False
+                    monthly_stop_reason = None
+                    monthly_stop_value = None
+                    log_tactical_balance = tactical_balance
 
-                # stop trade if we got monthly target profit
-                # Apply monthly actions only after the last close in a batch.
-                if trade_power and remaining_open_margin <= 0 and monthly_profit_close_filter == True :
-                    if profit_percent_per_month >= monthly_profit_percent_stop_trade:
-                        monthly_stop_reason = "profit"
-                        monthly_stop_value = profit_percent_per_month
-                        if balance >= tactical_balance + (tactical_balance * monthly_compound / 100):
-                            tactical_balance = tactical_balance + (tactical_balance * monthly_compound / 100)
-                        else:
+                    # stop trade if we got monthly target profit
+                    # Apply monthly actions only after the last close in a batch.
+                    if trade_power and remaining_open_margin <= 0 and monthly_profit_close_filter == True :
+                        if profit_percent_per_month >= monthly_profit_percent_stop_trade:
+                            monthly_stop_reason = "profit"
+                            monthly_stop_value = profit_percent_per_month
+                            if balance >= tactical_balance + (tactical_balance * monthly_compound / 100):
+                                tactical_balance = tactical_balance + (tactical_balance * monthly_compound / 100)
+                            else:
+                                tactical_balance = balance
+                            monthly_surplus = balance - tactical_balance
+                            if monthly_surplus > 0:
+                                save_money += monthly_surplus
+                            balance = tactical_balance
+                            cooldowns['long'] = i
+                            trade_power = False    # off
+
+                    # stop trade if we got monthly max loss
+                    if trade_power and remaining_open_margin <= 0 and monthly_loss_close_filter == True:
+                        if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
+                            monthly_stop_reason = "loss"
+                            monthly_stop_value = profit_percent_per_month
+                            needed_to_tactical = tactical_balance - balance
+                            if needed_to_tactical > 0 and save_money >= needed_to_tactical:
+                                balance += needed_to_tactical
+                                save_money -= needed_to_tactical
+                                used_save_money_for_monthly_loss = True
+
+                        if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
+                            cooldowns['long'] = i
+                            trade_power = False    # off
+
+                    if monthly_profit_close_filter == False and monthly_loss_close_filter == False:
+                        if balance >= tactical_balance * 1.08:
                             tactical_balance = balance
-                        monthly_surplus = balance - tactical_balance
-                        if monthly_surplus > 0:
-                            save_money += monthly_surplus
-                        balance = tactical_balance
-                        cooldown_until_index = i
-                        trade_power = False    # off
 
-                # stop trade if we got monthly max loss
-                if trade_power and remaining_open_margin <= 0 and monthly_loss_close_filter == True:
-                    if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
-                        monthly_stop_reason = "loss"
-                        monthly_stop_value = profit_percent_per_month
-                        needed_to_tactical = tactical_balance - balance
-                        if needed_to_tactical > 0 and save_money >= needed_to_tactical:
-                            balance += needed_to_tactical
-                            save_money -= needed_to_tactical
-                            used_save_money_for_monthly_loss = True
+                    # ---- save money ----
+                    # Recovery trigger must use active portfolio capital (free balance + other open margins),
+                    # not only free balance; otherwise multi-position mode withdraws too early.
+                    if trade_power and (not used_save_money_for_monthly_loss):
+                        save_money_recover_amount_pct = 100 - save_money_recover_trigger_pct
+                        active_capital = balance + remaining_open_margin
+                        recover_trigger_capital = tactical_balance * save_money_recover_trigger_pct / 100
+                        recover_amount = tactical_balance * save_money_recover_amount_pct / 100
+                        if active_capital < recover_trigger_capital:
+                            if save_money >= recover_amount:
+                                balance += recover_amount
+                                save_money -= recover_amount
 
-                    if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
-                        cooldown_until_index = i
-                        trade_power = False    # off
+                    pending_monthly_stop_reason = monthly_stop_reason
+                    pending_monthly_stop_value = monthly_stop_value
 
-                if monthly_profit_close_filter == False and monthly_loss_close_filter == False:
-                    if balance >= tactical_balance * 1.08:
-                        tactical_balance = balance
+        if not independent_directions:
+            cooldown_until_index = cooldowns['long']
+            cooldowns['short'] = cooldown_until_index
+        if skip_remaining_candle:
+            continue
 
-                # ---- save money ----
-                # Recovery trigger must use active portfolio capital (free balance + other open margins),
-                # not only free balance; otherwise multi-position mode withdraws too early.
-                if trade_power and (not used_save_money_for_monthly_loss):
-                    save_money_recover_amount_pct = 100 - save_money_recover_trigger_pct
-                    active_capital = balance + remaining_open_margin
-                    recover_trigger_capital = tactical_balance * save_money_recover_trigger_pct / 100
-                    recover_amount = tactical_balance * save_money_recover_amount_pct / 100
-                    if active_capital < recover_trigger_capital:
-                        if save_money >= recover_amount:
-                            balance += recover_amount
-                            save_money -= recover_amount
+        skip_remaining_candle = False
+        for _short_pass in (None,):
+            if not short_ready:
+                break
+            # ===================== OPEN SHORT =====================
+            # Require that EMA/MA50 have crossed and the last cross was bearish,
+            # and avoid opening multiple trades for the same cross.
+            if cfg.short_enabled and not open_positions and i >= cooldowns['short']:
+                if short_state['cross_seen'] and short_state['last_trade_cross_index'] != short_state['last_cross_index']:
 
-                pending_monthly_stop_reason = monthly_stop_reason
-                pending_monthly_stop_value = monthly_stop_value
+                    entry_score = 0
+                    entry_reasons = []
 
-        # ===================== OPEN SHORT =====================
-        # Require that EMA/MA50 have crossed and the last cross was bearish,
-        # and avoid opening multiple trades for the same cross.
-        if not open_positions and i >= cooldown_until_index:
-            if cross_seen and last_trade_cross_index != last_cross_index:
-                
-                entry_score = 0
-                entry_reasons = []
-                
-                # ===== ATR ENTRY FILTER =====
-                if atr_filter == True:
-                    if atr[i] is None or atr_ma[i] is None:
-                        continue
+                    # ===== ATR ENTRY FILTER =====
+                    if short_cfg.atr_filter == True:
+                        if short_atr[i] is None or short_atr_ma[i] is None:
+                            skip_remaining_candle = not independent_directions
+                            continue
 
-                    atr_ratio = atr[i] / atr_ma[i]
+                        atr_ratio = short_atr[i] / short_atr_ma[i]
 
-                    if atr_ratio < entry_atr_threshold:
-                        continue
-                # ---- Positive Scores
-                # 1) CONFIRMED BEAR CROSS
-                if last_cross_dir == 'bear' and last_cross_index is not None:
-                    # wait at least 1 candle after cross
-                    if i > last_cross_index:
-                        # price acceptance below EMA after cross
-                        if close_prices[i] < ema_16[i]:
-                            entry_score += entry_score_cross
-                            entry_reasons.append(("Bear cross confirmed below EMA16", entry_score_cross))
-                # 2) EMA 14 < Ma 50
-                if ema_16[i] <= ma_50[i]:
-                    entry_score += entry_score_ema_vs_ma50
-                    entry_reasons.append(("EMA16 below/equal MA50", entry_score_ema_vs_ma50))
-                # 3) Ma 130 < Ma 200
-                if ma_100[i] < ma_200[i]:
-                    entry_score += entry_score_ma_trend
-                    entry_reasons.append(("MA100 below MA200", entry_score_ma_trend))
-                # 4) ma_distance or last_candle_move is strong
-                if ma_distance > ma_distance_threshold or last_candle_move > candle_move_threshold:
-                    entry_score += entry_score_ma_distance_or_candle
-                    entry_reasons.append(("Momentum strength (MA distance or candle move)", entry_score_ma_distance_or_candle))
-                # 5) ===== ADX FILTER =====
-                if adx_filter == True :
-                    if adx[i] != None and adx[i] >= entry_adx_threshold:
-                        entry_score += entry_score_adx
-                        entry_reasons.append(("ADX strength confirmation", entry_score_adx))
-                # 6) ===== VOLUME FILTER =====
-                if volume_filter:
-                    vol_now = volume_prices[i]
-                    vol_avg15 = vol_avg_15_list[i]
-                    if vol_now >= volume_spike_multiplier * vol_avg15:
-                        entry_score += entry_score_volume
-                        entry_reasons.append(("Volume spike confirmation", entry_score_volume))
-                # ---- Negative Scores (late-entry guard)
-                # 1) only penalize when a sharp move already happened AND price is overextended AND momentum is cooling
-                if i >= impulse_lookback:
-                    impulse_pct = (close_prices[i - impulse_lookback] / close_prices[i] - 1.0) * 100
-                    if impulse_pct > impulse_move_threshold_pct:
-                        if atr[i] is not None and atr[i] > 0:
-                            extension = (ema_16[i] - close_prices[i]) / atr[i]
-                            overextended = extension > late_entry_atr_mult
-                        else:
-                            extension = (ema_16[i] - close_prices[i]) / ema_16[i]
-                            overextended = extension > late_entry_ema_pct
+                        if atr_ratio < short_cfg.entry_atr_threshold:
+                            skip_remaining_candle = not independent_directions
+                            continue
+                    # ---- Positive Scores
+                    # 1) CONFIRMED BEAR CROSS
+                    if short_state['last_cross_dir'] == 'bear' and short_state['last_cross_index'] is not None:
+                        # wait at least 1 candle after cross
+                        if i > short_state['last_cross_index']:
+                            # price acceptance below EMA after cross
+                            if close_prices[i] < short_ema_16[i]:
+                                entry_score += short_cfg.entry_score_cross
+                                entry_reasons.append(("Bear cross confirmed below EMA16", short_cfg.entry_score_cross))
+                    # 2) EMA 14 < Ma 50
+                    if short_ema_16[i] <= short_ma_50[i]:
+                        entry_score += short_cfg.entry_score_ema_vs_ma50
+                        entry_reasons.append(("EMA16 below/equal MA50", short_cfg.entry_score_ema_vs_ma50))
+                    # 3) Ma 130 < Ma 200
+                    if short_ma_100[i] < short_ma_200[i]:
+                        entry_score += short_cfg.entry_score_ma_trend
+                        entry_reasons.append(("MA100 below MA200", short_cfg.entry_score_ma_trend))
+                    # 4) ma_distance or last_candle_move is strong
+                    if short_ma_distance > short_cfg.ma_distance_threshold or last_candle_move > short_cfg.candle_move_threshold:
+                        entry_score += short_cfg.entry_score_ma_distance_or_candle
+                        entry_reasons.append(("Momentum strength (MA distance or candle move)", short_cfg.entry_score_ma_distance_or_candle))
+                    # 5) ===== ADX FILTER =====
+                    if short_cfg.adx_filter == True :
+                        if short_adx[i] != None and short_adx[i] >= short_cfg.entry_adx_threshold:
+                            entry_score += short_cfg.entry_score_adx
+                            entry_reasons.append(("ADX strength confirmation", short_cfg.entry_score_adx))
+                    # 6) ===== VOLUME FILTER =====
+                    if short_cfg.volume_filter:
+                        vol_now = volume_prices[i]
+                        vol_avg15 = short_vol_avg_15_list[i]
+                        if vol_now >= short_cfg.volume_spike_multiplier * vol_avg15:
+                            entry_score += short_cfg.entry_score_volume
+                            entry_reasons.append(("Volume spike confirmation", short_cfg.entry_score_volume))
+                    # ---- Negative Scores (late-entry guard)
+                    # 1) only penalize when a sharp move already happened AND price is overextended AND momentum is cooling
+                    if i >= short_cfg.impulse_lookback:
+                        impulse_pct = (close_prices[i - short_cfg.impulse_lookback] / close_prices[i] - 1.0) * 100
+                        if impulse_pct > short_cfg.impulse_move_threshold_pct:
+                            if short_atr[i] is not None and short_atr[i] > 0:
+                                extension = (short_ema_16[i] - close_prices[i]) / short_atr[i]
+                                overextended = extension > short_cfg.late_entry_atr_mult
+                            else:
+                                extension = (short_ema_16[i] - close_prices[i]) / short_ema_16[i]
+                                overextended = extension > short_cfg.late_entry_ema_pct
 
-                        body_now = close_prices[i] - open_prices[i]
-                        body_prev = close_prices[i - 1] - open_prices[i - 1]
-                        cooling = (body_now >= 0) or (body_prev < 0 and abs(body_now) < abs(body_prev) * late_entry_body_ratio)
+                            body_now = close_prices[i] - open_prices[i]
+                            body_prev = close_prices[i - 1] - open_prices[i - 1]
+                            cooling = (body_now >= 0) or (body_prev < 0 and abs(body_now) < abs(body_prev) * short_cfg.late_entry_body_ratio)
 
-                        if overextended and cooling:
-                            entry_score -= entry_late_penalty
-                            entry_reasons.append(("Late-entry penalty: overextended + cooling", -entry_late_penalty))
+                            if overextended and cooling:
+                                entry_score -= short_cfg.entry_late_penalty
+                                entry_reasons.append(("Late-entry penalty: overextended + cooling", -short_cfg.entry_late_penalty))
 
 
-                if entry_score >= entry_score_threshold:
-                    # ===== SKIP LOGIC =====
-                    if skip_logic and skip_trades_left > 0:
-                        skip_trades_left -= 1
-                        last_trade_cross_index = last_cross_index
-                        TradeEngine.display(verbose, f"⏭️ SKIP SHORT | skips left: {skip_trades_left}")
-                        continue
-                    entry_reason_text = build_score_reason_text(
-                        "SHORT ENTRY SCORE REASONS",
-                        entry_reasons,
-                        entry_score,
-                        entry_score_threshold,
-                    )
-
-                    # ---- open short ----
-                    account = capture_account_state()
-                    updates = trade_engine.open_short(
-                        execution_i, open_prices, open_times, account,
-                        trade_amount_percent=trade_amount_percent,
-                        margin_balance=balance + sum(p.margin for p in open_positions),
-                        margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
-                        leverage=None,
-                    )
-                    apply_account_state(account)
-                    if updates is not None:
-                        trade_reason = 'ma_strategy'
-                        position = Position.from_open_result(
-                            updates,
-                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
-                            side="short",
-                            entry_index=execution_i,
-                            high_price=open_prices[execution_i],
-                            low_price=open_prices[execution_i],
-                            reason=trade_reason,
+                    if entry_score >= short_cfg.entry_score_threshold:
+                        # ===== SKIP LOGIC =====
+                        if skip_logic and skip_trades_left > 0:
+                            skip_trades_left -= 1
+                            short_state['last_trade_cross_index'] = short_state['last_cross_index']
+                            TradeEngine.display(verbose, f"⏭️ SKIP SHORT | skips left: {skip_trades_left}")
+                            skip_remaining_candle = not independent_directions
+                            continue
+                        entry_reason_text = build_score_reason_text(
+                            "SHORT ENTRY SCORE REASONS",
+                            entry_reasons,
+                            entry_score,
+                            short_cfg.entry_score_threshold,
                         )
-                        open_positions.append(position)
-                        
-                        # open point on chart
-                        if short_open_points is not None:
-                            short_open_points.append((execution_i, position.entry_price))
-                            # open reason text
-                            if short_open_reasons is not None:
-                                # default texts
-                                entry_reason_text += generate_entry_reason_text(trade_id=position.trade_id, updates=updates)
-                                short_open_reasons[execution_i] = entry_reason_text
 
-                        next_trade_id += 1
-                        # record which cross enabled this trade and init trailing state
-                        last_trade_cross_index = last_cross_index
-                        updates = None
+                        # ---- open short ----
+                        account = capture_account_state()
+                        updates = trade_engine.open_short(
+                            execution_i, open_prices, open_times, account,
+                            trade_amount_percent=short_cfg.trade_amount_percent,
+                            margin_balance=balance + sum(p.margin for p in open_positions),
+                            margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
+                            leverage=_directional_leverage(short_cfg, balance + sum(p.margin for p in open_positions), tactical_balance),
+                        )
+                        apply_account_state(account, 'short')
+                        if updates is not None:
+                            trade_reason = 'ma_strategy'
+                            position = Position.from_open_result(
+                                updates,
+                                trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                                side="short",
+                                entry_index=execution_i,
+                                high_price=open_prices[execution_i],
+                                low_price=open_prices[execution_i],
+                                reason=trade_reason,
+                            )
+                            open_positions.append(position)
 
-        # ===================== SCALE ENTRY SHORT =====================
-        if (
-            scale_in_enabled
-            and len(open_positions) < max_open_trades
-            and open_positions
-            and all(p.side == "short" for p in open_positions)
-            and i >= cooldown_until_index
-        ):
-            first_short_position = min(
-                (p for p in open_positions
-                 if p.side == "short" and p.entry_index <= i),
-                key=lambda x: x.entry_index,
-                default=None
-            )
-            if first_short_position is not None:
-                first_short_entry_price = first_short_position.entry_price
-                short_scale_entry_profit_trigger_price = first_short_entry_price * (1 - scale_entry_profit_trigger_pct)
-                short_scale_entry_loss_trigger_price = first_short_entry_price * (1 + scale_entry_loss_trigger_pct)
-                short_scale_entry_reason = None
-                if scale_entry_on_profit_enabled and close_prices[i] <= short_scale_entry_profit_trigger_price:
-                    short_scale_entry_reason = "profit"
-                elif scale_entry_on_loss_enabled and close_prices[i] >= short_scale_entry_loss_trigger_price:
-                    short_scale_entry_reason = "loss"
+                            # open point on chart
+                            if short_open_points is not None:
+                                short_open_points.append((execution_i, position.entry_price))
+                                # open reason text
+                                if short_open_reasons is not None:
+                                    # default texts
+                                    entry_reason_text += generate_entry_reason_text(trade_id=position.trade_id, updates=updates)
+                                    short_open_reasons[execution_i] = entry_reason_text
 
-                # count scales
-                if short_scale_entry_reason == "profit":
-                    short_profit_scale_entry_attempts += 1
-                elif short_scale_entry_reason == "loss":
-                    short_loss_scale_entry_attempts += 1
+                            next_trade_id += 1
+                            # record which cross enabled this trade and init trailing state
+                            short_state['last_trade_cross_index'] = short_state['last_cross_index']
+                            updates = None
 
-                short_profit_scale_entry_score = 0
-                if short_scale_entry_reason == "profit" and profit_scale_entry_filter_enabled:
-                    # validate profit scale entry quality before adding to a winning SHORT position.
-                    if ema_16[i] < ma_50[i]:
-                        short_profit_scale_entry_score += 1
-                    if ma_100[i] < ma_200[i]:
-                        short_profit_scale_entry_score += 1
-                    if i > 0 and close_prices[i] < open_prices[i] and close_prices[i] < close_prices[i - 1]:
-                        short_profit_scale_entry_score += 1
-                    if atr[i] is not None and atr_ma[i] is not None and atr_ma[i] > 0:
-                        short_scale_entry_atr_ratio = atr[i] / atr_ma[i]
-                        if short_scale_entry_atr_ratio >= profit_scale_entry_atr_ratio_min:
+            # ===================== SCALE ENTRY SHORT =====================
+            if (
+                short_cfg.scale_in_enabled
+                and len(open_positions) < short_cfg.max_open_trades
+                and open_positions
+                and all(p.side == "short" for p in open_positions)
+                and i >= cooldowns['short']
+            ):
+                first_short_position = min(
+                    (p for p in open_positions
+                     if p.side == "short" and p.entry_index <= i),
+                    key=lambda x: x.entry_index,
+                    default=None
+                )
+                if first_short_position is not None:
+                    first_short_entry_price = first_short_position.entry_price
+                    short_scale_entry_profit_trigger_price = first_short_entry_price * (1 - short_cfg.scale_entry_profit_trigger_pct)
+                    short_scale_entry_loss_trigger_price = first_short_entry_price * (1 + short_cfg.scale_entry_loss_trigger_pct)
+                    short_scale_entry_reason = None
+                    if short_cfg.scale_entry_on_profit_enabled and close_prices[i] <= short_scale_entry_profit_trigger_price:
+                        short_scale_entry_reason = "profit"
+                    elif short_cfg.scale_entry_on_loss_enabled and close_prices[i] >= short_scale_entry_loss_trigger_price:
+                        short_scale_entry_reason = "loss"
+
+                    # count scales
+                    if short_scale_entry_reason == "profit":
+                        short_profit_scale_entry_attempts += 1
+                    elif short_scale_entry_reason == "loss":
+                        short_loss_scale_entry_attempts += 1
+
+                    short_profit_scale_entry_score = 0
+                    if short_scale_entry_reason == "profit" and short_cfg.profit_scale_entry_filter_enabled:
+                        # validate profit scale entry quality before adding to a winning SHORT position.
+                        if short_ema_16[i] < short_ma_50[i]:
                             short_profit_scale_entry_score += 1
-                    if volume_filter:
-                        vol_now = volume_prices[i]
-                        vol_avg15 = vol_avg_15_list[i]
-                        if vol_now >= volume_spike_multiplier * vol_avg15:
-                            short_profit_scale_entry_score += 2
-                    if short_profit_scale_entry_score < profit_scale_entry_min_score:
-                        short_filtered_profit_scale_entries += 1
-                        short_scale_entry_reason = None
+                        if short_ma_100[i] < short_ma_200[i]:
+                            short_profit_scale_entry_score += 1
+                        if i > 0 and close_prices[i] < open_prices[i] and close_prices[i] < close_prices[i - 1]:
+                            short_profit_scale_entry_score += 1
+                        if short_atr[i] is not None and short_atr_ma[i] is not None and short_atr_ma[i] > 0:
+                            short_scale_entry_atr_ratio = short_atr[i] / short_atr_ma[i]
+                            if short_scale_entry_atr_ratio >= short_cfg.profit_scale_entry_atr_ratio_min:
+                                short_profit_scale_entry_score += 1
+                        if short_cfg.volume_filter:
+                            vol_now = volume_prices[i]
+                            vol_avg15 = short_vol_avg_15_list[i]
+                            if vol_now >= short_cfg.volume_spike_multiplier * vol_avg15:
+                                short_profit_scale_entry_score += 2
+                        if short_profit_scale_entry_score < short_cfg.profit_scale_entry_min_score:
+                            short_filtered_profit_scale_entries += 1
+                            short_scale_entry_reason = None
 
-                if short_scale_entry_reason is not None:
-                    account = capture_account_state()
-                    updates = trade_engine.open_short(
-                        execution_i, open_prices, open_times, account,
-                        trade_amount_percent=scale_entry_amount_percent,
-                        margin_balance=balance + sum(p.margin for p in open_positions),
-                        margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
-                        leverage=None,
-                    )
-                    apply_account_state(account)
-                    if updates is not None:
-                        
-                        # count profits, losses Scales
-                        if short_scale_entry_reason == "profit":
-                            short_profit_scale_entries += 1
-                        elif short_scale_entry_reason == "loss":
-                            short_loss_scale_entries += 1
-
-                        trade_reason = 'scale_ma_strategy'
-                        position = Position.from_open_result(
-                            updates,
-                            trade_id=f"{trade_reason}_{next_trade_id:04d}",
-                            side="short",
-                            entry_index=execution_i,
-                            high_price=open_prices[execution_i],
-                            low_price=open_prices[execution_i],
-                            reason=trade_reason,
+                    if short_scale_entry_reason is not None:
+                        account = capture_account_state()
+                        updates = trade_engine.open_short(
+                            execution_i, open_prices, open_times, account,
+                            trade_amount_percent=short_cfg.scale_entry_amount_percent,
+                            margin_balance=balance + sum(p.margin for p in open_positions),
+                            margin_balance_no_fee=balance_without_fee + sum(p.margin_no_fee for p in open_positions),
+                            leverage=_directional_leverage(short_cfg, balance + sum(p.margin for p in open_positions), tactical_balance),
                         )
-                        open_positions.append(position)
-                        next_trade_id += 1
-                        if short_open_points is not None:
-                            short_open_points.append((execution_i, position.entry_price))
-                            if short_open_reasons is not None:
-                                short_scale_entry_text = (
-                                    f"SHORT SCALE ENTRY\n"
-                                    f"Order size: {scale_entry_amount_percent*100:.2f}%\n"
-                                )
-                                if short_scale_entry_reason == "profit":
-                                    short_scale_entry_text += (
-                                        f"Price moved -{scale_entry_profit_trigger_pct*100:.2f}% from first SHORT entry."
-                                    )
+                        apply_account_state(account, 'short')
+                        if updates is not None:
 
-                                    if profit_scale_entry_filter_enabled:
+                            # count profits, losses Scales
+                            if short_scale_entry_reason == "profit":
+                                short_profit_scale_entries += 1
+                            elif short_scale_entry_reason == "loss":
+                                short_loss_scale_entries += 1
+
+                            trade_reason = 'scale_ma_strategy'
+                            position = Position.from_open_result(
+                                updates,
+                                trade_id=f"{trade_reason}_{next_trade_id:04d}",
+                                side="short",
+                                entry_index=execution_i,
+                                high_price=open_prices[execution_i],
+                                low_price=open_prices[execution_i],
+                                reason=trade_reason,
+                            )
+                            open_positions.append(position)
+                            next_trade_id += 1
+                            if short_open_points is not None:
+                                short_open_points.append((execution_i, position.entry_price))
+                                if short_open_reasons is not None:
+                                    short_scale_entry_text = (
+                                        f"SHORT SCALE ENTRY\n"
+                                        f"Order size: {short_cfg.scale_entry_amount_percent*100:.2f}%\n"
+                                    )
+                                    if short_scale_entry_reason == "profit":
                                         short_scale_entry_text += (
-                                            f"\nProfit filter score: {short_profit_scale_entry_score}/{profit_scale_entry_min_score}"
+                                            f"Price moved -{short_cfg.scale_entry_profit_trigger_pct*100:.2f}% from first SHORT entry."
                                         )
 
-                                elif short_scale_entry_reason == "loss":
-                                    short_scale_entry_text += (
-                                        f"Price moved +{scale_entry_loss_trigger_pct*100:.2f}% from first SHORT entry."
+                                        if short_cfg.profit_scale_entry_filter_enabled:
+                                            short_scale_entry_text += (
+                                                f"\nProfit filter score: {short_profit_scale_entry_score}/{short_cfg.profit_scale_entry_min_score}"
+                                            )
+
+                                    elif short_scale_entry_reason == "loss":
+                                        short_scale_entry_text += (
+                                            f"Price moved +{short_cfg.scale_entry_loss_trigger_pct*100:.2f}% from first SHORT entry."
+                                        )
+
+                                    short_scale_entry_text += "\n\n" + generate_entry_reason_text(
+                                        trade_id=position.trade_id, updates=updates
                                     )
 
-                                short_scale_entry_text += "\n\n" + generate_entry_reason_text(
-                                    trade_id=position.trade_id, updates=updates
+                                    short_open_reasons[execution_i] = short_scale_entry_text
+
+                        updates = None
+
+
+            # ===================== CLOSE SHORT =====================
+            close_all_shorts = False
+            short_exit_reason_text = None
+            for p in open_positions[:]:
+                if p.side != "short":
+                    continue
+                if p.entry_index is not None and p.entry_index > i:
+                    continue
+                exit_score = 0
+                exit_reasons = []
+                entry_price = p.entry_price
+
+                if p.lowest_since_entry is None:
+                    p.lowest_since_entry = entry_price
+                if low_prices[i] < p.lowest_since_entry:
+                    p.lowest_since_entry = low_prices[i]
+
+                # 1) LOSS GUARD (based on dynamic loss-lock line)
+                if p.target_close_price_loss is not None:
+                    loss_pct = (close_prices[i] - p.target_close_price_loss) / p.target_close_price_loss
+                    if loss_pct >= short_cfg.loss_exit_pct_2:
+                        exit_score += short_cfg.exit_score_loss_guard_2
+                        exit_reasons.append((f"Loss guard triggered ({short_cfg.loss_exit_pct_2*100:.0f}%+ loss)", short_cfg.exit_score_loss_guard_2))
+                    if loss_pct >= short_cfg.loss_exit_pct_1:
+                        exit_score += short_cfg.exit_score_loss_guard_1
+                        exit_reasons.append((f"Loss guard triggered ({short_cfg.loss_exit_pct_1*100:.0f}%+ loss)", short_cfg.exit_score_loss_guard_1))
+
+                # 2) PROFIT GUARD
+                profit_pct = (entry_price - close_prices[i]) / entry_price
+                if profit_pct >= short_cfg.profit_exit_pct_2:
+                    exit_score += short_cfg.exit_score_profit_guard_2
+                    exit_reasons.append((f"Profit guard triggered ({short_cfg.profit_exit_pct_2*100:.0f}%+ profit)", short_cfg.exit_score_profit_guard_2))
+                if profit_pct >= short_cfg.profit_exit_pct_1:
+                    exit_score += short_cfg.exit_score_profit_guard_1
+                    exit_reasons.append((f"Profit guard triggered ({short_cfg.profit_exit_pct_1*100:.0f}%+ profit)", short_cfg.exit_score_profit_guard_1))
+
+                # 3) EMA SLOPE WEAKNESS (SHORT CONTEXT)
+                if i - short_cfg.slope_window >= 0 and short_ema_16[i] > short_ema_16[i - short_cfg.slope_window]:
+                    exit_score += short_cfg.exit_score_ema_slope
+                    exit_reasons.append(("EMA16 slope weakness (short)", short_cfg.exit_score_ema_slope))
+                # 4) EMA16 CROSSED ABOVE MA50
+                if short_ema_16[i] > short_ma_50[i]:
+                    exit_score += short_cfg.exit_score_ema_cross
+                    exit_reasons.append(("EMA16 crossed above MA50", short_cfg.exit_score_ema_cross))
+                # 5) MA TREND WEAKNESS (MA100 >= MA200 for short)
+                if short_ma_100[i] >= short_ma_200[i]:
+                    exit_score += short_cfg.exit_score_ma_trend
+                    exit_reasons.append(("MA100 above/equal MA200", short_cfg.exit_score_ma_trend))
+
+                # 6) TRAILING RETRACE EXIT
+                if p.entry_index is not None and i > p.entry_index:
+                    if p.lowest_since_entry <= entry_price * (1 - short_cfg.trail_activate_pct):
+                        if close_prices[i] >= p.lowest_since_entry * (1 + short_cfg.trail_retrace_pct):
+                            exit_score += short_cfg.exit_score_trailing
+                            exit_reasons.append(("Trailing retrace exit", short_cfg.exit_score_trailing))
+
+                # 7) ADX WEAKENING EXIT
+                if i - short_cfg.adx_exit_lookback >= 0:
+                    adx_now = short_adx[i]
+                    adx_prev = short_adx[i - short_cfg.adx_exit_lookback]
+                    if adx_now is not None and adx_prev is not None:
+                        if np.isfinite(adx_now) and np.isfinite(adx_prev):
+                            if adx_now < short_cfg.adx_exit_threshold and adx_now < adx_prev:
+                                exit_score += short_cfg.exit_score_adx
+                                exit_reasons.append(("ADX weakening", short_cfg.exit_score_adx))
+
+                # 8) STRONG OPPOSITE CANDLE
+                if short_atr[i] is not None and short_atr[i] > 0:
+                    if close_prices[i] > open_prices[i]:
+                        body = close_prices[i] - open_prices[i]
+                        if body >= short_atr[i] * short_cfg.opposite_atr_body_mult:
+                            exit_score += short_cfg.exit_score_opposite_candle
+                            exit_reasons.append(("Strong opposite bullish candle", short_cfg.exit_score_opposite_candle))
+
+                # Negative Scores:
+                # 1) POST-CROSS SHARP-MOVE PENALTY
+                if short_state['last_cross_index'] is not None and i > short_state['last_cross_index'] and short_cfg.post_cross_penalty_candles > 0:
+                    candles_since_cross = i - short_state['last_cross_index']
+                    if (
+                        short_state['last_cross_strongest_down_move_pct'] >= short_cfg.sharp_move_threshold_pct
+                        and candles_since_cross < short_cfg.post_cross_penalty_candles
+                        and short_ema_16[i] > short_ma_50[i]
+                    ):
+                        exit_score -= short_cfg.post_cross_penalty_score
+                        penalty_reason_text = (
+                            f"Post-cross sharp-move penalty ({candles_since_cross} candles since cross, "
+                            f"down-move={short_state['last_cross_strongest_down_move_pct']:.2f}%)"
+                        )
+                        exit_reasons.append((penalty_reason_text, -short_cfg.post_cross_penalty_score))
+                        if penalty_short_points is not None:
+                            penalty_short_points.append((i, close_prices[i]))
+                            if penalty_short_reasons is not None:
+                                penalty_short_reasons[i] = (
+                                    f"SHORT penalty marker\n{penalty_reason_text}\nScore impact: -{short_cfg.post_cross_penalty_score}"
                                 )
 
-                                short_open_reasons[execution_i] = short_scale_entry_text
+                if exit_score >= short_cfg.exit_score_threshold:
+                    short_exit_reason_text = build_score_reason_text(
+                        "SHORT EXIT SCORE REASONS",
+                        exit_reasons,
+                        exit_score,
+                        short_cfg.exit_score_threshold,
+                    )
+                    close_all_shorts = True
+                    break
+
+            if close_all_shorts:
+                short_positions_to_close = [
+                    p for p in open_positions[:]
+                    if p.side == "short" and p.entry_index <= i
+                ]
+                for p in short_positions_to_close:
+                    remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
+                    remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
+                    # remaining_open_equity = _open_positions_equity(close_prices[i], p)
+                    close_price = open_prices[execution_i]
+                    account = capture_account_state()
+                    updates = trade_engine.close_short(
+                        execution_i, open_prices, open_times, p, account,
+                        fee_rate=fee_rate,
+                        cooldown_after_big_pnl=short_cfg.cooldown_after_big_pnl,
+                        remaining_open_margin=remaining_open_margin,
+                        remaining_open_margin_no_fee=remaining_open_margin_no_fee,
+                        balance_before_close_snapshot=balance_before_close_batch,
+                        balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
+                        balance_before_log_override=p.balance_before_trade,
+                        balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
+                        remaining_open_equity=remaining_open_margin,
+                    )
+                    apply_account_state(account, 'short')
+
+                    # count profit,loss scales positions
+                    if p.get('reason') == 'scale_ma_strategy':
+                        scale_ma_short_total += 1
+                        scale_ma_short_total_profit += updates['profit']
+
+                        if updates['profit'] > 0:
+                            scale_ma_short_wins += 1
+                        else:
+                            scale_ma_short_losses += 1
+                    # remove position
+                    open_positions.remove(p)
+
+                    # close point on chart
+                    if short_close_points is not None:
+                        short_close_points.append((execution_i, close_price))
+                        # close reason text
+                        if short_close_reasons is not None:
+                            short_exit_reason_text += generate_close_reason_text(trade_id=p.trade_id, updates=updates)
+                            if len(short_positions_to_close) > 1:
+                                short_close_reasons[execution_i] = f"\n{short_exit_reason_text}\nBatch close: all open SHORT positions closed together."
+                            else:
+                                short_close_reasons[execution_i] = short_exit_reason_text
 
                     updates = None
 
-
-        # ===================== CLOSE SHORT =====================
-        close_all_shorts = False
-        short_exit_reason_text = None
-        for p in open_positions[:]:
-            if p.side != "short":
-                continue
-            if p.entry_index is not None and p.entry_index > i:
-                continue
-            exit_score = 0
-            exit_reasons = []
-            entry_price = p.entry_price
-
-            if p.lowest_since_entry is None:
-                p.lowest_since_entry = entry_price
-            if low_prices[i] < p.lowest_since_entry:
-                p.lowest_since_entry = low_prices[i]
-
-            # 1) LOSS GUARD (based on dynamic loss-lock line)
-            if p.target_close_price_loss is not None:
-                loss_pct = (close_prices[i] - p.target_close_price_loss) / p.target_close_price_loss
-                if loss_pct >= loss_exit_pct_2:
-                    exit_score += exit_score_loss_guard_2
-                    exit_reasons.append((f"Loss guard triggered ({loss_exit_pct_2*100:.0f}%+ loss)", exit_score_loss_guard_2))
-                if loss_pct >= loss_exit_pct_1:
-                    exit_score += exit_score_loss_guard_1
-                    exit_reasons.append((f"Loss guard triggered ({loss_exit_pct_1*100:.0f}%+ loss)", exit_score_loss_guard_1))
-
-            # 2) PROFIT GUARD
-            profit_pct = (entry_price - close_prices[i]) / entry_price
-            if profit_pct >= profit_exit_pct_2:
-                exit_score += exit_score_profit_guard_2
-                exit_reasons.append((f"Profit guard triggered ({profit_exit_pct_2*100:.0f}%+ profit)", exit_score_profit_guard_2))
-            if profit_pct >= profit_exit_pct_1:
-                exit_score += exit_score_profit_guard_1
-                exit_reasons.append((f"Profit guard triggered ({profit_exit_pct_1*100:.0f}%+ profit)", exit_score_profit_guard_1))
-
-            # 3) EMA SLOPE WEAKNESS (SHORT CONTEXT)
-            if i - slope_window >= 0 and ema_16[i] > ema_16[i - slope_window]:
-                exit_score += exit_score_ema_slope
-                exit_reasons.append(("EMA16 slope weakness (short)", exit_score_ema_slope))
-            # 4) EMA16 CROSSED ABOVE MA50
-            if ema_16[i] > ma_50[i]:
-                exit_score += exit_score_ema_cross
-                exit_reasons.append(("EMA16 crossed above MA50", exit_score_ema_cross))
-            # 5) MA TREND WEAKNESS (MA100 >= MA200 for short)
-            if ma_100[i] >= ma_200[i]:
-                exit_score += exit_score_ma_trend
-                exit_reasons.append(("MA100 above/equal MA200", exit_score_ma_trend))
-
-            # 6) TRAILING RETRACE EXIT
-            if p.entry_index is not None and i > p.entry_index:
-                if p.lowest_since_entry <= entry_price * (1 - trail_activate_pct):
-                    if close_prices[i] >= p.lowest_since_entry * (1 + trail_retrace_pct):
-                        exit_score += exit_score_trailing
-                        exit_reasons.append(("Trailing retrace exit", exit_score_trailing))
-
-            # 7) ADX WEAKENING EXIT
-            if i - adx_exit_lookback >= 0:
-                adx_now = adx[i]
-                adx_prev = adx[i - adx_exit_lookback]
-                if adx_now is not None and adx_prev is not None:
-                    if np.isfinite(adx_now) and np.isfinite(adx_prev):
-                        if adx_now < adx_exit_threshold and adx_now < adx_prev:
-                            exit_score += exit_score_adx
-                            exit_reasons.append(("ADX weakening", exit_score_adx))
-
-            # 8) STRONG OPPOSITE CANDLE
-            if atr[i] is not None and atr[i] > 0:
-                if close_prices[i] > open_prices[i]:
-                    body = close_prices[i] - open_prices[i]
-                    if body >= atr[i] * opposite_atr_body_mult:
-                        exit_score += exit_score_opposite_candle
-                        exit_reasons.append(("Strong opposite bullish candle", exit_score_opposite_candle))
-
-            # Negative Scores:
-            # 1) POST-CROSS SHARP-MOVE PENALTY
-            if last_cross_index is not None and i > last_cross_index and post_cross_penalty_candles > 0:
-                candles_since_cross = i - last_cross_index
-                if (
-                    last_cross_strongest_down_move_pct >= sharp_move_threshold_pct
-                    and candles_since_cross < post_cross_penalty_candles
-                    and ema_16[i] > ma_50[i]
-                ):
-                    exit_score -= post_cross_penalty_score
-                    penalty_reason_text = (
-                        f"Post-cross sharp-move penalty ({candles_since_cross} candles since cross, "
-                        f"down-move={last_cross_strongest_down_move_pct:.2f}%)"
-                    )
-                    exit_reasons.append((penalty_reason_text, -post_cross_penalty_score))
-                    if penalty_short_points is not None:
-                        penalty_short_points.append((i, close_prices[i]))
-                        if penalty_short_reasons is not None:
-                            penalty_short_reasons[i] = (
-                                f"SHORT penalty marker\n{penalty_reason_text}\nScore impact: -{post_cross_penalty_score}"
-                            )
-
-            if exit_score >= exit_score_threshold:
-                short_exit_reason_text = build_score_reason_text(
-                    "SHORT EXIT SCORE REASONS",
-                    exit_reasons,
-                    exit_score,
-                    exit_score_threshold,
-                )
-                close_all_shorts = True
-                break
-
-        if close_all_shorts:
-            short_positions_to_close = [
-                p for p in open_positions[:]
-                if p.side == "short" and p.entry_index <= i
-            ]
-            for p in short_positions_to_close:
-                remaining_open_margin = sum(x.margin for x in open_positions if x is not p)
-                remaining_open_margin_no_fee = sum(x.margin_no_fee for x in open_positions if x is not p)
-                # remaining_open_equity = _open_positions_equity(close_prices[i], p)
-                close_price = open_prices[execution_i]
-                account = capture_account_state()
-                updates = trade_engine.close_short(
-                    execution_i, open_prices, open_times, p, account,
-                    fee_rate=fee_rate,
-                    cooldown_after_big_pnl=cooldown_after_big_pnl,
-                    remaining_open_margin=remaining_open_margin,
-                    remaining_open_margin_no_fee=remaining_open_margin_no_fee,
-                    balance_before_close_snapshot=balance_before_close_batch,
-                    balance_before_close_no_fee_snapshot=balance_before_close_batch_no_fee,
-                    balance_before_log_override=p.balance_before_trade,
-                    balance_before_log_override_no_fee=p.balance_before_trade_no_fee,
-                    remaining_open_equity=remaining_open_margin,
-                )
-                apply_account_state(account)
-
-                # count profit,loss scales positions
-                if p.get('reason') == 'scale_ma_strategy':
-                    scale_ma_short_total += 1
-                    scale_ma_short_total_profit += updates['profit']
-
-                    if updates['profit'] > 0:
-                        scale_ma_short_wins += 1
+                    if profits_lst[-1] < 0:
+                        consecutive_losses += 1
+                        if consecutive_losses_month_stop_filter:
+                            loss_streak_until_month_stop += 1
+                            if (
+                                consecutive_losses_stop_until_month > 0
+                                and loss_streak_until_month_stop >= consecutive_losses_stop_until_month
+                            ):
+                                stop_trading_until_new_month_by_losses = True
+                                loss_streak_until_month_stop = 0
                     else:
-                        scale_ma_short_losses += 1
-                # remove position
-                open_positions.remove(p)
-
-                # close point on chart
-                if short_close_points is not None:
-                    short_close_points.append((execution_i, close_price))
-                    # close reason text
-                    if short_close_reasons is not None:
-                        short_exit_reason_text += generate_close_reason_text(trade_id=p.trade_id, updates=updates)
-                        if len(short_positions_to_close) > 1:
-                            short_close_reasons[execution_i] = f"\n{short_exit_reason_text}\nBatch close: all open SHORT positions closed together."
-                        else:
-                            short_close_reasons[execution_i] = short_exit_reason_text
-
-                updates = None
-
-                if profits_lst[-1] < 0:
-                    consecutive_losses += 1
-                    if consecutive_losses_month_stop_filter:
-                        loss_streak_until_month_stop += 1
-                        if (
-                            consecutive_losses_stop_until_month > 0
-                            and loss_streak_until_month_stop >= consecutive_losses_stop_until_month
-                        ):
-                            stop_trading_until_new_month_by_losses = True
+                        consecutive_losses = 0
+                        if consecutive_losses_month_stop_filter:
                             loss_streak_until_month_stop = 0
-                else:
-                    consecutive_losses = 0
-                    if consecutive_losses_month_stop_filter:
-                        loss_streak_until_month_stop = 0
 
-                if consecutive_losses >= 2:
-                    skip_trades_left = 2
-                    consecutive_losses = 0
+                    if consecutive_losses >= 2:
+                        skip_trades_left = 2
+                        consecutive_losses = 0
 
-                used_save_money_for_monthly_loss = False
-                monthly_stop_reason = None
-                monthly_stop_value = None
-                log_tactical_balance = tactical_balance
+                    used_save_money_for_monthly_loss = False
+                    monthly_stop_reason = None
+                    monthly_stop_value = None
+                    log_tactical_balance = tactical_balance
 
-                # stop trade if we got monthly target profit
-                # Apply monthly actions only after the last close in a batch.
-                if trade_power and remaining_open_margin <= 0 and monthly_profit_close_filter == True :
-                    if profit_percent_per_month >= monthly_profit_percent_stop_trade:
-                        monthly_stop_reason = "profit"
-                        monthly_stop_value = profit_percent_per_month
-                        if balance >= tactical_balance + (tactical_balance * monthly_compound / 100):
-                            tactical_balance = tactical_balance + (tactical_balance * monthly_compound / 100)
-                        else:
+                    # stop trade if we got monthly target profit
+                    # Apply monthly actions only after the last close in a batch.
+                    if trade_power and remaining_open_margin <= 0 and monthly_profit_close_filter == True :
+                        if profit_percent_per_month >= monthly_profit_percent_stop_trade:
+                            monthly_stop_reason = "profit"
+                            monthly_stop_value = profit_percent_per_month
+                            if balance >= tactical_balance + (tactical_balance * monthly_compound / 100):
+                                tactical_balance = tactical_balance + (tactical_balance * monthly_compound / 100)
+                            else:
+                                tactical_balance = balance
+                            monthly_surplus = balance - tactical_balance
+                            if monthly_surplus > 0:
+                                save_money += monthly_surplus
+                            balance = tactical_balance
+                            cooldowns['short'] = i
+                            trade_power = False    # off
+
+                    # stop trade if we got monthly max loss
+                    if trade_power and remaining_open_margin <= 0 and monthly_loss_close_filter == True:
+                        if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
+                            monthly_stop_reason = "loss"
+                            monthly_stop_value = profit_percent_per_month
+                            needed_to_tactical = tactical_balance - balance
+                            if needed_to_tactical > 0 and save_money >= needed_to_tactical:
+                                balance += needed_to_tactical
+                                save_money -= needed_to_tactical
+                                used_save_money_for_monthly_loss = True
+
+                        if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
+                            cooldowns['short'] = i
+                            trade_power = False    # off
+
+                    if monthly_profit_close_filter == False and monthly_loss_close_filter == False:
+                        if balance >= tactical_balance * 1.08:
                             tactical_balance = balance
-                        monthly_surplus = balance - tactical_balance
-                        if monthly_surplus > 0:
-                            save_money += monthly_surplus
-                        balance = tactical_balance
-                        cooldown_until_index = i
-                        trade_power = False    # off
 
-                # stop trade if we got monthly max loss
-                if trade_power and remaining_open_margin <= 0 and monthly_loss_close_filter == True:
-                    if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
-                        monthly_stop_reason = "loss"
-                        monthly_stop_value = profit_percent_per_month
-                        needed_to_tactical = tactical_balance - balance
-                        if needed_to_tactical > 0 and save_money >= needed_to_tactical:
-                            balance += needed_to_tactical
-                            save_money -= needed_to_tactical
-                            used_save_money_for_monthly_loss = True
+                    # ---- save money ----
+                    # Recovery trigger must use active portfolio capital (free balance + other open margins),
+                    # not only free balance; otherwise multi-position mode withdraws too early.
+                    if trade_power and (not used_save_money_for_monthly_loss):
+                        save_money_recover_amount_pct = 100 - save_money_recover_trigger_pct
+                        active_capital = balance + remaining_open_margin
+                        recover_trigger_capital = tactical_balance * save_money_recover_trigger_pct / 100
+                        recover_amount = tactical_balance * save_money_recover_amount_pct / 100
+                        if active_capital < recover_trigger_capital:
+                            if save_money >= recover_amount:
+                                balance += recover_amount
+                                save_money -= recover_amount
 
-                    if profit_percent_per_month <= -monthly_loss_percent_stop_trade:
-                        cooldown_until_index = i
-                        trade_power = False    # off
+                    pending_monthly_stop_reason = monthly_stop_reason
+                    pending_monthly_stop_value = monthly_stop_value
 
-                if monthly_profit_close_filter == False and monthly_loss_close_filter == False:
-                    if balance >= tactical_balance * 1.08:
-                        tactical_balance = balance
-
-                # ---- save money ----
-                # Recovery trigger must use active portfolio capital (free balance + other open margins),
-                # not only free balance; otherwise multi-position mode withdraws too early.
-                if trade_power and (not used_save_money_for_monthly_loss):
-                    save_money_recover_amount_pct = 100 - save_money_recover_trigger_pct
-                    active_capital = balance + remaining_open_margin
-                    recover_trigger_capital = tactical_balance * save_money_recover_trigger_pct / 100
-                    recover_amount = tactical_balance * save_money_recover_amount_pct / 100
-                    if active_capital < recover_trigger_capital:
-                        if save_money >= recover_amount:
-                            balance += recover_amount
-                            save_money -= recover_amount
-
-                pending_monthly_stop_reason = monthly_stop_reason
-                pending_monthly_stop_value = monthly_stop_value
+        if not independent_directions:
+            cooldown_until_index = cooldowns['short']
+        if skip_remaining_candle:
+            continue
 
         if research:
             # Keep a compact, strategy-control-independent month-end equity

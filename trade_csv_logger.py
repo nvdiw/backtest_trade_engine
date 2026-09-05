@@ -1,3 +1,5 @@
+
+from excel_charts import add_report_chart
 import pandas as pd
 import os
 from collections import Counter
@@ -706,7 +708,7 @@ class TradeCSVLogger:
                     point.graphicalProperties.solidFill = color
                     point.graphicalProperties.line.solidFill = color
                     chart.series[0].dPt.append(point)
-                dashboard_ws.add_chart(chart, anchor)
+                add_report_chart(wb, chart)
 
         if not monthly_df.empty:
             monthly_ws = wb["Monthly Analysis"]
@@ -749,7 +751,7 @@ class TradeCSVLogger:
                     chart.dLbls = DataLabelList()
                     chart.dLbls.showVal = True
                     chart.dLbls.numFmt = '$#,##0'
-                dashboard_ws.add_chart(chart, "S2")
+                add_report_chart(wb, chart)
 
                 monthly_exact_rows = []
                 first_row = max(2, monthly_ws.max_row - 11)
@@ -798,7 +800,7 @@ class TradeCSVLogger:
                 chart.set_categories(
                     Reference(all_ws, min_col=close_column, min_row=2, max_row=all_ws.max_row)
                 )
-                dashboard_ws.add_chart(chart, "S20")
+                add_report_chart(wb, chart)
 
                 ending_rows = []
                 for label, column_name in (

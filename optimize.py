@@ -7,6 +7,8 @@ Examples:
     python optimize.py --mode grid -w 8
 """
 
+from excel_charts import add_report_chart
+
 import argparse
 import calendar
 import csv
@@ -27,7 +29,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ma_strategy import ma_strategy, required_indicator_warmup
-from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
+from strategy_config import build_ma_strategy_config, load_ma_strategy_tune, DIRECTIONAL_FIELDS
 from strategy_adapter import (
     StrategyAdapter,
     load_grid_source,
@@ -229,6 +231,9 @@ FOCUSED_PARAM_GRID = {
 }
 
 
+FULL_PARAM_GRID.update(long_enabled=[True], short_enabled=[True])
+
+
 def _grid_subset(*prefixes, extra=()):
     keys = set(extra)
     for key in FULL_PARAM_GRID:
@@ -276,6 +281,25 @@ STAGED_AUTO_PHASES = (
     ("scale", "scale"),
 )
 
+# Side profiles deliberately omit shared aliases for directional keys: mutating
+# both the inherited key and its override would waste trials on inactive values.
+for _side in ('long', 'short'):
+    for _name, _grid in list(PARAMETER_PROFILES.items()):
+        if _name in ('focused', 'signal', 'exit', 'risk_core', 'rsi', 'scale', 'full'):
+            PARAMETER_PROFILES[f'{_side}_{_name}'] = {
+                (key if key.startswith(f'rsi_{_side}_') else f'{_side}_{key}'): values
+                for key, values in _grid.items()
+                if key in DIRECTIONAL_FIELDS or key.startswith(f'rsi_{_side}_')
+            }
+    PARAMETER_PROFILES[_side] = PARAMETER_PROFILES[f'{_side}_full']
+PARAMETER_PROFILES['portfolio'] = {
+    key: values for key, values in FULL_PARAM_GRID.items()
+    if key not in DIRECTIONAL_FIELDS and not key.startswith(('rsi_long_', 'rsi_short_'))
+}
+PARAMETER_PROFILES['directional'] = {
+    **PARAMETER_PROFILES['portfolio'], **PARAMETER_PROFILES['long'], **PARAMETER_PROFILES['short']
+}
+
 
 def _strategy_staged_phases(args):
     """Return a strategy-owned staged schedule, preserving the MA default."""
@@ -288,6 +312,9 @@ def _strategy_staged_phases(args):
     declared = getattr(adapter.module, "STAGED_PHASES", None)
     if declared is None:
         if adapter.identifier == "ma_strategy:ma_strategy":
+            if getattr(args, 'directional', False):
+                return tuple((f'{side}_{name}', f'{side}_{profile}')
+                             for name, profile in STAGED_AUTO_PHASES for side in ('long', 'short')) + (('portfolio', 'portfolio'),)
             return STAGED_AUTO_PHASES
         return ()
     phases = []
@@ -533,6 +560,15 @@ class SmartCandidateGenerator:
             if strategy_adapter is not None
             else build_ma_strategy_config(baseline_params)
         )
+        if isinstance(defaults, dict):
+            defaults = dict(defaults)
+            for key in self.grid:
+                if key.startswith(('long_', 'short_')) and defaults.get(key) is None:
+                    defaults[key] = defaults.get(key.split('_', 1)[1], self.grid[key][0])
+        else:
+            for key in self.grid:
+                if key.startswith(('long_', 'short_')) and getattr(defaults, key, None) is None:
+                    setattr(defaults, key, getattr(defaults, key.split('_', 1)[1], self.grid[key][0]))
         self.baseline = {
             key: _nearest_value(
                 values,
@@ -711,8 +747,13 @@ class SmartCandidateGenerator:
         candidate = {key: parent["params"][key] for key in self.keys}
         if len(elites) > 1 and self.random.random() < crossover_probability:
             other = self._elite_choice(elites)["params"]
+            side_choices = {side: self.random.random() < 0.5 for side in ('long', 'short')}
             for key in self.mutable_keys:
-                if self.random.random() < 0.5:
+                # Preserve a parent's complete directional setup rather than
+                # splicing incompatible MA periods and exit settings together.
+                side = key.split('_', 1)[0]
+                take_other = side_choices[side] if side in side_choices else self.random.random() < 0.5
+                if take_other:
                     candidate[key] = other[key]
 
         max_mutations = max(2, round(math.sqrt(max(1, len(self.mutable_keys)))))
@@ -2248,7 +2289,7 @@ def _save_optimizer_workbook(
         chart.dLbls.numFmt = "0.000"
         chart.series[0].graphicalProperties.solidFill = "8064A2"
         chart.series[0].graphicalProperties.line.solidFill = "5F497A"
-        dashboard_ws.add_chart(chart, "E2")
+        add_report_chart(workbook, chart)
 
     directional_ws = workbook["Directional Metrics"]
     directional_headers = {cell.value: cell.column for cell in directional_ws[1]}
@@ -2279,7 +2320,7 @@ def _save_optimizer_workbook(
         for series, color in zip(chart.series, ("70AD47", "C0504D")):
             series.graphicalProperties.solidFill = color
             series.graphicalProperties.line.solidFill = color
-        dashboard_ws.add_chart(chart, "E18")
+        add_report_chart(workbook, chart)
     workbook.save(output_path)
     return output_path
 
@@ -3062,6 +3103,24 @@ def _select_surrogate_candidates(
         for record in training_history
     ]
     targets = [float(_surrogate_target(record)) for record in training_history]
+    # A deterministic held-back part of search history tests whether the model
+    # can rank unseen configurations. This never consumes reporting OOS data.
+    probe_indices = list(range(len(training_history)))
+    random.Random(seed + 104729).shuffle(probe_indices)
+    validation_count = max(1, min(len(probe_indices)-3, max(8, len(probe_indices) // 5)))
+    validation_indices, fit_indices = probe_indices[:validation_count], probe_indices[validation_count:]
+    probe = ExtraTreesSurrogate(n_trees=min(16, features['surrogate_trees']),
+                                max_depth=8, min_leaf=3, seed=seed + 17).fit(
+        [training_features[i] for i in fit_indices], [targets[i] for i in fit_indices])
+    probe_predictions = [v[0] for v in probe.predict_mean_std([training_features[i] for i in validation_indices])]
+    predicted_ranks = _rank_fractions(probe_predictions)
+    actual_ranks = _rank_fractions([targets[i] for i in validation_indices])
+    pred_mean, actual_mean = statistics.fmean(predicted_ranks), statistics.fmean(actual_ranks)
+    covariance = sum((p-pred_mean)*(a-actual_mean) for p,a in zip(predicted_ranks, actual_ranks))
+    variance = math.sqrt(sum((p-pred_mean)**2 for p in predicted_ranks) * sum((a-actual_mean)**2 for a in actual_ranks))
+    rank_correlation = covariance / variance if variance else 0.0
+    model_trust = min(1.0, max(0.0, rank_correlation))
+    quality_fraction = 0.25 + 0.25 * model_trust
     model = ExtraTreesSurrogate(
         n_trees=features["surrogate_trees"],
         max_depth=max(6, min(12, round(math.log2(len(training_history) + 1)) + 1)),
@@ -3133,7 +3192,7 @@ def _select_surrogate_candidates(
                 selected_indices.append(index)
                 selected_buckets[fingerprint] = selected_buckets.get(fingerprint, 0) + 1
 
-    quality_target = max(1, round(count * 0.50))
+    quality_target = max(1, round(count * quality_fraction))
     uncertainty_target = min(count, quality_target + round(count * 0.20))
     diversity_target = min(count, uncertainty_target + round(count * 0.20))
     add(ranked_quality, quality_target)
@@ -3149,6 +3208,9 @@ def _select_surrogate_candidates(
     return selected, {
         "enabled": True,
         "model": "dependency_free_extra_trees",
+        "validation_rank_correlation": rank_correlation,
+        "validation_samples": validation_count,
+        "validation_scope": "held-back search configurations, never reporting OOS",
         "history_samples": len(usable_history),
         "training_samples": len(training_history),
         "training_target": "normalized_and_robust_funnel_rank",
@@ -3162,8 +3224,8 @@ def _select_surrogate_candidates(
         "diversity_keys": diversity_keys,
         "diversity_buckets": len(set(fingerprints[index] for index in selected_indices)),
         "selection_mix": {
-            "quality_acquisition": 0.50, "uncertainty": 0.20,
-            "diversity_novelty": 0.20, "random": 0.10,
+            "quality_acquisition": quality_fraction, "uncertainty": 0.20,
+            "diversity_novelty": 0.20, "random": 0.60-quality_fraction,
         },
     }
 
@@ -4197,7 +4259,8 @@ def _flatten_hall_record(record, keys, rank, state=None):
             if stage == "final":
                 continue
             row[f"{stage}_{metric}"] = metrics.get(metric)
-    row.update({key: record.get("effective_params", record["params"]).get(key) for key in keys})
+    effective_params = record.get('effective_params') or record.get('params') or {}
+    row.update({key: effective_params.get(key) for key in keys})
     return row
 
 
@@ -4565,7 +4628,7 @@ def _save_auto_workbook(
         chart.dLbls.numFmt = '0.00"%"'
         chart.series[0].graphicalProperties.solidFill = "4472C4"
         chart.series[0].graphicalProperties.line.solidFill = "2F5597"
-        dashboard_sheet.add_chart(chart, "E2")
+        add_report_chart(workbook, chart)
     directional_sheet = workbook["Directional Metrics"]
     directional_headers = {cell.value: cell.column for cell in directional_sheet[1]}
     rank_column = directional_headers.get("rank")
@@ -4599,7 +4662,7 @@ def _save_auto_workbook(
         for series, color in zip(chart.series, ("70AD47", "C0504D")):
             series.graphicalProperties.solidFill = color
             series.graphicalProperties.line.solidFill = color
-        dashboard_sheet.add_chart(chart, "E18")
+        add_report_chart(workbook, chart)
     workbook.save(staging_path)
     try:
         _replace_with_retry(staging_path, output_path)
@@ -5673,8 +5736,14 @@ def _staged_seed_data(records, grid, baseline):
     denominator = max(1, len(ranked) - 1)
     for rank, record in enumerate(ranked):
         effective = record.get("effective_params") or record.get("params") or {}
+        def inherited_value(key):
+            value = effective.get(key, getattr(defaults, key, None))
+            if value is None and key.startswith(('long_', 'short_')):
+                common = key.split('_', 1)[1]
+                value = effective.get(common, getattr(defaults, common, grid[key][0]))
+            return value
         params = {
-            key: _nearest_value(grid[key], effective.get(key, getattr(defaults, key)))
+            key: _nearest_value(grid[key], inherited_value(key))
             for key in keys
         }
         signature = _candidate_signature(params, keys)
@@ -5692,7 +5761,9 @@ def _staged_seed_data(records, grid, baseline):
 
 
 def _staged_report_rows(records):
-    parameter_keys = tuple(FULL_PARAM_GRID)
+    parameter_keys = tuple(dict.fromkeys([*FULL_PARAM_GRID, *(
+        key for record in records for key in (record.get('effective_params') or {})
+        if key.startswith(('long_', 'short_')))]))
     rows = []
     for rank, record in enumerate(records, start=1):
         effective = record.get("effective_params") or {}
@@ -5731,7 +5802,8 @@ def _staged_report_rows(records):
     return rows
 
 
-def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
+def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None,
+                          excel_enabled=True, state=None):
     ranked = list(records)[:max(1, int(top_n))]
     if not ranked:
         return
@@ -5753,6 +5825,14 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None):
         output_dir / "best_candidate_summary.json",
         _candidate_summary(ranked[0], 1, Path("best_params.json")),
     )
+    if excel_enabled:
+        parameter_keys = tuple(dict.fromkeys(key for record in ranked for key in record['effective_params']))
+        workbook_rows = [_flatten_hall_record(record, parameter_keys, rank, state=state)
+                         for rank, record in enumerate(ranked, 1)]
+        _save_auto_workbook(output_dir, workbook_rows, [], state=state)
+        if snapshot_dir is not None:
+            Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
+            _save_auto_workbook(snapshot_dir, workbook_rows, [], state=state, filename='snapshot_report.xlsx')
     if snapshot_dir is not None:
         snapshot_dir = Path(snapshot_dir)
         snapshot_dir.mkdir(parents=True, exist_ok=True)
@@ -6207,10 +6287,26 @@ def _run_random_window_audit(args, candidates, output_dir, block, final_end):
         _write_best_params_manifest(
             output_dir,
             status="final_random_window_audit",
-            selection_basis="rank #1 finalist by independent random-window robustness audit",
+            selection_basis="rank #1 finalist by development random-window robustness audit",
             metrics=summaries[0],
             candidate_id=summaries[0].get("candidate_id"),
         )
+        # Export already-computed winner windows automatically; no duplicate
+        # backtests and no separate terminal command are needed.
+        if getattr(args, 'excel_top', 5000):
+            from evaluate_params import summarize, write_workbook
+            winner_records = [dict(record, start_date=record['start_label'],
+                                   end_exclusive=record['end_label']) for record in records
+                              if record['candidate_id'] == summaries[0]['candidate_id']]
+            report, frame = summarize(winner_records, len(windows), args.min_trades or 0,
+                                      args.max_drawdown or 40, .7, .7)
+            write_workbook(output_dir / 'random_window_report.xlsx', frame, report,
+                           summaries[0]['effective_params'],
+                           dict(source='Auto snapshot audit (selection data)',
+                                min_trades=args.min_trades or 0, max_drawdown=args.max_drawdown or 40,
+                                min_positive_ratio=.7, min_pass_ratio=.7,
+                                selection_warning='Winner selected using these windows; descriptive results only'),
+                           winner_records)
     return summaries[0] if summaries else None
 
 
@@ -7694,7 +7790,9 @@ def run_staged_optimization(args):
             archive[:int(args.snapshot_top)], phase_grid, baseline
         )
         phase_args._seed_elites = seeds
-        phase_args._seed_history = seeds
+        # Projected winners are useful parents, but their old scores were
+        # measured with different fixed settings. Re-evaluate before learning.
+        phase_args._seed_history = []
 
         print(
             f"\nStaged block {block} | phase {phase_index + 1}/{phase_count}: "
@@ -7728,10 +7826,14 @@ def run_staged_optimization(args):
         state["status"] = "running"
         state["updated_at"] = _timestamp_now()
 
+        if state['phase_index'] < phase_count:
+            _write_staged_ranking(output_dir, archive, args.snapshot_top,
+                                  excel_enabled=bool(args.excel_top), state=state)
         if state["phase_index"] >= phase_count:
             snapshot_dir = output_dir / "snapshots" / f"cycles_{state['cycles_completed']:06d}"
             _write_staged_ranking(
-                output_dir, archive, args.snapshot_top, snapshot_dir=snapshot_dir
+                output_dir, archive, args.snapshot_top, snapshot_dir=snapshot_dir,
+                excel_enabled=False, state=state,
             )
             audit_best = _run_random_window_audit(
                 args, archive[:args.random_audit_top], output_dir, block,
@@ -7770,11 +7872,13 @@ def run_staged_optimization(args):
                 )
                 _write_json(archive_path, archive)
                 _write_staged_ranking(
-                    output_dir, archive, args.snapshot_top, snapshot_dir=snapshot_dir
+                    output_dir, archive, args.snapshot_top, snapshot_dir=snapshot_dir,
+                    excel_enabled=bool(args.excel_top), state=state,
                 )
                 for filename in (
                     "random_window_results.csv", "random_window_summary.csv",
                     "random_windows.csv", "random_window_summary.json", "best_params.json",
+                    "random_window_report.xlsx",
                 ):
                     source = output_dir / filename
                     if source.is_file():
@@ -7821,6 +7925,8 @@ def run_staged_optimization(args):
 
     state.update({"status": "completed", "updated_at": _timestamp_now()})
     _write_json(state_path, state)
+    _write_staged_ranking(output_dir, archive, args.snapshot_top,
+                          excel_enabled=bool(args.excel_top), state=state)
     if (output_dir / "best_params.json").is_file():
         print(f"USE THIS PARAMETER FILE: {output_dir / 'best_params.json'}")
         print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
@@ -8652,11 +8758,24 @@ Tips:
         "--random-audit-max-months", type=int, default=12, metavar="N",
         help="maximum random audit window duration",
     )
+    parser.add_argument('--directional', action='store_true',
+                        help='MA: optimize long/short separately; use side phases with --staged')
+    parser.add_argument('--autopilot', action='store_true',
+                        help='MA: start staged directional Auto with automatic snapshot and audit workbooks')
     return parser
 
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.autopilot:
+        args.auto = args.staged = args.directional = True
+    if args.directional:
+        if args.strategy not in ('ma', 'ma_strategy', 'ma_strategy:ma_strategy'):
+            raise SystemExit('--directional/--autopilot currently require the MA strategy')
+        if args.profile is None:
+            args.profile = 'directional'
+        if args.staged:
+            args.snapshot_cycles = args.stage_cycles * (2 * len(STAGED_AUTO_PHASES) + 1)
     try:
         args._strategy_adapter = _adapter_from_spec(args.strategy)
         args._parameter_profiles = _profiles_from_args(args)
