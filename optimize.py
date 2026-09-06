@@ -24,17 +24,23 @@ import random
 import shutil
 import signal
 import statistics
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ma_strategy import ma_strategy, required_indicator_warmup
 from strategy_config import build_ma_strategy_config, load_ma_strategy_tune, DIRECTIONAL_FIELDS
 from strategy_adapter import (
     StrategyAdapter,
     load_grid_source,
     resolve_strategy,
 )
+
+
+def ma_strategy(*args, **kwargs):
+    """Load MA only when selected; other plug-ins do not require its module."""
+    from ma_strategy import ma_strategy as run_ma
+    return run_ma(*args, **kwargs)
 from research_statistics import (
     deflated_sharpe_ratio,
     grid_ordinal_position,
@@ -52,6 +58,7 @@ from market_data_audit import (
     fingerprint_data,
 )
 from market_data import MarketDataSource
+from strategy_workspace import output_path, claim_output, assert_strategy_path, output_session
 from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session, apply_process_policy
 
 
@@ -472,6 +479,10 @@ def _profiles_from_args(args):
                 f"strategy {adapter.identifier} does not expose param_grid or "
                 "PARAMETER_PROFILES; provide --param-grid JSON|module:attribute"
             )
+    validator = getattr(adapter.module, 'validate_parameter_grid', None)
+    if callable(validator):
+        for profile_grid in profiles.values():
+            validator(profile_grid)
     try:
         args._parameter_profiles = profiles
     except Exception:
@@ -5258,7 +5269,8 @@ def run_auto_optimization(args, grid=None):
                     grid,
                     seed=args.seed + cycle - 1,
                     baseline_params=continuation_base,
-                    continuous_refinement=bool(elite_records),
+                    continuous_refinement=bool(elite_records) and getattr(
+                        _adapter_from_args(args).module, 'ALLOW_CONTINUOUS_REFINEMENT', True),
                     parameter_importance={
                         key: item.get("weight", 1.0) for key, item in importance.items()
                     },
@@ -8471,7 +8483,7 @@ Tips:
 
     output = parser.add_argument_group("output, checkpoints, and planning")
     output.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, metavar="PATH",
-                        help="directory for CSV, JSON, checkpoints, and reports")
+                        help="directory for reports; CLI default: outputs/<strategy>/optimize (research/holdout for those modes)")
     output.add_argument("--resume", action="store_true",
                         help="require a compatible checkpoint; auto detects one without this flag")
     output.add_argument("--log-every", type=int, default=10, metavar="N",
@@ -8777,6 +8789,7 @@ Tips:
 
 
 @runtime_session
+@output_session
 def main(argv=None):
     args = build_parser().parse_args(argv)
     try:
@@ -8806,6 +8819,16 @@ def main(argv=None):
             f"unknown profile {args.profile!r}; available profiles: "
             + ", ".join(args._parameter_profiles)
         )
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    explicit = lambda flag: any(a == flag or a.startswith(flag + '=') for a in arguments)
+    workflow = 'research' if args.research else 'holdout' if args.sealed_holdout else 'optimize'
+    identifier = args._strategy_adapter.identifier
+    if not explicit('--output-dir'):
+        args.output_dir = str(output_path(identifier, workflow))
+    if not explicit('--base-params'):
+        args.base_params = str(output_path(identifier, 'optimize') / 'best_params.json')
+    assert_strategy_path(args.output_dir, identifier)
+    assert_strategy_path(args.base_params, identifier)
     if args.list_profiles:
         print(f"Strategy: {args._strategy_adapter.identifier}")
         for name, grid in args._parameter_profiles.items():
@@ -9178,6 +9201,7 @@ def main(argv=None):
         return
     multiprocessing.freeze_support()
     if args.refresh_auto_report:
+        claim_output(args.output_dir, identifier, workflow)
         report_path = refresh_auto_report_monthly(
             args.output_dir,
             top_n=getattr(args, "snapshot_top", 100),
@@ -9185,15 +9209,7 @@ def main(argv=None):
         )
         print(f"Refreshed Auto report: {report_path}")
         return
-    if args.auto and args.output_dir == DEFAULT_OUTPUT_DIR:
-        protocol_tag = (
-            f"{str(args.auto_stress_start)[:10].replace('-', '')}_"
-            f"{str(date_protocol.get('holdout_end', args.auto_end))[:10].replace('-', '')}"
-        )
-        args.output_dir = os.path.join(
-            DEFAULT_OUTPUT_DIR,
-            ("staged_" if args.staged else "auto_") + protocol_tag,
-        )
+    claim_output(args.output_dir, identifier, workflow)
     resolved_cli_config = {
         key: value for key, value in vars(args).items() if not key.startswith("_")
     }

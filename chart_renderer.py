@@ -72,6 +72,9 @@ def render_backtest_chart(
     lst_profit_percent_per_month,
     chart_show=True,
     chart_save_path=None,
+    price_overlays=None,
+    oscillator_label="RSI",
+    chart_title=None,
 ):
     source_open = np.asarray(open_prices, dtype=float)
     source_high = np.asarray(high_prices, dtype=float)
@@ -82,6 +85,12 @@ def render_backtest_chart(
     source_ma100 = np.asarray(ma_100, dtype=float)
     source_ma200 = np.asarray(ma_200, dtype=float)
     source_rsi = np.asarray(rsi_values, dtype=float)
+    overlays = {name: np.asarray(values, dtype=float) for name, values in (price_overlays or {}).items()}
+    finite_oscillator = source_rsi[np.isfinite(source_rsi)]
+    oscillator_limits = (0, 100) if oscillator_label == 'RSI' else (
+        0, max(1e-9, float(finite_oscillator.max()) * 1.1) if finite_oscillator.size else 1)
+    if any(len(values) != len(source_close) for values in overlays.values()):
+        raise ValueError('Chart overlays must match candle count')
     source_times = pd.to_datetime(np.asarray(close_times, dtype=object), utc=True)
     source_open_times = pd.to_datetime(np.asarray(open_times, dtype=object), utc=True)
     total_candles = len(source_close)
@@ -523,6 +532,12 @@ def render_backtest_chart(
     
             preview_mode = bool(nav_state.get("preview_mode"))
             add_plots = []
+            overlay_colors = ('#66C7FF', '#FFC774', '#FF6B7A', '#BA9CFF')
+            for overlay_index, (name, values) in enumerate(overlays.items()):
+                series = pd.Series(downsample_last(values[plot_start:plot_end], render_step), index=time_index)
+                if has_finite(series):
+                    add_plots.append(mpf.make_addplot(series, ax=ax_price,
+                        color=overlay_colors[overlay_index % len(overlay_colors)], width=1.0, label=name))
             if has_finite(ema16_series):
                 add_plots.append(
                     mpf.make_addplot(ema16_series, ax=ax_price, color=chart_palette["ema16"], width=1.0)
@@ -650,26 +665,27 @@ def render_backtest_chart(
                     mpf.make_addplot(rsi_series, ax=ax_rsi, color=chart_palette["rsi"], width=1.2)
                 )
                 
-                # line 30 (oversold)
-                oversold_line = pd.Series([30] * len(time_index), index=time_index)
-                add_plots.append(
-                    mpf.make_addplot(oversold_line, ax=ax_rsi, color=chart_palette["rsi_oversold"], 
-                                    width=0.8, linestyle="--", alpha=0.7)
-                )
+                if oscillator_label == 'RSI':
+                    # line 30 (oversold)
+                    oversold_line = pd.Series([30] * len(time_index), index=time_index)
+                    add_plots.append(
+                        mpf.make_addplot(oversold_line, ax=ax_rsi, color=chart_palette["rsi_oversold"],
+                                        width=0.8, linestyle="--", alpha=0.7)
+                    )
                 
-                # line 70 (overbought)
-                overbought_line = pd.Series([70] * len(time_index), index=time_index)
-                add_plots.append(
-                    mpf.make_addplot(overbought_line, ax=ax_rsi, color=chart_palette["rsi_overbought"], 
-                                    width=0.8, linestyle="--", alpha=0.7)
-                )
+                    # line 70 (overbought)
+                    overbought_line = pd.Series([70] * len(time_index), index=time_index)
+                    add_plots.append(
+                        mpf.make_addplot(overbought_line, ax=ax_rsi, color=chart_palette["rsi_overbought"],
+                                        width=0.8, linestyle="--", alpha=0.7)
+                    )
                 
-                # line 50 (mid)
-                mid_line = pd.Series([50] * len(time_index), index=time_index)
-                add_plots.append(
-                    mpf.make_addplot(mid_line, ax=ax_rsi, color=chart_palette["rsi_mid"], 
-                                    width=0.5, linestyle=":", alpha=0.5)
-                )
+                    # line 50 (mid)
+                    mid_line = pd.Series([50] * len(time_index), index=time_index)
+                    add_plots.append(
+                        mpf.make_addplot(mid_line, ax=ax_rsi, color=chart_palette["rsi_mid"],
+                                        width=0.5, linestyle=":", alpha=0.5)
+                    )
 
             last_close_price = float(ds_close[-1])
             plot_kwargs = {}
@@ -742,20 +758,28 @@ def render_backtest_chart(
                 ax_equity.set_ylim(fixed_equity_ylim)
     
             ax_price.set_title(
-                f"BTC - OHLC + MAs | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped} | Drag/Wheel/\u2190/\u2192 | \u2191 oldest | \u2193 latest | Hover a trade marker for full details",
+                (f"{chart_title} | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped}"
+                 if chart_title else
+                 f"BTC - OHLC + MAs | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped} | Drag/Wheel/\u2190/\u2192 | \u2191 oldest | \u2193 latest | Hover a trade marker for full details"),
                 color=chart_palette["text"],
             )
             ax_price.set_ylabel("BTC Price")
             ax_equity.set_ylabel("Balance ($)")
             ax_price.tick_params(labelbottom=False)
 
-            ax_rsi.set_ylabel("RSI", color=chart_palette["text"], fontsize=10)
-            ax_rsi.set_ylim(0, 100)
+            ax_rsi.set_ylabel(oscillator_label, color=chart_palette["text"], fontsize=10)
+            ax_rsi.set_ylim(*oscillator_limits)
 
-            ax_rsi.axhspan(0, 30, alpha=0.08, color=chart_palette["rsi_oversold"], zorder=0)
-            ax_rsi.axhspan(70, 100, alpha=0.08, color=chart_palette["rsi_overbought"], zorder=0)
+            if oscillator_label == 'RSI':
+                ax_rsi.axhspan(0, 30, alpha=0.08, color=chart_palette["rsi_oversold"], zorder=0)
+                ax_rsi.axhspan(70, 100, alpha=0.08, color=chart_palette["rsi_overbought"], zorder=0)
 
-            ax_rsi.tick_params(labelbottom=False)
+            ax_equity.tick_params(labelbottom=False)
+            ax_rsi.tick_params(labelbottom=True, labelrotation=15, labelsize=8)
+            ax_rsi.set_xlabel('Candle time (UTC)', color=chart_palette['muted'])
+            if overlays:
+                ax_price.legend(loc='upper right', fontsize=8, ncol=len(overlays),
+                                facecolor=chart_palette['panel_bg'], labelcolor=chart_palette['text'])
 
             # visual separator between price panel and equity panel
             ax_price.spines["bottom"].set_visible(True)
@@ -1302,14 +1326,14 @@ def render_backtest_chart(
         
         if ax_rsi.bbox.contains(event.x, event.y) and cursor_y_on_rsi is not None:
             # Check if within valid RSI range (0-100)
-            if 0 <= cursor_y_on_rsi <= 100:
+            if oscillator_limits[0] <= cursor_y_on_rsi <= oscillator_limits[1]:
                 if hline_rsi is not None:
                     hline_rsi.set_ydata([cursor_y_on_rsi, cursor_y_on_rsi])
                     hline_rsi.set_visible(True)
                 
                 if rsi_label is not None:
                     rsi_label.set_y(cursor_y_on_rsi)
-                    rsi_label.set_text(f"RSI: {cursor_y_on_rsi:.1f}")
+                    rsi_label.set_text(f"{oscillator_label}: {cursor_y_on_rsi:.2f}")
                     rsi_label.set_visible(True)
             else:
                 # Outside RSI range (0-100), hide crosshair
@@ -1443,7 +1467,7 @@ def render_backtest_chart(
 
         elif event.inaxes == ax_rsi:
             # Reset RSI to 0-100 range on double click
-            ax_rsi.set_ylim(0, 100)
+            ax_rsi.set_ylim(*oscillator_limits)
             fig.canvas.draw_idle()
 
     def on_click(event):

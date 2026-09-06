@@ -232,7 +232,7 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `--tests N` | `5000` | Smart-mode candidate budget; not a grid-mode limit. |
 | `--profile NAME` | mode-dependent | `full` in Auto mode, `focused` otherwise; staged mode selects `signal`, `exit`, `risk_core`, `rsi`, and `scale` automatically. |
 | `--base-source config\|best\|file` | `config` | Baseline outside the selected profile. |
-| `--base-params FILE` | `outputs/optimize/best_params.json` | JSON for `best` or `file`. |
+| `--base-params FILE` | `outputs/<strategy>/optimize/best_params.json` | JSON for `best` or `file`. |
 | `-w N`, `--workers N` | up to `8` | Worker processes; use `1` for easiest debugging. |
 | `--batch-size N` | `0` | Checkpoint batch size; `0` is automatic. |
 | `--chunksize N` | `0` | Multiprocessing task chunk; `0` is automatic. |
@@ -247,7 +247,7 @@ The optimizer evaluates `ma_strategy` with charting, verbose output, and trade-f
 | `--overfit-penalty X` | `0.25` | Penalty when train score exceeds validation score. |
 | `--min-trades N` | `0` | Disqualify candidates with too few closed trades. |
 | `--max-drawdown X` | — | Disqualify candidates above this absolute drawdown %. |
-| `--output-dir DIR` | `outputs/optimize` | Checkpoints and results. |
+| `--output-dir DIR` | `outputs/<strategy>/optimize` | Checkpoints and results. |
 | `--resume` | off | Continue a compatible results CSV. |
 | `--log-every N` | `10` | Progress interval; `0` is silent. |
 | `--top-n N` | `20` | Ranked candidates saved to `top_results.json`. |
@@ -500,6 +500,10 @@ outputs/                generated artifacts
 
 
 ## Runtime resources and candle timeframe
+
+Pulse (`--strategy pulse`) implements the one-minute rolling-range breakout using the shared TradeEngine, CSV/XLSX logger, monthly reports and interactive chart renderer. See [Pulse rules, parameter schema, tests and commands](PULSE_GUIDE_FA.md). Its initial shared grid has 392 combinations; risk and cost assumptions are not search dimensions.
+
+Outputs now default to `outputs/<strategy>/backtest`, `optimize`, `evaluate`, `research` or `holdout`. Workspace ownership prevents cross-strategy reuse, and OS locks prevent concurrent writers to the same run directory. Legacy outputs stay in place and remain selectable with an explicit path. See [strategy workspaces](STRATEGY_WORKSPACES_FA.md).
 
 Git tracks source code, tests, documentation and parameter grids. Generated files in `outputs/`, local candle datasets in `data_candle/`, Python caches, environments and scratch files are ignored. Supply an OHLCV CSV through `--data-file`; ignoring an existing local file does not delete it.
 

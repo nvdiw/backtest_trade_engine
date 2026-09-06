@@ -19,6 +19,7 @@ from typing import Any, Mapping
 
 from indicators import Indicator
 from trade_engine import AccountState, Position, TradeEngine
+from strategy_workspace import claim_output, output_session
 
 
 DATA_FILE = Path(__file__).resolve().parent / "data_candle" / "btc_1m_data.csv"
@@ -197,6 +198,7 @@ def _portfolio_equity(engine, account, position, mark_price):
     return account.balance + account.save_money + position_equity
 
 
+@output_session
 def example_strategy(
     tune: Mapping[str, Any] | None = None,
     start="2025-01-01",
@@ -205,12 +207,14 @@ def example_strategy(
     use_indicator_warmup=True,
     indicator_warmup_candles=None,
     research=False,
-    output_dir="outputs/example_strategy",
+    output_dir="outputs/example/backtest",
     **_ignored,
 ):
     """Run a causal one-position MA-crossover example on BTC 1m candles."""
     config = build_strategy_config(tune)
     optimize = bool(config.optimize)
+    if not optimize:
+        claim_output(output_dir, 'example_strategy:example_strategy', 'backtest')
     required_warmup = required_indicator_warmup(config)
     warmup = (
         max(required_warmup, int(indicator_warmup_candles or 0))

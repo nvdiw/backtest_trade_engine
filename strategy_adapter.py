@@ -103,6 +103,8 @@ class StrategyAdapter:
         return _plain_config_values(self.config_builder(dict(tune or {})))
 
     def load_tune(self, path: str | Path) -> dict[str, Any]:
+        from strategy_workspace import assert_strategy_path
+        assert_strategy_path(path, self.identifier)
         if self.tune_loader is not None:
             return dict(self.tune_loader(path))
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -266,6 +268,8 @@ def resolve_strategy(specification: str | None = None) -> StrategyAdapter:
     aliases = {
         "ma": "ma_strategy:ma_strategy",
         "ma_strategy": "ma_strategy:ma_strategy",
+        "pulse": "pulse_strategy:pulse_strategy",
+        "pulse_strategy": "pulse_strategy:pulse_strategy",
         "rsi": "rsi_strategy:rsi_strategy",
         "rsi_strategy": "rsi_strategy:rsi_strategy",
     }
@@ -284,6 +288,8 @@ def resolve_strategy(specification: str | None = None) -> StrategyAdapter:
             ) from exc
         raise
     function = getattr(module, function_name, None)
+    if getattr(module, 'STRATEGY_READY', True) is False:
+        raise ValueError(f'{getattr(module, "DISPLAY_NAME", module_name)} is not implemented yet; trading rules are pending')
     if not callable(function):
         raise ValueError(f"strategy callable not found: {module_name}:{function_name}")
 

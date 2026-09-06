@@ -36,6 +36,9 @@ IN_FILE = os.path.join('outputs', 'trades', 'data_orders.csv')
 OUT_FILE = os.path.join('outputs', 'monthly', 'monthly_data_orders.csv')
 
 
+MONTHLY_COLUMNS = ('month', 'total_trades', 'total_wins', 'total_losses', 'total_longs', 'total_shorts', 'long_wins', 'long_losses', 'long_win_rate', 'long_profit', 'long_fees', 'long_profit_factor', 'long_expectancy', 'short_wins', 'short_losses', 'short_win_rate', 'short_profit', 'short_fees', 'short_profit_factor', 'short_expectancy', 'monthly_profit', 'monthly_fee_paid', 'total_duration_minutes', 'win_rate', 'avg_profit_per_trade', 'first_balance', 'last_balance', 'net_percent')
+
+
 def summarize_monthly(df: pd.DataFrame) -> pd.DataFrame:
     # remove summary rows and ensure datetime parsing
     df = df[~df['type'].astype(str).str.upper().str.startswith('SUMMARY')].copy()
@@ -136,7 +139,7 @@ def summarize_monthly(df: pd.DataFrame) -> pd.DataFrame:
             'net_percent': float(net_percent) if net_percent is not None else None,
         })
 
-    out_df = pd.DataFrame(groups).sort_values('month')
+    out_df = pd.DataFrame(groups, columns=MONTHLY_COLUMNS).sort_values('month')
     return out_df
 
 

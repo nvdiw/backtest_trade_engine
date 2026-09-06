@@ -2,6 +2,8 @@
 
 import os
 import math
+import json
+from pathlib import Path
 from datetime import datetime, timezone
 from functools import lru_cache
 from dataclasses import dataclass, field, fields
@@ -242,6 +244,12 @@ class TradeEngine:
         self.maintenance_margin_rate = max(0.0, float(maintenance_margin_rate))
         self.liquidation_fee_rate = max(0.0, float(liquidation_fee_rate))
         self.verbose = bool(verbose)
+        if self.verbose:
+            import sys
+            # Library callers may still use a legacy Windows code page.
+            # Keep logging from aborting a completed trade on an arrow/emoji.
+            if hasattr(sys.stdout, 'reconfigure'):
+                sys.stdout.reconfigure(errors='replace')
         if track_equity_curve is None:
             track_equity_curve = not bool(optimize)
         self.track_equity_curve = bool(track_equity_curve)
@@ -355,6 +363,38 @@ class TradeEngine:
     def display(enabled, *parts):
         if enabled:
             print(*parts)
+
+    def render_strategy_chart(self, *, market, chart_state, account, result,
+                              price_overlays, oscillator_values, oscillator_label,
+                              title, show=False, save_path=None, max_candles=500):
+        """Strategy-neutral bridge to the same interactive renderer used by MA."""
+        empty = np.full(len(market['close_prices']), np.nan)
+        return render_backtest_chart(
+            **chart_state,
+            **{key: market[key] for key in ('close_prices', 'close_times', 'open_times',
+                                           'open_prices', 'high_prices', 'low_prices')},
+            ema_16=empty, ma_50=empty, ma_100=empty, ma_200=empty,
+            rsi_values=oscillator_values, oscillator_label=oscillator_label,
+            price_overlays=price_overlays, chart_title=title,
+            plot_end_offset=0, plot_max_candles=max_candles, plot_step_candles=100,
+            plot_min_zoom_candles=20, plot_max_render_candles=900,
+            plot_zoom_in_factor=.8, plot_zoom_out_factor=1.25,
+            plot_window_width_scale=.9, plot_window_height_scale=.9,
+            plot_drag_preview_factor=.3, plot_drag_update_interval_ms=75,
+            plot_yscale_drag_sensitivity=.003, balance=result['final_balance'],
+            profits_lst=account.profits_lst, t_profit_percent=result['total_profit_percent'],
+            count_closed_orders=account.count_closed_orders, total_wins=account.total_wins,
+            total_losses=account.total_losses, max_drawdown=account.max_drawdown,
+            lst_profit_percent_per_month=result['monthly_returns'],
+            chart_show=show, chart_save_path=save_path)
+
+    def save_run_metadata(self, result, parameters):
+        """Shared JSON sidecars; callers hold their strategy workspace lock."""
+        output = Path(self.output_dir)
+        output.mkdir(parents=True, exist_ok=True)
+        for filename, payload in (('result.json', result), ('params.json', parameters)):
+            (output / filename).write_text(json.dumps(payload, indent=2,
+                default=lambda value: value.item() if isinstance(value, np.generic) else str(value)) + '\n', encoding='utf-8')
 
     @staticmethod
     def _safe_percent(value, base):
@@ -540,6 +580,62 @@ class TradeEngine:
         account.apply_result(result)
         account.record_closed_trade("long", result)
         return result
+
+    def open_risk_position(self, i, prices, times, account, *, side, stop_distance,
+                           risk_per_trade, max_gross_exposure, trade_id,
+                           quantity_step=0.0, min_quantity=0.0, min_notional=0.0):
+        """Risk-budgeted 1x entry using the existing fills and account ledger.
+
+        Risk excludes costs/gaps. Reserve both estimated fees in the cash cap;
+        the existing ledger charges entry and exit fees together when closed.
+        """
+        if side not in ('long', 'short'):
+            raise ValueError('side must be long or short')
+        if not math.isfinite(stop_distance) or stop_distance <= 0:
+            return None, None, 'invalid_stop_distance'
+        fill = float(prices[i]) * (1 + self.slippage_rate if side == 'long' else 1 - self.slippage_rate)
+        equity = account.balance + account.save_money
+        if min(fill, equity, account.balance, account.tactical_balance) <= 0:
+            return None, None, 'insufficient_balance'
+        qty = min(equity * risk_per_trade / stop_distance,
+                  equity * max_gross_exposure / fill,
+                  account.balance / (fill * (1 + 2 * self.fee_rate)))
+        if quantity_step:
+            from decimal import Decimal, ROUND_FLOOR
+            step = Decimal(str(quantity_step))
+            qty = float((Decimal(str(qty)) / step).to_integral_value(rounding=ROUND_FLOOR) * step)
+        if qty <= 0 or qty < min_quantity or qty * fill < min_notional:
+            return None, None, 'below_minimum_order'
+        stop = fill - stop_distance if side == 'long' else fill + stop_distance
+        if stop <= 0:
+            return None, None, 'invalid_stop_price'
+        fraction = qty * fill / account.tactical_balance
+        method = self.open_long if side == 'long' else self.open_short
+        opened = method(i, prices, times, account, trade_amount_percent=fraction, leverage=1.0)
+        position = Position.from_open_result(opened, trade_id=trade_id, side=side,
+                                            entry_index=i, high_price=opened['entry_price'],
+                                            low_price=opened['entry_price'], reason='range_breakout')
+        return position, stop, None
+
+    @staticmethod
+    def protective_stop_reference(side, stop, open_price, high, low, *, data_gap=False):
+        """Conservative market-stop reference, before adverse execution costs."""
+        if side not in ('long', 'short'):
+            raise ValueError('side must be long or short')
+        if data_gap or (low <= stop if side == 'long' else high >= stop):
+            return min(stop, open_price) if side == 'long' else max(stop, open_price)
+        return None
+
+    def close_at_reference(self, position, account, price, time, *, reason):
+        """Close through the normal fee/slippage ledger at an explicit reference."""
+        method = self.close_long if position.side == 'long' else self.close_short
+        return method(0, [price], [time], position, account, fee_rate=self.fee_rate,
+                      cooldown_after_big_pnl=0, reason_to_close=reason)
+
+    def accrued_position_costs(self, position, time):
+        """Entry fee and accrued funding; no unexecuted exit is fabricated."""
+        notional = position.entry_price * position.position_size
+        return notional * self.fee_rate + self._funding_cost(notional, position.open_time_value, time)
 
     def close_short(
         self,
@@ -829,7 +925,7 @@ class TradeEngine:
         pnl_percent_without_leverage = (((pnl / margin) * 100 ) / leverage) if (margin != 0 and leverage != 0) else 0
         if pnl_percent_without_leverage >= 4:
             cooldown_until_index = i + cooldown_after_big_pnl
-            if self.verbose:
+            if self.verbose and cooldown_after_big_pnl > 0:
                 print(f"🟡 Cooldown Activated (LONG) until candle index {cooldown_until_index}")
 
         close_time_value = open_times[i]
@@ -1099,7 +1195,7 @@ class TradeEngine:
         pnl_percent_without_leverage = (((pnl / margin) * 100) / leverage) if (margin != 0 and leverage != 0) else 0
         if pnl_percent_without_leverage >= 4:
             cooldown_until_index = i + cooldown_after_big_pnl
-            if self.verbose:
+            if self.verbose and cooldown_after_big_pnl > 0:
                 print(f"🟡 Cooldown Activated (SHORT) until candle index {cooldown_until_index}")
 
         close_time_value = open_times[i]
@@ -1638,6 +1734,8 @@ class TradeEngine:
         monthly_returns=(),
         output_file=None,
         extra_metrics=None,
+        accrue_open_costs=False,
+        report_metadata=None,
     ):
         """Build the generic optimizer/report result for any strategy.
 
@@ -1651,6 +1749,8 @@ class TradeEngine:
         ending_mark_price = float(ending_mark_price)
         open_margin = sum(position.margin for position in positions)
         marked_equity = self.open_positions_equity(positions, ending_mark_price)
+        accrued_costs = sum(self.accrued_position_costs(p, end_time) for p in positions) if accrue_open_costs else 0.0
+        marked_equity -= accrued_costs
         marked_equity_no_fee = sum(
             self.position_equity_no_fee(position, ending_mark_price)
             for position in positions
@@ -1708,7 +1808,7 @@ class TradeEngine:
             "realized_profit": round(realized_profit, 6),
             "unrealized_profit": round(unrealized_profit, 6),
             "open_positions": len(positions),
-            "total_fees": round(account.deducting_fee_total, 6),
+            "total_fees": round(account.deducting_fee_total + accrued_costs, 6),
             "saved_money": round(account.save_money, 6),
             "liquidations": int(account.total_liquids),
             "total_profit_percent": round(return_percent, 6),
@@ -1734,6 +1834,12 @@ class TradeEngine:
         if extra_metrics:
             result.update(dict(extra_metrics))
 
+        if accrue_open_costs:
+            result['accrued_open_costs'] = round(accrued_costs, 6)
+
+        if self.verbose:
+            self.print_account_report(result, start_time, end_time)
+
         if self.write_trades:
             output_file = output_file or os.path.join(
                 self.output_dir, "trades", "data_orders.csv"
@@ -1744,13 +1850,14 @@ class TradeEngine:
                 final_balance=final_balance,
                 total_profit=total_profit,
                 total_profit_percent=return_percent,
-                total_fee=account.deducting_fee_total,
+                total_fee=account.deducting_fee_total + accrued_costs,
                 start_time=start_time,
                 end_time=end_time,
                 days=days,
                 hours=hours,
                 minutes=minutes,
                 overview_metrics={
+                    **({'Strategy': dict(report_metadata)} if report_metadata else {}),
                     "Capital": {
                         "Starting balance": first_balance,
                         "Final balance": final_balance,
@@ -1758,7 +1865,7 @@ class TradeEngine:
                         "Realized profit": realized_profit,
                         "Unrealized profit": unrealized_profit,
                         "Total profit %": return_percent,
-                        "Total fees": account.deducting_fee_total,
+                        "Total fees": account.deducting_fee_total + accrued_costs,
                     },
                     "Performance": {
                         "Optimizer score": score_metrics["score"],
@@ -1773,7 +1880,40 @@ class TradeEngine:
                 },
                 file_name=str(output_file),
             )
+            write_monthly_summary(in_file=str(output_file),
+                out_file=os.path.join(self.output_dir, 'monthly', 'monthly_data_orders.csv'), quiet=True)
         return result
+
+    @staticmethod
+    def print_account_report(result, start_time, end_time):
+        """Console report for plug-ins using the shared account finalizer."""
+        days, hours, minutes = trade_duration(start_time, end_time)
+        print('✅ BACKTEST FINISHED')
+        if result.get('strategy_name'):
+            print('Strategy:', result['strategy_name'])
+        print('Closed Trades:', result['closed_trades'], '( Longs:', result['long_trades'], '| Shorts:', result['short_trades'], ')')
+        print('Count open Trades:', result['open_positions'])
+        print('Total Wins:', result['wins'], '| Total Wins Long:', result['long_wins'], '| Total Wins Short:', result['short_wins'])
+        print('Total Losses:', result['losses'])
+        for label, key, suffix in (
+            ('Final Balance:', 'final_balance', '$'),
+            ('Final Balance (No Fee):', 'final_balance_without_fee', '$'),
+            ('Final marked balance:', 'final_balance_dynamic', '$'),
+            ('Total Fees Paid:', 'total_fees', '$'),
+            ('Maximum Drawdown:', 'maximum_drawdown', '%'),
+            ('Win Rate:', 'win_rate', '%'),
+            ('Total Profit:', 'total_profit', '$'),
+            ('Total Profit Percent:', 'total_profit_percent', '%'),
+            ('saved Money:', 'saved_money', '$'),
+        ):
+            print(label, round(result[key], 2), suffix)
+        print(f'Total Duration : {days} days, {hours} hours, {minutes} minutes')
+        print('Count Liquids:', result['liquidations'])
+        print('count_profit_months:', result['profit_months'])
+        print('count_loss_months:', result['loss_months'])
+        print('Total score:', result['score'])
+        if result.get('funding_model'):
+            print('Funding model:', result['funding_model'])
 
     def finalize_backtest(self, **state):
         """Calculate final metrics, emit reports/files, render the chart, and return results."""
@@ -2001,33 +2141,9 @@ class TradeEngine:
             file_name=output_file,
         )
 
-        if state.get("show_chart", not optimize):
-            chart_payload = dict(state["chart_payload"])
-            chart_payload.update(
-                balance=balance,
-                profits_lst=profits,
-                t_profit_percent=t_profit_percent,
-                count_closed_orders=state["count_closed_orders"],
-                total_wins=total_wins,
-                total_losses=total_losses,
-                max_drawdown=max_drawdown,
-                lst_profit_percent_per_month=monthly_profits,
-            )
-            chart_result = render_backtest_chart(**chart_payload)
-            if chart_result is not None:
-                return chart_result
-
         if self.write_trades:
-            try:
-                write_monthly_summary(
-                    in_file=output_file,
-                    out_file=os.path.join(
-                        self.output_dir, "monthly", "monthly_data_orders.csv"
-                    ),
-                    quiet=True,
-                )
-            except Exception:
-                pass
+            write_monthly_summary(in_file=output_file,
+                out_file=os.path.join(self.output_dir, 'monthly', 'monthly_data_orders.csv'), quiet=True)
 
         result = {
             "final_balance_static": state["total_money_static"],
@@ -2110,6 +2226,26 @@ class TradeEngine:
                     float(value) / 100.0 for value in monthly_profits
                     if value is not None and math.isfinite(float(value))
                 ]
+        if not optimize and 'strategy_parameters' in state:
+            if state.get('chart_payload', {}).get('chart_save_path'):
+                result['chart_file'] = str(state['chart_payload']['chart_save_path'])
+            self.save_run_metadata(result, state['strategy_parameters'])
+        if state.get("show_chart", not optimize):
+            chart_payload = dict(state["chart_payload"])
+            chart_payload.update(
+                balance=balance,
+                profits_lst=profits,
+                t_profit_percent=t_profit_percent,
+                count_closed_orders=state["count_closed_orders"],
+                total_wins=total_wins,
+                total_losses=total_losses,
+                max_drawdown=max_drawdown,
+                lst_profit_percent_per_month=monthly_profits,
+            )
+            chart_result = render_backtest_chart(**chart_payload)
+            if chart_result is not None:
+                return chart_result
+
         return result
 
     @staticmethod

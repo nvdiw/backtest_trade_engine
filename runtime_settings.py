@@ -38,6 +38,21 @@ def add_runtime_arguments(parser, *, data_file=True):
                         help='auto detects candle spacing; e.g. 1m or 15m validates an explicit interval')
 
 
+def add_chart_arguments(parser):
+    parser.add_argument('--no-chart', action='store_true', help='disable chart display and automatic PNG (explicit --save-chart still saves)')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--show-chart', dest='show_chart', action='store_true', default=True,
+                       help='display the interactive chart (default)')
+    group.add_argument('--no-show-chart', dest='show_chart', action='store_false',
+                       help='save the chart without opening a window')
+    parser.add_argument('--save-chart', metavar='FILE', help='custom PNG/PDF/SVG path')
+
+
+def chart_options(args):
+    return dict(show_chart=args.show_chart and not args.no_chart,
+                chart_file=args.save_chart or (str(Path(args.output_dir) / 'chart.png') if not args.no_chart else None))
+
+
 def configure_runtime(args, argv=None):
     arguments = sys.argv[1:] if argv is None else list(argv)
     explicit_workers = any(a in ('-w', '--workers') or a.startswith('--workers=')
@@ -88,6 +103,10 @@ def runtime_session(function):
     @wraps(function)
     def wrapped(*args, **kwargs):
         previous = {key: os.environ.get(key) for key in _KEYS}
+        optimizer = sys.modules.get('optimize')
+        previous_market = {key: getattr(optimizer, key) for key in
+                           ('_ACTIVE_MARKET_DATA_SOURCE', '_ACTIVE_CANDLES_PER_YEAR')
+                           if optimizer is not None and hasattr(optimizer, key)}
         previous_priority = None
         if os.name == 'nt':
             import ctypes
@@ -98,6 +117,8 @@ def runtime_session(function):
         try:
             return function(*args, **kwargs)
         finally:
+            for key, value in previous_market.items():
+                setattr(optimizer, key, value)
             for key, value in previous.items():
                 if value is None:
                     os.environ.pop(key, None)

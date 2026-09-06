@@ -1,5 +1,9 @@
 # راهنمای فارسی Backtest Trade Engine
 
+**Pulse آماده بک‌تست و optimize است:** [قوانین، schema، خروجی CSV/XLSX/نمودار و فرمان‌های یک‌دقیقه‌ای](PULSE_GUIDE_FA.md). مسیر اجرا: `python pulse_strategy.py`؛ انتخاب optimizer: `--strategy pulse`.
+
+ساختار خروجی‌های مستقل MA و Pulse و قرارداد افزودن استراتژی در [راهنمای پوشه‌های استراتژی](STRATEGY_WORKSPACES_FA.md) آمده است. مسیر پیش‌فرض optimize اکنون `outputs/<strategy>/optimize/` است؛ برای ادامه کمپین قدیمی، مسیر قبلی را صریح بدهید.
+
 راهنمای [فوکوس جدید، حالت‌های performance و تشخیص تایم‌فریم](RUNTIME_FOCUS_GUIDE_FA.md) شامل فرمان شروع ۱۰۰ سیکل از snapshot سیکل ۳۰۰ است. گزینه‌های `--data-file` و `--timeframe auto` فایل کندل را برای موتور و workerها یکسان انتخاب می‌کنند؛ `--performance power_saving|normal|boost` منابع اجرا را بدون کاهش تعداد تست و دقت محاسبات تنظیم می‌کند.
 
 [راهنمای جدید تنظیم مستقل لانگ/شورت، Auto هوشمند و چارت‌های خوانا](DIRECTIONAL_AUTO_GUIDE_FA.md)
@@ -250,7 +254,7 @@ optimizer هنگام ارزیابی کاندیدها چارت، پیام‌ها�
 | `--tests N` | `5000` | بودجه کاندیدها در smart؛ محدودکننده grid نیست. |
 | `--profile NAME` | وابسته به حالت | در Auto مقدار `full` و در حالت عادی `focused`؛ انتخاب‌های صریح: `focused`، `signal`، `exit`، `risk`، `rsi` یا `full`. |
 | `--base-source config\|best\|file` | `config` | منبع پارامترهای خارج از profile انتخاب‌شده. |
-| `--base-params FILE` | `outputs/optimize/best_params.json` | فایل JSON برای `best` یا `file`. |
+| `--base-params FILE` | `outputs/<strategy>/optimize/best_params.json` | فایل JSON برای `best` یا `file`. |
 | `-w N`, `--workers N` | حداکثر `8` | تعداد process؛ برای دیباگ ساده‌تر `1` بگذارید. |
 | `--batch-size N` | `0` | اندازه batch و checkpoint؛ صفر یعنی خودکار. |
 | `--chunksize N` | `0` | اندازه chunk پردازش چندپردازه؛ صفر یعنی خودکار. |
@@ -265,7 +269,7 @@ optimizer هنگام ارزیابی کاندیدها چارت، پیام‌ها�
 | `--overfit-penalty X` | `0.25` | جریمه فاصله score آموزش و validation. |
 | `--min-trades N` | `0` | حذف نتایج با معاملات بسته کمتر. |
 | `--max-drawdown X` | — | حذف نتایج با drawdown مطلق بیشتر از این درصد. |
-| `--output-dir DIR` | `outputs/optimize` | مسیر checkpointها و نتیجه‌ها. |
+| `--output-dir DIR` | `outputs/<strategy>/optimize` | مسیر checkpointها و نتیجه‌ها. |
 | `--resume` | خاموش | ادامه یک `optimization_results.csv` سازگار. |
 | `--log-every N` | `10` | فاصله چاپ پیشرفت؛ صفر یعنی بدون گزارش پیشرفت. |
 | `--top-n N` | `20` | تعداد گزینه‌های ذخیره‌شده در `top_results.json`. |

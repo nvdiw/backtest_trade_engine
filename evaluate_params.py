@@ -15,6 +15,7 @@ import pandas as pd
 from market_data_audit import AuditConfig, audit_market_data, build_run_fingerprints
 from optimize import _evaluate_random_window_task, _write_json
 from strategy_adapter import resolve_strategy
+from strategy_workspace import output_path, claim_output, assert_strategy_path, output_session
 from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session
 
 
@@ -169,6 +170,7 @@ def write_workbook(path, frame, summary, params, plan, records):
 
 
 @runtime_session
+@output_session
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--params', required=True, help='best_params.json or its containing directory')
@@ -184,7 +186,7 @@ def main(argv=None):
     parser.add_argument('--max-drawdown', type=float, default=30)
     parser.add_argument('--min-positive-ratio', type=float, default=.7)
     parser.add_argument('--min-pass-ratio', type=float, default=.7)
-    parser.add_argument('--output-dir', default='outputs/evaluate_params')
+    parser.add_argument('--output-dir', help='default: outputs/<strategy>/evaluate')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
     add_runtime_arguments(parser)
@@ -199,6 +201,8 @@ def main(argv=None):
             0 <= x <= 1 for x in (args.min_positive_ratio, args.min_pass_ratio)):
         parser.error('Invalid quality thresholds')
     adapter = resolve_strategy(args.strategy)
+    args.output_dir = args.output_dir or str(output_path(adapter.identifier, 'evaluate'))
+    assert_strategy_path(args.output_dir, adapter.identifier)
     source = adapter.market_data_source()
     if source is None:
         parser.error('Strategy must declare DATA_FILE')
@@ -230,6 +234,7 @@ def main(argv=None):
     manifest_path = output / 'manifest.json'
     if not args.resume and any(output.iterdir()):
         parser.error('Output directory is not empty; use a new directory or --resume')
+    claim_output(output, adapter.identifier, 'evaluate')
     audit = audit_market_data(source.data_file, AuditConfig(expected_interval=source.interval()))
     audit.raise_for_errors()
     fingerprints = build_run_fingerprints(source.data_file, list(Path(__file__).parent.glob('*.py')),

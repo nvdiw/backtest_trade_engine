@@ -1,3 +1,4 @@
+from strategy_workspace import output_path, claim_output, assert_strategy_path, output_session
 # NOTE: Strategy executes With candle Open prices, High prices, Low prices, Close prices
 
 import argparse
@@ -10,7 +11,7 @@ import numpy as np
 
 from indicators import Indicator
 from fetch_calculate_data import DATA_FILE
-from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session
+from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session, add_chart_arguments, chart_options
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
 from strategy_config import (
@@ -22,7 +23,7 @@ from strategy_config import (
 )
 
 
-DEFAULT_BEST_PARAMS_PATH = Path("outputs") / "optimize" / "best_params.json"
+DEFAULT_BEST_PARAMS_PATH = output_path("ma_strategy:ma_strategy", "optimize") / "best_params.json"
 TIMEFRAME = "auto"
 
 
@@ -44,6 +45,7 @@ def resolve_parameter_source(source="config", *, params_file=None,
         raise FileNotFoundError(
             f"parameter file not found: {path}. Run optimize.py first or provide another path."
         )
+    assert_strategy_path(path, "ma_strategy:ma_strategy")
     return load_ma_strategy_tune(path), str(path)
 
 
@@ -232,6 +234,7 @@ def canonicalize_candidate(params, baseline):
     return candidate
 
 # Main Trading Logic
+@output_session
 def ma_strategy(
     tune: dict = None,
     start="2025-01-01",
@@ -242,7 +245,7 @@ def ma_strategy(
     verbose=None,
     write_trades=None,
     write_excel=True,
-    output_dir="outputs",
+    output_dir="outputs/ma/backtest",
     use_indicator_warmup=True,
     indicator_warmup_candles=None,
     research=False,
@@ -264,7 +267,11 @@ def ma_strategy(
         write_trades = not optimize
     show_chart = bool(show_chart) and not optimize
     write_trades = bool(write_trades) and not optimize
+    if show_chart and not chart_file:
+        chart_file = str(Path(output_dir) / 'chart.png')
     render_chart = (show_chart or bool(chart_file)) and not optimize
+    if not optimize:
+        claim_output(output_dir, 'ma_strategy:ma_strategy', 'backtest')
 
     cfg = build_ma_strategy_config(tune)
     long_cfg = directional_config(cfg, 'long')
@@ -2259,6 +2266,7 @@ def ma_strategy(
 
     return trade_engine.finalize_backtest(
         optimize=optimize,
+        strategy_parameters=asdict(cfg),
         research=bool(research),
         show_chart=render_chart,
         ending_mark_price=close_prices[-1],
@@ -2419,10 +2427,7 @@ def build_parser():
     )
     parser.add_argument("--list-params", action="store_true",
                         help="print effective config defaults as JSON and exit")
-    parser.add_argument("--no-chart", action="store_true",
-                        help="skip the interactive chart for a faster run")
-    parser.add_argument("--save-chart", metavar="FILE",
-                        help="save the chart to PNG/PDF/SVG; works with --no-chart")
+    add_chart_arguments(parser)
     parser.add_argument("--quiet", action="store_true",
                         help="suppress per-trade and summary console output")
     parser.add_argument("--no-trade-log", action="store_true",
@@ -2436,7 +2441,7 @@ def build_parser():
         "--no-excel", dest="excel", action="store_false",
         help="skip the XLSX report and write only CSV files",
     )
-    parser.add_argument("--output-dir", default="outputs",
+    parser.add_argument("--output-dir", default="outputs/ma/backtest",
                         help="root directory for trade and monthly reports")
     parser.add_argument("--result-json", metavar="FILE",
                         help="write the final result dictionary as JSON")
@@ -2447,6 +2452,7 @@ def build_parser():
 
 
 @runtime_session
+@output_session
 def main(argv=None):
     try:
         sys.stdout.reconfigure(errors="replace")
@@ -2479,6 +2485,7 @@ def main(argv=None):
         parser.error(str(exc))
     if overrides:
         tune = {**(tune or {}), **overrides}
+    tune = {**(tune or {}), 'optimize': False}
 
     if not args.quiet:
         print(f"Parameter source: {source_description}")
@@ -2488,8 +2495,7 @@ def main(argv=None):
         tune=tune,
         start=_parse_bound(args.start),
         end=_parse_bound(args.end),
-        show_chart=not args.no_chart,
-        chart_file=args.save_chart,
+        **chart_options(args),
         verbose=not args.quiet,
         write_trades=not args.no_trade_log,
         write_excel=args.excel,
