@@ -6,119 +6,29 @@ Initial ATR stop and time exit only. See PULSE_GUIDE_FA.md for assumptions.
 from __future__ import annotations
 import argparse
 from collections import OrderedDict, Counter
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 import json
-import math
 import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
 from market_data import MarketDataSource
 from runtime_settings import add_runtime_arguments, configure_runtime, market_selection, runtime_session, add_chart_arguments, chart_options
-from strategy_workspace import assert_strategy_path, claim_output, output_session
+from strategy_workspace import claim_output, output_session
 from trade_engine import AccountState, TradeEngine
+from pulse_strategy_config import (
+    PulseConfig, SIGNAL_KEYS, FULL_PARAM_GRID, FOCUSED_PARAM_GRID, PHASE_A_GRID,
+    PARAMETER_PROFILES, param_grid, STAGED_PHASES, EXECUTION_SCENARIOS,
+    AUTO_DATE_DEFAULTS, IDENTIFIER, side_value, build_strategy_config,
+    load_strategy_tune, is_valid_candidate, validate_parameter_grid,
+)
 
 DISPLAY_NAME = 'Pulse / RollingRangeBreakout1m'
 STRATEGY_READY = True
 DATA_FILE = Path(__file__).resolve().parent / 'data_candle' / 'btc_1m_data_2025_to_2026.csv'
 TIMEFRAME = '1m'
-IDENTIFIER = 'pulse_strategy:pulse_strategy'
 ALLOW_CONTINUOUS_REFINEMENT = False
 MINUTE_NS = 60_000_000_000
-
-@dataclass(frozen=True)
-class PulseConfig:
-    breakout_lookback_bars: int = 30
-    stop_atr_mult: float = 2.0
-    max_hold_bars: int = 30
-    long_breakout_lookback_bars: int | None = None
-    short_breakout_lookback_bars: int | None = None
-    long_stop_atr_mult: float | None = None
-    short_stop_atr_mult: float | None = None
-    long_max_hold_bars: int | None = None
-    short_max_hold_bars: int | None = None
-    atr_period: int = 20
-    enable_long: bool = True
-    enable_short: bool = True
-    balance: float = 1000.0
-    risk_per_trade: float = .0025
-    max_gross_exposure: float = 1.0
-    quantity_step: float = 0.0
-    min_quantity: float = 0.0
-    min_notional: float = 0.0
-    fee_rate: float = .0005
-    slippage_rate: float = .0001
-    funding_rate_per_8h: float = 0.0
-    optimize: bool = False
-
-SIGNAL_KEYS = ('breakout_lookback_bars', 'stop_atr_mult', 'max_hold_bars')
-PHASE_A_GRID = dict(breakout_lookback_bars=[15,20,30,45,60,90,120],
-                    stop_atr_mult=[1.25,1.50,1.75,2.,2.25,2.50,3.],
-                    max_hold_bars=[10,15,20,30,45,60,90,120])
-PARAMETER_PROFILES = {name: dict(PHASE_A_GRID) for name in ('focused','full','signal')}
-PARAMETER_PROFILES['directional'] = {f'{side}_{key}': values for side in ('long','short')
-                                     for key,values in PHASE_A_GRID.items()}
-param_grid = PHASE_A_GRID
-STAGED_PHASES = (('signal','signal'),)
-EXECUTION_SCENARIOS = {'base': {}, 'adverse': {'fee_rate': .0007, 'slippage_rate': .0002},
-                       'severe': {'fee_rate': .001, 'slippage_rate': .0005}}
-
-def side_value(cfg, side, key):
-    value = getattr(cfg, f'{side}_{key}')
-    return getattr(cfg, key) if value is None else value
-
-def build_strategy_config(tune=None):
-    values = dict(tune or {})
-    defaults = asdict(PulseConfig())
-    unknown = set(values) - set(defaults)
-    if unknown:
-        raise ValueError('Unknown Pulse parameters: ' + ', '.join(sorted(unknown)))
-    for key,value in values.items():
-        base = key.split('_',1)[1] if key.startswith(('long_','short_')) else key
-        default = defaults[base]
-        if value is None and key != base:
-            continue
-        if isinstance(default,bool):
-            if value not in (True,False,'true','false'):
-                raise ValueError(f'{key} must be boolean')
-            values[key] = value in (True,'true')
-        else:
-            number = float(value)
-            if not math.isfinite(number) or (isinstance(default,int) and number != int(number)):
-                raise ValueError(f'{key} must be finite and use the declared type')
-            values[key] = int(number) if isinstance(default,int) else number
-    cfg = PulseConfig(**values)
-    if cfg.atr_period != 20:
-        raise ValueError('Pulse fixes atr_period=20')
-    for side in ('long','short'):
-        if any(side_value(cfg,side,key) <= 0 for key in SIGNAL_KEYS):
-            raise ValueError('Lookback, hold bars and ATR multiplier must be positive')
-    if cfg.balance <= 0 or not 0 < cfg.risk_per_trade <= 1 or not 0 < cfg.max_gross_exposure <= 1:
-        raise ValueError('Positive balance, risk in (0,1] and unlevered exposure in (0,1] required')
-    if not (cfg.enable_long or cfg.enable_short):
-        raise ValueError('Enable at least one side')
-    if min(cfg.quantity_step,cfg.min_quantity,cfg.min_notional,cfg.fee_rate,cfg.slippage_rate,cfg.funding_rate_per_8h) < 0 or max(cfg.fee_rate,cfg.slippage_rate) >= 1:
-        raise ValueError('Invalid order constraints or costs')
-    return cfg
-
-def load_strategy_tune(path):
-    assert_strategy_path(path, IDENTIFIER)
-    return asdict(build_strategy_config(json.loads(Path(path).read_text(encoding='utf-8'))))
-
-def is_valid_candidate(params):
-    try:
-        build_strategy_config(params)
-        return True
-    except (ValueError,TypeError):
-        return False
-
-def validate_parameter_grid(grid):
-    allowed = set(SIGNAL_KEYS) | {f'{side}_{key}' for side in ('long','short') for key in SIGNAL_KEYS}
-    if set(grid) - allowed:
-        raise ValueError('Pulse grids tune signal parameters only; risk and execution costs are fixed policies')
-    for key,values in grid.items():
-        if not values or any(not is_valid_candidate({key:value}) for value in values):
-            raise ValueError(f'Invalid Pulse grid: {key}')
 
 def required_indicator_warmup(config):
     cfg = config if isinstance(config,PulseConfig) else build_strategy_config(config)

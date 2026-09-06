@@ -1,5 +1,7 @@
 # Backtest Trade Engine
 
+[Pulse automatic date windows and bounded campaign](PULSE_OPTIMIZE_FA.md): `python run_pulse_optimize.py --performance normal` runs up to four cycles of 98 Phase A candidates, with dataset-revision isolation and automatic checkpoint continuation.
+
 [Independent long/short settings, adaptive Auto and chart layout](DIRECTIONAL_AUTO_GUIDE_FA.md)
 
 | Task | Command / setting | Behavior |
@@ -109,7 +111,7 @@ python ma_strategy.py --list-params
 
 ### Parameter sources and precedence
 
-`config` reads defaults from `strategy_config.py` without rewriting it:
+`config` reads defaults from `ma_strategy_config.py` without rewriting it:
 
 ```powershell
 python ma_strategy.py --params-source config
@@ -491,7 +493,9 @@ trade_engine.py         execution, accounting, liquidation, reports
 trade_csv_logger.py     CSV and optional XLSX writer
 chart_renderer.py       interactive/exportable chart
 indicators.py           vectorized indicators
-strategy_config.py      typed defaults
+ma_strategy_config.py   MA defaults, validators and optimizer grids
+pulse_strategy_config.py Pulse defaults, validators and optimizer grids
+param_grids/            independent ma_focused.json and pulse_focused.json
 optimize.py             smart/grid multiprocessing optimizer
 check_monthly_data.py   monthly report builder
 data_candle/            input candles

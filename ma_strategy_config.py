@@ -474,3 +474,259 @@ def load_ma_strategy_tune(path):
     with path.open(encoding="utf-8") as config_file:
         tune = json.load(config_file)
     return normalize_ma_strategy_tune(tune, source=str(path))
+
+
+# Every key is an existing MAStrategyConfig setting.  Defaults in
+# ma_strategy_config.py remain unchanged; the optimizer only passes candidates via
+# ``tune`` and writes the winning values to JSON.
+FULL_PARAM_GRID = {
+    # Capital baseline (singletons prevent meaningless score scaling)
+    "balance": [1000],
+    "save_money": [0],
+    "fee_rate": [0.0005],
+    # Execution assumptions are fixed during signal search and stressed later.
+    "slippage_rate": [0.0001],
+    "funding_rate_per_8h": [0.00005],
+    "maintenance_margin_rate": [0.005],
+    "liquidation_fee_rate": [0.002],
+    # Entry context and thresholds
+    "entry_score_threshold": [6, 7, 8, 9, 10, 11, 12],
+    "exit_score_threshold": [4, 5, 6, 7, 8, 9, 10],
+    "ma_distance_threshold": [0.0008, 0.0010, 0.00125, 0.0015, 0.00159, 0.0020, 0.0025, 0.0030, 0.0040],
+    "candle_move_threshold": [0.002, 0.004, 0.006, 0.008, 0.010, 0.012, 0.015],
+    "impulse_move_threshold_pct": [0.75, 1.0, 1.5, 2.0, 2.5, 3.0],
+    "impulse_lookback": [3, 4, 5, 6, 8, 10],
+    "late_entry_atr_mult": [0.5, 0.8, 1.0, 1.2, 1.5, 2.0],
+    "late_entry_body_ratio": [0.4, 0.6, 0.8, 1.0, 1.2],
+    "late_entry_ema_pct": [0.002, 0.003, 0.004, 0.005, 0.007, 0.010],
+    # Exit behavior
+    "slope_window": [2, 3, 5, 8, 13],
+    "trail_activate_pct": [0.003, 0.005, 0.007, 0.010, 0.015, 0.020],
+    "trail_retrace_pct": [0.0015, 0.002, 0.003, 0.004, 0.005, 0.008],
+    "loss_exit_pct_1": [0.015, 0.02, 0.025, 0.03, 0.04, 0.05],
+    "loss_exit_pct_2": [0.03, 0.04, 0.05, 0.06, 0.08],
+    "profit_exit_pct_1": [0.02, 0.03, 0.04, 0.05, 0.075, 0.10, 0.15],
+    "profit_exit_pct_2": [0.06, 0.08, 0.10, 0.12, 0.15, 0.20],
+    "loss_lock_step_pct": [0.005, 0.01, 0.015, 0.02, 0.03],
+    "adx_exit_threshold": [12, 15, 18, 21, 24, 27],
+    "adx_exit_lookback": [1, 2, 3, 5, 8],
+    "opposite_atr_body_mult": [0.4, 0.6, 0.8, 1.0, 1.25, 1.5],
+    "sharp_move_threshold_pct": [6, 8, 10, 12, 15, 18, 20],
+    "sharp_move_lookback_candles": [100, 200, 300, 450, 600, 800, 1000],
+    "post_cross_penalty_candles": [5, 10, 15, 20, 30],
+    # Indicator periods and filters
+    "ema_16_period": [10, 12, 14, 16, 18, 20, 24],
+    "ma_50_period": [35, 40, 45, 50, 55, 60, 70],
+    "ma_100_period": [80, 90, 100, 102, 110, 125, 140],
+    "ma_200_period": [160, 180, 198, 200, 220, 240, 260],
+    "period_adx": [8, 10, 12, 14, 16, 18, 21],
+    "period_atr": [8, 10, 12, 14, 16, 18, 21],
+    "period_atr_ma": [7, 10, 14, 18, 21, 28, 35],
+    "period_vol_avg": [6, 8, 10, 12, 15, 18, 21, 30],
+    "period_rsi": [7, 9, 11, 14, 18, 21],
+    "entry_adx_threshold": [12, 15, 18, 20, 20.5, 22, 25, 28, 32],
+    "entry_atr_threshold": [0.7, 0.85, 1.0, 1.1, 1.2, 1.35, 1.5],
+    "volume_spike_multiplier": [0.9, 1.0, 1.1, 1.2, 1.24, 1.3, 1.45, 1.6, 1.8],
+    "adx_filter": [False, True],
+    "atr_filter": [False, True],
+    "volume_filter": [False, True],
+    # Score weights
+    "entry_score_cross": [1, 2, 3, 4],
+    "entry_score_ema_vs_ma50": [1, 2, 3, 4],
+    "entry_score_ma_trend": [1, 2, 3],
+    "entry_score_ma_distance_or_candle": [1, 2, 3],
+    "entry_score_adx": [1, 2, 3],
+    "entry_score_volume": [1, 2, 3],
+    "entry_late_penalty": [0, 1, 2, 3, 4],
+    "exit_score_loss_guard_1": [1, 2, 3, 4],
+    "exit_score_loss_guard_2": [1, 2, 3, 4],
+    "exit_score_profit_guard_1": [1, 2, 3, 4],
+    "exit_score_profit_guard_2": [1, 2, 3, 4],
+    "exit_score_ema_slope": [1, 2, 3, 4],
+    "exit_score_ema_cross": [1, 2, 3, 4],
+    "exit_score_ma_trend": [1, 2, 3],
+    "exit_score_trailing": [1, 2, 3, 4],
+    "exit_score_adx": [1, 2, 3],
+    "exit_score_opposite_candle": [1, 2, 3],
+    "post_cross_penalty_score": [0, 1, 2, 3, 4, 5],
+    # Position sizing, safety, monthly controls, and scale-ins
+    "trade_amount_percent": [0.2, 0.3, 0.4, 0.5, 0.6],
+    "leverage": [1, 2, 3, 4, 5, 7, 10],
+    "safe_leverage_low": [1, 2, 3, 4],
+    "safe_leverage_med": [2, 3, 4, 5, 6],
+    "safe_leverage_high": [3, 4, 5, 6, 8],
+    "safe_leverage_balance_pct_low": [60, 70, 75, 80],
+    "safe_leverage_balance_pct_med": [70, 75, 80, 85],
+    "safe_leverage_balance_pct_high": [80, 85, 90, 95],
+    "save_money_recover_trigger_pct": [60, 65, 70, 75, 80],
+    "max_open_trades": [1, 2, 3, 4],
+    "cooldown_after_big_pnl": [0, 4, 8, 12, 24, 48, 96],
+    "monthly_profit_percent_stop_trade": [5, 7, 9, 12, 15, 20],
+    "monthly_loss_percent_stop_trade": [8, 12, 16, 19, 20, 25, 30],
+    "monthly_compound": [3],
+    "monthly_profit_close_filter": [False, True],
+    "monthly_loss_close_filter": [False, True],
+    "consecutive_losses_month_stop_filter": [False, True],
+    "consecutive_losses_stop_until_month": [3, 4, 5, 6, 8, 10],
+    "skip_logic": [False, True],
+    "scale_in_enabled": [False, True],
+    "scale_entry_amount_percent": [0.05, 0.1, 0.15, 0.2, 0.3],
+    "scale_entry_profit_trigger_pct": [0.005, 0.01, 0.02, 0.03, 0.039, 0.04, 0.06],
+    "scale_entry_loss_trigger_pct": [0.005, 0.01, 0.02, 0.03, 0.04, 0.06],
+    "scale_entry_on_profit_enabled": [False, True],
+    "scale_entry_on_loss_enabled": [False, True],
+    "profit_scale_entry_filter_enabled": [False, True],
+    "profit_scale_entry_min_score": [2, 3, 4, 5, 6],
+    "profit_scale_entry_atr_ratio_min": [0.8, 0.9, 1.0, 1.1, 1.25, 1.5],
+    # RSI monthly sub-strategy used inside ma_strategy
+    "rsi_trade_monthly_filter_on": [False, True],
+    "rsi_long_open_monthly_profit": [10, 15, 20, 25, 30, 35],
+    "rsi_long_close_monthly_profit": [60, 70, 79, 80, 85, 90],
+    "rsi_short_open_monthly_profit": [55, 60, 65, 70, 75, 80],
+    "rsi_short_close_monthly_profit": [10, 15, 20, 25, 30, 35],
+    "rsi_long_tp_pct": [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
+    "rsi_long_sl_pct": [0.02, 0.03, 0.04, 0.05, 0.06, 0.08],
+    "rsi_short_tp_pct": [0.02, 0.03, 0.04, 0.05, 0.06, 0.08, 0.10],
+    "rsi_short_sl_pct": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06],
+    "rsi_max_open_trades": [1, 2, 3, 4],
+    "rsi_trade_amount_percent": [0.1, 0.2, 0.3, 0.4, 0.5],
+    "rsi_leverage": [1, 2, 3, 4, 5, 6, 8],
+    "rsi_cooldown_filter": [False, True],
+    "rsi_cooldown_bars": [0, 4, 8, 10, 12, 16, 24, 48],
+    "lowest_rsi_last_n_value": [1, 2, 3, 5, 8, 13],
+    "highest_rsi_last_n_value": [1, 2, 3, 5, 8, 13],
+    "rsi_entry_buffer": [2, 4, 6, 8, 10, 12],
+    "rsi_distance_threshold": [4, 6, 8, 10, 12, 15, 20],
+    # Chart-only settings remain fixed because charts are disabled in optimize mode.
+    "plot_max_candles": [1200],
+    "plot_end_offset": [0],
+    "plot_step_candles": [300],
+    "plot_min_zoom_candles": [80],
+    "plot_max_render_candles": [900],
+    "plot_zoom_in_factor": [0.8],
+    "plot_zoom_out_factor": [1.6],
+    "plot_window_width_scale": [0.94],
+    "plot_window_height_scale": [0.90],
+    "plot_drag_preview_factor": [0.20],
+    "plot_drag_update_interval_ms": [75],
+    "plot_yscale_drag_sensitivity": [0.0030],
+    "plot_post_cross_penalty_markers": [True],
+}
+
+LEGACY_FOCUSED_PARAM_GRID = {
+    "entry_score_threshold": [6, 7, 8, 9, 10, 11, 12],
+    "exit_score_threshold": [4, 5, 6, 7, 8, 9, 10],
+    # Score weights
+    "entry_score_cross": [1, 2, 3, 4],
+    "entry_score_ema_vs_ma50": [1, 2, 3, 4],
+    "entry_score_ma_trend": [1, 2, 3],
+    "entry_score_ma_distance_or_candle": [1, 2, 3],
+    "entry_score_adx": [1, 2, 3],
+    "entry_score_volume": [1, 2, 3],
+    "entry_late_penalty": [0, 1, 2, 3, 4],
+    "exit_score_loss_guard_1": [1, 2, 3, 4],
+    "exit_score_loss_guard_2": [1, 2, 3, 4],
+    "exit_score_profit_guard_1": [1, 2, 3, 4],
+    "exit_score_profit_guard_2": [1, 2, 3, 4],
+    "exit_score_ema_slope": [1, 2, 3, 4],
+    "exit_score_ema_cross": [1, 2, 3, 4],
+    "exit_score_ma_trend": [1, 2, 3],
+    "exit_score_trailing": [1, 2, 3, 4],
+    "exit_score_adx": [1, 2, 3],
+    "exit_score_opposite_candle": [1, 2, 3],
+    "post_cross_penalty_score": [0, 1, 2, 3, 4, 5],
+    # Tune the indicators that create the signals as well as their scores.
+    "ema_16_period": [10, 12, 14, 16, 18, 20, 24],
+    "ma_50_period": [35, 40, 45, 50, 55, 60, 70],
+    "ma_100_period": [80, 90, 100, 102, 110, 125, 140],
+    "ma_200_period": [160, 180, 198, 200, 220, 240, 260],
+    "period_adx": [8, 10, 12, 14, 16, 18, 21],
+    "period_atr": [8, 10, 12, 14, 16, 18, 21],
+    "period_atr_ma": [7, 10, 14, 18, 21, 28, 35],
+    "period_vol_avg": [6, 8, 10, 12, 15, 18, 21, 30],
+    "period_rsi": [7, 9, 11, 14, 18, 21],
+    "entry_adx_threshold": [12, 15, 18, 20, 20.5, 22, 25, 28, 32],
+    "entry_atr_threshold": [0.7, 0.85, 1.0, 1.1, 1.2, 1.35, 1.5],
+    "volume_spike_multiplier": [0.9, 1.0, 1.1, 1.2, 1.24, 1.3, 1.45, 1.6, 1.8],
+    "rsi_entry_buffer": [2, 4, 6, 8, 10, 12],
+    "rsi_distance_threshold": [4, 6, 8, 10, 12, 15, 20],
+}
+
+
+# Editable directional MA/entry search; shared weights remain at the seed values.
+FOCUSED_PARAM_GRID = json.loads(
+    (Path(__file__).parent / 'param_grids' / 'ma_focused.json').read_text(encoding='utf-8')
+)
+
+FULL_PARAM_GRID.update(long_enabled=[True], short_enabled=[True])
+
+
+def _grid_subset(*prefixes, extra=()):
+    keys = set(extra)
+    for key in FULL_PARAM_GRID:
+        if key.startswith(prefixes):
+            keys.add(key)
+    return {key: values for key, values in FULL_PARAM_GRID.items() if key in keys}
+
+
+PARAMETER_PROFILES = {
+    # Directional focus starts from the supplied winner; legacy grid remains available.
+    "focused": FOCUSED_PARAM_GRID,
+    "focused_legacy": LEGACY_FOCUSED_PARAM_GRID,
+    "signal": _grid_subset(
+        "entry_", "ma_distance", "candle_move", "impulse_", "late_entry_",
+        "period_", "volume_spike", "adx_filter", "atr_filter", "volume_filter",
+        extra=("ema_16_period", "ma_50_period", "ma_100_period", "ma_200_period"),
+    ),
+    "exit": _grid_subset(
+        "exit_", "trail_", "loss_exit", "profit_exit", "loss_lock",
+        "adx_exit", "opposite_", "sharp_move", "post_cross_", "slope_window",
+    ),
+    "risk": _grid_subset(
+        "safe_leverage", "monthly_", "scale_", "profit_scale_", "consecutive_",
+        extra=(
+            "trade_amount_percent", "leverage", "save_money_recover_trigger_pct",
+            "max_open_trades", "cooldown_after_big_pnl", "skip_logic",
+        ),
+    ),
+    "risk_core": _grid_subset(
+        "safe_leverage", "monthly_", "consecutive_",
+        extra=(
+            "trade_amount_percent", "leverage", "save_money_recover_trigger_pct",
+            "max_open_trades", "cooldown_after_big_pnl", "skip_logic",
+        ),
+    ),
+    "rsi": _grid_subset("rsi_", "lowest_rsi_", "highest_rsi_"),
+    "scale": _grid_subset("scale_", "profit_scale_"),
+    "full": FULL_PARAM_GRID,
+}
+
+STAGED_AUTO_PHASES = (
+    ("signal", "signal"),
+    ("exit", "exit"),
+    ("risk", "risk_core"),
+    ("rsi", "rsi"),
+    ("scale", "scale"),
+)
+
+# Side profiles deliberately omit shared aliases for directional keys: mutating
+# both the inherited key and its override would waste trials on inactive values.
+for _side in ('long', 'short'):
+    for _name, _grid in list(PARAMETER_PROFILES.items()):
+        if _name in ('focused', 'signal', 'exit', 'risk_core', 'rsi', 'scale', 'full'):
+            PARAMETER_PROFILES[f'{_side}_{_name}'] = {
+                (key if key.startswith((f'rsi_{_side}_', f'{_side}_')) else f'{_side}_{key}'): values
+                for key, values in _grid.items()
+                if key in DIRECTIONAL_FIELDS or key.startswith((f'rsi_{_side}_', f'{_side}_'))
+            }
+    PARAMETER_PROFILES[_side] = PARAMETER_PROFILES[f'{_side}_full']
+PARAMETER_PROFILES['portfolio'] = {
+    key: values for key, values in FULL_PARAM_GRID.items()
+    if key not in DIRECTIONAL_FIELDS and not key.startswith(('rsi_long_', 'rsi_short_'))
+}
+PARAMETER_PROFILES['directional'] = {
+    **PARAMETER_PROFILES['portfolio'], **PARAMETER_PROFILES['long'], **PARAMETER_PROFILES['short']
+}
+
+
+param_grid = FULL_PARAM_GRID

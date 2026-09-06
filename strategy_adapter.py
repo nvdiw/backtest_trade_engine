@@ -293,16 +293,10 @@ def resolve_strategy(specification: str | None = None) -> StrategyAdapter:
     if not callable(function):
         raise ValueError(f"strategy callable not found: {module_name}:{function_name}")
 
-    if module_name == "ma_strategy":
-        from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
-
-        config_builder = build_ma_strategy_config
-        tune_loader = load_ma_strategy_tune
-    else:
-        config_builder = _optional_callable(
-            module, "build_strategy_config", f"build_{function_name}_config"
-        )
-        tune_loader = _optional_callable(module, "load_strategy_tune", "load_tune")
+    config_builder = _optional_callable(
+        module, "build_strategy_config", f"build_{function_name}_config"
+    )
+    tune_loader = _optional_callable(module, "load_strategy_tune", "load_tune")
 
     return StrategyAdapter(
         name=specification,

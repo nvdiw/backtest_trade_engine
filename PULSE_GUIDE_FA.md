@@ -1,5 +1,7 @@
 # Pulse — Rolling Range Breakout 1m
 
+تنظیمات و validatorها در `pulse_strategy_config.py` هستند. `FULL_PARAM_GRID` شبکهٔ کامل را تعریف می‌کند؛ `FOCUSED_PARAM_GRID` از `param_grids/pulse_focused.json` خوانده می‌شود. مقدارهای اولیهٔ این دو برابرند، اما مستقل و قابل ویرایش‌اند. `pulse_strategy.py` منطق معامله و warmup را نگه می‌دارد و تنظیمات را برای رابط مشترک strategy adapter وارد می‌کند. راهنمای بازه‌ها و دستور اجرا: [Optimize خودکار Pulse](PULSE_OPTIMIZE_FA.md).
+
 Pulse یک فرضیه پژوهشی برای شکست محدوده است؛ پیاده‌سازی و عبور از تست‌ها به معنی سودآوری نیست. استراتژی اصلی MA جایگزین نشده است.
 
 ## معماری و خروجی‌ها

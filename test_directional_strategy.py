@@ -10,7 +10,7 @@ import pandas as pd
 import ma_strategy as ma
 import optimize
 from market_data import clear_market_data_cache
-from strategy_config import build_ma_strategy_config, directional_config, normalize_ma_strategy_tune
+from ma_strategy_config import build_ma_strategy_config, directional_config, normalize_ma_strategy_tune
 from strategy_adapter import resolve_strategy
 from trade_engine import TradeEngine
 

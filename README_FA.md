@@ -127,7 +127,7 @@ python ma_strategy.py --list-params
 
 ### منابع پارامتر و ترتیب اولویت
 
-حالت `config` از مقادیر `strategy_config.py` استفاده می‌کند و آن فایل را تغییر نمی‌دهد:
+حالت `config` از مقادیر `ma_strategy_config.py` استفاده می‌کند و آن فایل را تغییر نمی‌دهد:
 
 ```powershell
 python ma_strategy.py --params-source config
@@ -494,7 +494,9 @@ trade_engine.py         اجرا، حسابداری، liquidation و گزارش
 trade_csv_logger.py     خروجی CSV و Excel اختیاری
 chart_renderer.py       چارت تعاملی و قابل ذخیره
 indicators.py           indicatorهای برداری
-strategy_config.py      تنظیمات typed پیش‌فرض
+ma_strategy_config.py   پیش‌فرض‌ها و شبکه‌های جست‌وجوی MA
+pulse_strategy_config.py پیش‌فرض‌ها و شبکه‌های جست‌وجوی Pulse
+param_grids/            فایل‌های مستقل ma_focused.json و pulse_focused.json
 optimize.py             optimizer هوشمند/grid و چندپردازه
 check_monthly_data.py   سازنده گزارش ماهانه
 data_candle/            داده ورودی

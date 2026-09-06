@@ -50,7 +50,7 @@ python optimize.py --strategy ma --auto --profile focused --performance normal -
 ## قرارداد نگهداری استراتژی‌ها
 
 1. قوانین Pulse در `pulse_strategy.py` نگهداری شوند؛ تغییر MA برای اضافه‌کردن منطق Pulse لازم نیست.
-2. تنظیمات، gridها، validator، warmup و کش اندیکاتورها متعلق به ماژول Pulse باشند. از `strategy_config.py` مربوط به MA برای تنظیمات Pulse استفاده نشود.
+2. تنظیمات، gridها و validatorهای Pulse در `pulse_strategy_config.py` هستند؛ warmup و کش اندیکاتورها در `pulse_strategy.py` می‌مانند. MA نیز تنظیمات و gridهای خودش را از `ma_strategy_config.py` می‌گیرد. Optimize و strategy adapter تنظیمات استراتژی انتخاب‌شده را مصرف می‌کنند؛ اضافه‌کردن پارامتر به یکی نیاز به افزودن آن در تنظیمات دیگری ندارد.
 3. قرارداد `StrategyAdapter` و خروجی معیارهای optimizer رعایت شود. `TradeEngine`، اندیکاتورها و گزارش‌سازها ابزار مشترک باقی بمانند.
 4. خروجی مستقیم با `output_path(identifier, 'backtest')` تعیین شود. توابع نویسنده از `@output_session` و `claim_output` استفاده کنند؛ اجرای optimize داخل worker نباید گزارش مستقل بنویسد.
 5. Pulse اکنون `STRATEGY_READY=True` دارد. برای پلاگین آینده که هنوز قوانین ندارد، مقدار False مانع اجرای تصادفی می‌شود.

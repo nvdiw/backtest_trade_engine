@@ -32,7 +32,7 @@ from optimize import (
     param_grid, run_auto_optimization, run_optimization, run_staged_optimization,
 )
 from ma_strategy import resolve_parameter_source
-from strategy_config import build_ma_strategy_config, load_ma_strategy_tune
+from ma_strategy_config import build_ma_strategy_config, load_ma_strategy_tune
 from trade_engine import TradeEngine
 
 
@@ -1185,7 +1185,7 @@ class ParameterSourceTests(unittest.TestCase):
     def test_config_and_best_sources_are_explicit(self):
         tune, description = resolve_parameter_source("config")
         self.assertIsNone(tune)
-        self.assertEqual(description, "strategy_config.py")
+        self.assertEqual(description, "ma_strategy_config.py")
 
         with tempfile.TemporaryDirectory() as temp_dir:
             best_path = Path(temp_dir) / "best.json"

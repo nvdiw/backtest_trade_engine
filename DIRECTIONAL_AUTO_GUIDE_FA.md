@@ -35,7 +35,7 @@
 }
 ```
 
-برای تغییر پیش‌فرض‌ها داخل کد، دیکشنری‌های `MA_LONG_DEFAULTS` و `MA_SHORT_DEFAULTS` در `strategy_config.py` را پر کنید؛ نام‌های داخل این دو دیکشنری **بدون پیشوند جهت** نوشته می‌شوند. مثلاً `MA_SHORT_DEFAULTS = {"ema_16_period": 20, "ma_50_period": 60}`. برای مشاهدهٔ همهٔ کلیدها، `python ma_strategy.py --list-params` را اجرا کنید.
+برای تغییر پیش‌فرض‌ها داخل کد، دیکشنری‌های `MA_LONG_DEFAULTS` و `MA_SHORT_DEFAULTS` در `ma_strategy_config.py` را پر کنید؛ نام‌های داخل این دو دیکشنری **بدون پیشوند جهت** نوشته می‌شوند. مثلاً `MA_SHORT_DEFAULTS = {"ema_16_period": 20, "ma_50_period": 60}`. برای مشاهدهٔ همهٔ کلیدها، `python ma_strategy.py --list-params` را اجرا کنید.
 
 برای تست موردی نیز `--set long_ema_16_period=14 --set short_ema_16_period=20` به فرمان `ma_strategy.py` اضافه کنید. `evaluate_params.py` همان فایل‌های جهت‌دار را بدون تغییر پارامترها می‌پذیرد.
 

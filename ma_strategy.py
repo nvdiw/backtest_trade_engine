@@ -14,24 +14,29 @@ from fetch_calculate_data import DATA_FILE
 from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session, add_chart_arguments, chart_options
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
-from strategy_config import (
+from ma_strategy_config import (
     build_ma_strategy_config,
     load_ma_strategy_tune,
     normalize_ma_strategy_tune,
     directional_config,
     DIRECTIONAL_FIELDS,
+    FULL_PARAM_GRID, FOCUSED_PARAM_GRID, PARAMETER_PROFILES, param_grid,
 )
 
 
 DEFAULT_BEST_PARAMS_PATH = output_path("ma_strategy:ma_strategy", "optimize") / "best_params.json"
 TIMEFRAME = "auto"
 
+# Shared adapter hooks, matching every other strategy plug-in.
+build_strategy_config = build_ma_strategy_config
+load_strategy_tune = load_ma_strategy_tune
+
 
 def resolve_parameter_source(source="config", *, params_file=None,
                              best_params=DEFAULT_BEST_PARAMS_PATH):
     """Return parameter overrides and a human-readable source description."""
     if source == "config":
-        return None, "strategy_config.py"
+        return None, "ma_strategy_config.py"
     if source == "best":
         path = Path(best_params)
     elif source == "file":
@@ -2410,7 +2415,7 @@ def build_parser():
                         help="exclusive YYYY-MM-DD date or candle index")
     parser.add_argument(
         "--params-source", choices=("config", "best", "file"), default="config",
-        help="config=strategy_config.py, best=optimizer winner, file=custom JSON",
+        help="config=ma_strategy_config.py, best=optimizer winner, file=custom JSON",
     )
     parser.add_argument(
         "--best-params", default=str(DEFAULT_BEST_PARAMS_PATH),
