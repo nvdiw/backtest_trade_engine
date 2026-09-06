@@ -15,6 +15,7 @@ import pandas as pd
 from market_data_audit import AuditConfig, audit_market_data, build_run_fingerprints
 from optimize import _evaluate_random_window_task, _write_json
 from strategy_adapter import resolve_strategy
+from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session
 
 
 def generate_windows(source, start, end, count, min_months, max_months, seed):
@@ -167,6 +168,7 @@ def write_workbook(path, frame, summary, params, plan, records):
     temporary.replace(path)
 
 
+@runtime_session
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--params', required=True, help='best_params.json or its containing directory')
@@ -185,7 +187,12 @@ def main(argv=None):
     parser.add_argument('--output-dir', default='outputs/evaluate_params')
     parser.add_argument('--resume', action='store_true')
     parser.add_argument('--dry-run', action='store_true')
+    add_runtime_arguments(parser)
     args = parser.parse_args(argv)
+    try:
+        configure_runtime(args, argv)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     if min(args.tests, args.workers, args.min_months) <= 0 or args.max_months < args.min_months:
         parser.error('tests/workers/months must be positive and max-months >= min-months')
     if args.min_trades < 0 or not 0 <= args.max_drawdown <= 100 or not all(
@@ -209,7 +216,7 @@ def main(argv=None):
     for window in windows:
         window['selection_history'] = ('overlaps_selection' if pd.Timestamp(window['start_date']) < pd.Timestamp(selection_end)
                                        else 'after_selection') if selection_end else 'unknown'
-    plan = {k: v for k, v in vars(args).items() if k not in ('workers', 'resume', 'dry_run', 'output_dir')}
+    plan = {k: v for k, v in vars(args).items() if k not in ('workers', 'performance', 'resume', 'dry_run', 'output_dir')}
     plan.update(params=params, source_params=str(params_path), strategy=adapter.identifier,
                 windows=windows, coverage=source.coverage(), selection_end_exclusive=selection_end)
     print(f'Fixed configuration | {len(windows)} windows | {args.min_months}-{args.max_months} calendar months', flush=True)

@@ -52,6 +52,7 @@ from market_data_audit import (
     fingerprint_data,
 )
 from market_data import MarketDataSource
+from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session, apply_process_policy
 
 
 # Every key is an existing MAStrategyConfig setting.  Defaults in
@@ -191,7 +192,7 @@ FULL_PARAM_GRID = {
     "plot_post_cross_penalty_markers": [True],
 }
 
-FOCUSED_PARAM_GRID = {
+LEGACY_FOCUSED_PARAM_GRID = {
     "entry_score_threshold": [6, 7, 8, 9, 10, 11, 12],
     "exit_score_threshold": [4, 5, 6, 7, 8, 9, 10],
     # Score weights
@@ -231,6 +232,11 @@ FOCUSED_PARAM_GRID = {
 }
 
 
+# Editable directional MA/entry search; shared weights remain at the seed values.
+FOCUSED_PARAM_GRID = json.loads(
+    (Path(__file__).parent / 'param_grids' / 'ma_focused.json').read_text(encoding='utf-8')
+)
+
 FULL_PARAM_GRID.update(long_enabled=[True], short_enabled=[True])
 
 
@@ -243,8 +249,9 @@ def _grid_subset(*prefixes, extra=()):
 
 
 PARAMETER_PROFILES = {
-    # The focused profile preserves the user's current score-weight search.
+    # Directional focus starts from the supplied winner; legacy grid remains available.
     "focused": FOCUSED_PARAM_GRID,
+    "focused_legacy": LEGACY_FOCUSED_PARAM_GRID,
     "signal": _grid_subset(
         "entry_", "ma_distance", "candle_move", "impulse_", "late_entry_",
         "period_", "volume_spike", "adx_filter", "atr_filter", "volume_filter",
@@ -287,9 +294,9 @@ for _side in ('long', 'short'):
     for _name, _grid in list(PARAMETER_PROFILES.items()):
         if _name in ('focused', 'signal', 'exit', 'risk_core', 'rsi', 'scale', 'full'):
             PARAMETER_PROFILES[f'{_side}_{_name}'] = {
-                (key if key.startswith(f'rsi_{_side}_') else f'{_side}_{key}'): values
+                (key if key.startswith((f'rsi_{_side}_', f'{_side}_')) else f'{_side}_{key}'): values
                 for key, values in _grid.items()
-                if key in DIRECTIONAL_FIELDS or key.startswith(f'rsi_{_side}_')
+                if key in DIRECTIONAL_FIELDS or key.startswith((f'rsi_{_side}_', f'{_side}_'))
             }
     PARAMETER_PROFILES[_side] = PARAMETER_PROFILES[f'{_side}_full']
 PARAMETER_PROFILES['portfolio'] = {
@@ -898,6 +905,7 @@ def _init_worker(
     global _WORKER_START, _WORKER_END, _WORKER_BASE_TUNE
     global _WORKER_USE_INDICATOR_WARMUP, _WORKER_INDICATOR_WARMUP_CANDLES
     global _WORKER_STRATEGY_SPEC, _WORKER_RESEARCH
+    apply_process_policy()
     if ignore_keyboard_interrupt:
         signal.signal(signal.SIGINT, signal.SIG_IGN)
     _WORKER_START = start
@@ -956,6 +964,7 @@ def _evaluate_task(task):
 
 def _evaluate_random_window_task(task):
     """Evaluate one full configuration on one independently selected time window."""
+    apply_process_policy()
     if len(task) == 6:
         test_index, candidate_id, window_id, params, start, end = task
         strategy_spec = "ma"
@@ -1792,12 +1801,12 @@ def _timestamp_now():
 
 def _strategy_data_file(args, adapter=None):
     adapter = adapter or _adapter_from_args(args)
-    discovered = getattr(adapter.module, "DATA_FILE", None)
-    if discovered:
-        return Path(discovered)
     explicit = getattr(args, "data_file", None)
     if explicit:
         return Path(explicit)
+    discovered = adapter.data_file
+    if discovered:
+        return Path(discovered)
     if adapter.identifier == "ma_strategy:ma_strategy":
         from fetch_calculate_data import DATA_FILE
 
@@ -1816,6 +1825,7 @@ def _activate_strategy_market_data(args, adapter=None):
         return None
     source = MarketDataSource(data_file, adapter.timeframe)
     coverage = source.coverage()
+    args._detected_timeframe = coverage['timeframe']
     interval_seconds = float(coverage["interval_seconds"])
     _ACTIVE_MARKET_DATA_SOURCE = source
     _ACTIVE_CANDLES_PER_YEAR = 365.25 * 24 * 60 * 60 / interval_seconds
@@ -2651,7 +2661,7 @@ def _auto_configuration(args, profile, grid, base_tune, base_description, resolv
     return {
         "strategy": adapter.identifier,
         "data_file": str(data_file.resolve()) if data_file is not None else None,
-        "timeframe": adapter.timeframe,
+        "timeframe": getattr(args, "_detected_timeframe", adapter.timeframe),
         "parameter_grid_source": getattr(args, "param_grid", None),
         "profile": profile,
         "parameter_grid": {key: list(values) for key, values in grid.items()},
@@ -8762,11 +8772,17 @@ Tips:
                         help='MA: optimize long/short separately; use side phases with --staged')
     parser.add_argument('--autopilot', action='store_true',
                         help='MA: start staged directional Auto with automatic snapshot and audit workbooks')
+    add_runtime_arguments(parser, data_file=False)
     return parser
 
 
+@runtime_session
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    try:
+        configure_runtime(args, argv)
+    except (ValueError, OSError) as error:
+        raise SystemExit(str(error)) from error
     if args.autopilot:
         args.auto = args.staged = args.directional = True
     if args.directional:
@@ -8797,6 +8813,7 @@ def main(argv=None):
         return
     try:
         _activate_strategy_market_data(args, args._strategy_adapter)
+        print(f'Performance: {args.performance} | workers: {args.workers} | timeframe: {getattr(args, "_detected_timeframe", "unknown")}')
         frozen_protocol = (
             _load_frozen_date_protocol(args.output_dir)
             if args.date_policy == "auto" else None

@@ -83,12 +83,14 @@ class StrategyAdapter:
 
     @property
     def data_file(self) -> Path | None:
-        value = getattr(self.module, "DATA_FILE", None)
+        from runtime_settings import market_selection
+        value, _ = market_selection(getattr(self.module, "DATA_FILE", None), None)
         return Path(value) if value else None
 
     @property
     def timeframe(self) -> str | None:
-        value = getattr(self.module, "TIMEFRAME", None)
+        from runtime_settings import market_selection
+        _, value = market_selection(None, getattr(self.module, "TIMEFRAME", None))
         return str(value) if value else None
 
     def market_data_source(self, override=None) -> MarketDataSource | None:

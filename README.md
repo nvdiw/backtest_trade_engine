@@ -265,7 +265,7 @@ python optimize.py --profile risk --mode grid --dry-run
 
 | Profile | Intended use |
 |---|---|
-| `focused` | Entry/exit scores plus MA/EMA, ADX, ATR, volume, and RSI timing; practical recency-focused search. |
+| `focused` | 24 independent long/short MA and entry parameters from `param_grids/ma_focused.json`; previous shared search is `focused_legacy`. |
 | `signal` | Entry thresholds, indicators, filters, and entry weights. |
 | `exit` | Exit thresholds, trailing behavior, guards, and exit weights. |
 | `risk` | Sizing, leverage, monthly rules, cooldowns, and scale-ins. |
@@ -497,3 +497,10 @@ check_monthly_data.py   monthly report builder
 data_candle/            input candles
 outputs/                generated artifacts
 ```
+
+
+## Runtime resources and candle timeframe
+
+Git tracks source code, tests, documentation and parameter grids. Generated files in `outputs/`, local candle datasets in `data_candle/`, Python caches, environments and scratch files are ignored. Supply an OHLCV CSV through `--data-file`; ignoring an existing local file does not delete it.
+
+`--performance power_saving|normal|boost` controls worker count and process priority without changing test budgets or numerical precision. Explicit `-w` overrides the suggested worker count. `--data-file PATH --timeframe auto` selects and detects a consistent candle interval, including 1m and 15m, across the optimizer and workers. See [focus, resources and timeframe guide](RUNTIME_FOCUS_GUIDE_FA.md).

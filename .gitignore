@@ -1,5 +1,26 @@
-*.pyc
-outputs/monthly/monthly_data_orders.csv
-outputs/trades/data_orders.csv
-outputs/trades/data_orders.xlsx
-outputs/optimize/
+# Generated reports, checkpoints, charts and run logs
+/outputs/
+
+# Local market datasets (supply your own OHLCV input)
+/data_candle/*.csv
+/data_candle/*.xlsx
+/data_candle/*.parquet
+
+# Python caches, environments and test artifacts
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local scratch files and editor/OS artifacts
+/terminal.txt
+/strategy_config copy.py
+*.log
+~$*
+.DS_Store
+Thumbs.db

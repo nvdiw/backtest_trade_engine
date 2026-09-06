@@ -10,6 +10,7 @@ import numpy as np
 
 from indicators import Indicator
 from fetch_calculate_data import DATA_FILE
+from runtime_settings import add_runtime_arguments, configure_runtime, runtime_session
 from trade_engine import AccountState, Position, TradeEngine
 from generate_reason_text import generate_entry_reason_text, generate_close_reason_text
 from strategy_config import (
@@ -22,7 +23,7 @@ from strategy_config import (
 
 
 DEFAULT_BEST_PARAMS_PATH = Path("outputs") / "optimize" / "best_params.json"
-TIMEFRAME = "15m"
+TIMEFRAME = "auto"
 
 
 def resolve_parameter_source(source="config", *, params_file=None,
@@ -245,6 +246,8 @@ def ma_strategy(
     use_indicator_warmup=True,
     indicator_warmup_candles=None,
     research=False,
+    data_file=None,
+    timeframe=None,
 ):
     """Run the MA strategy over ``start`` (inclusive) to ``end`` (exclusive).
 
@@ -279,8 +282,8 @@ def ma_strategy(
         start=start,
         end=end,
         warmup_candles=indicator_warmup,
-        data_file=DATA_FILE,
-        timeframe=TIMEFRAME,
+        data_file=data_file or DATA_FILE,
+        timeframe=timeframe or TIMEFRAME,
     )
     start = market["start"]
     end = market["end"]
@@ -298,8 +301,9 @@ def ma_strategy(
     history_volume_prices = market["history_volume_prices"]
     warmup_offset = market["warmup_offset"]
 
-    data_stat = Path(DATA_FILE).stat()
-    range_key = (str(Path(DATA_FILE).resolve()), data_stat.st_mtime_ns, data_stat.st_size, market["data_start"], market["end"], warmup_offset)
+    market_file = Path(market.get('data_file', data_file or DATA_FILE))
+    data_stat = market_file.stat()
+    range_key = (str(market_file.resolve()), data_stat.st_mtime_ns, data_stat.st_size, market["data_start"], market["end"], warmup_offset)
 
     def _cached_indicator(kind, key, builder):
         return _get_cached_indicator(kind, range_key, key, builder)
@@ -2438,9 +2442,11 @@ def build_parser():
                         help="write the final result dictionary as JSON")
     parser.add_argument("--print-result", action="store_true",
                         help="print the final result dictionary as JSON")
+    add_runtime_arguments(parser)
     return parser
 
 
+@runtime_session
 def main(argv=None):
     try:
         sys.stdout.reconfigure(errors="replace")
@@ -2450,6 +2456,10 @@ def main(argv=None):
 
     parser = build_parser()
     args = parser.parse_args(argv)
+    try:
+        configure_runtime(args, argv)
+    except (ValueError, OSError) as exc:
+        parser.error(str(exc))
     if args.list_params:
         print(json.dumps(asdict(build_ma_strategy_config()), indent=2, sort_keys=True))
         return 0

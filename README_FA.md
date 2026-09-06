@@ -1,5 +1,7 @@
 # راهنمای فارسی Backtest Trade Engine
 
+راهنمای [فوکوس جدید، حالت‌های performance و تشخیص تایم‌فریم](RUNTIME_FOCUS_GUIDE_FA.md) شامل فرمان شروع ۱۰۰ سیکل از snapshot سیکل ۳۰۰ است. گزینه‌های `--data-file` و `--timeframe auto` فایل کندل را برای موتور و workerها یکسان انتخاب می‌کنند؛ `--performance power_saving|normal|boost` منابع اجرا را بدون کاهش تعداد تست و دقت محاسبات تنظیم می‌کند.
+
 [راهنمای جدید تنظیم مستقل لانگ/شورت، Auto هوشمند و چارت‌های خوانا](DIRECTIONAL_AUTO_GUIDE_FA.md)
 
 | نیاز | فرمان یا تنظیم | نتیجه |
@@ -281,7 +283,7 @@ python optimize.py --profile risk --mode grid --dry-run
 
 | Profile | کاربرد |
 |---|---|
-| `focused` | آستانه‌ها و وزن‌های امتیاز ورود و خروج؛ شروع عملی و سریع‌تر. |
+| `focused` | ۲۴ پارامتر مستقل MA و ورود لانگ/شورت در `param_grids/ma_focused.json`؛ فوکوس قبلی: `focused_legacy`. |
 | `signal` | شرط‌های ورود، indicatorها، filterها و وزن‌های ورود. |
 | `exit` | شرط خروج، trailing، guardها و وزن‌های خروج. |
 | `risk` | حجم معامله، اهرم، قوانین ماهانه، cooldown و scale-in. |

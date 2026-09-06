@@ -65,7 +65,33 @@ def _open_times(path_key: str) -> pd.Series:
 def clear_market_data_cache() -> None:
     """Clear timestamp caches after a candle file is replaced in-place."""
     _open_times.cache_clear()
+    _inferred_interval.cache_clear()
     _load_market_window.cache_clear()
+
+
+@lru_cache(maxsize=16)
+def _inferred_interval(path_key):
+    times = _open_times(path_key)
+    deltas = times.diff().dropna()
+    if (deltas <= pd.Timedelta(0)).any():
+        raise ValueError('Open time must be strictly increasing without duplicates')
+    if deltas.empty:
+        return None
+    counts = deltas.value_counts()
+    interval = counts.index[0]
+    if counts.iloc[0] / len(deltas) < .8:
+        raise ValueError('Ambiguous or mixed candle spacing; provide one consistent timeframe per file')
+    if ((deltas.to_numpy(dtype='timedelta64[ns]').astype('int64') % interval.value) != 0).any():
+        raise ValueError('Mixed candle spacing: gaps must be whole multiples of the base interval')
+    return interval
+
+
+def timeframe_label(interval):
+    for suffix, unit in (('d', 86400), ('h', 3600), ('m', 60), ('s', 1)):
+        seconds = interval.total_seconds()
+        if seconds >= unit and seconds % unit == 0:
+            return f'{int(seconds // unit)}{suffix}'
+    return str(interval)
 
 
 @dataclass(frozen=True)
@@ -87,22 +113,20 @@ class MarketDataSource:
         return _open_times(self.path_key)
 
     def inferred_interval(self) -> pd.Timedelta:
-        times = self.open_times().tail(1000).sort_values()
-        deltas = times.diff().dropna()
-        deltas = deltas[deltas > pd.Timedelta(0)]
-        if deltas.empty:
+        inferred = _inferred_interval(self.path_key)
+        if inferred is None:
             declared = _timeframe_delta(self.timeframe)
             if declared is None:
                 raise ValueError("cannot infer timeframe from fewer than two valid candles")
             return declared
-        return deltas.median()
+        return inferred
 
     def interval(self) -> pd.Timedelta:
         declared = _timeframe_delta(self.timeframe)
         inferred = self.inferred_interval()
         if declared is not None and inferred != declared:
             raise ValueError(
-                f"declared TIMEFRAME {self.timeframe!r} does not match the median "
+                f"declared TIMEFRAME {self.timeframe!r} does not match the detected "
                 f"candle interval {inferred} in {self.data_file}"
             )
         return declared or inferred
@@ -112,7 +136,7 @@ class MarketDataSource:
         interval = self.interval()
         return {
             "data_file": str(self.data_file),
-            "timeframe": str(self.timeframe or interval),
+            "timeframe": timeframe_label(interval),
             "first_candle": times.iloc[0].strftime("%Y-%m-%d %H:%M:%S"),
             "last_candle": times.iloc[-1].strftime("%Y-%m-%d %H:%M:%S"),
             "end_exclusive": (times.iloc[-1] + interval).strftime(
@@ -145,22 +169,25 @@ class MarketDataSource:
         return [int(index) for index in window.index[keep]]
 
     def load(self, start: Any, end: Any, warmup_candles: int = 0) -> dict[str, Any]:
+        interval = self.interval()
         start_index = self.resolve_index(start)
         end_index = self.resolve_index(end)
         if end_index <= start_index:
             raise ValueError("end must resolve to a candle after start")
+        if start_index < 0 or end_index > len(self.open_times()):
+            raise ValueError('Requested candle indices are outside the dataset')
         warmup_candles = max(0, int(warmup_candles))
         data_start = max(0, start_index - warmup_candles)
         return _load_market_window(
             self.path_key,
-            str(self.timeframe or "infer"),
+            timeframe_label(interval),
             data_start,
             start_index,
             end_index,
         )
 
 
-@lru_cache(maxsize=32)
+@lru_cache(maxsize=4)
 def _load_market_window(
     path_key: str,
     timeframe: str,

@@ -263,6 +263,9 @@ class TradeEngine:
         cached immutable market arrays avoid re-reading and parsing the CSV for
         every candidate in a worker process.
         """
+        from runtime_settings import market_selection, apply_process_policy
+        apply_process_policy()
+        data_file, timeframe = market_selection(data_file, timeframe)
         # The no-argument branch preserves the legacy MA loader and its public
         # test/mocking surface.  Plug-in strategies pass their own DATA_FILE and
         # TIMEFRAME and are completely independent of the 15-minute dataset.
