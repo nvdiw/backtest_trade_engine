@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 import sys
 
-_KEYS = ('BTE_DATA_FILE', 'BTE_TIMEFRAME', 'BTE_PERFORMANCE')
+_KEYS = ('BTE_DATA_FILE', 'BTE_TIMEFRAME', 'BTE_PERFORMANCE', 'BTE_SYMBOL')
 _priority_applied = None
 
 
@@ -36,6 +36,7 @@ def add_runtime_arguments(parser, *, data_file=True):
         parser.add_argument('--data-file', help='OHLCV CSV used for this run')
     parser.add_argument('--timeframe', default='auto',
                         help='auto detects candle spacing; e.g. 1m or 15m validates an explicit interval')
+    parser.add_argument('--symbol', help='market label for reports, e.g. ETHUSDT; otherwise inferred from the data filename')
 
 
 def add_chart_arguments(parser):
@@ -66,6 +67,8 @@ def configure_runtime(args, argv=None):
         args.data_file = str(path)
         os.environ['BTE_DATA_FILE'] = str(path)
     os.environ['BTE_TIMEFRAME'] = args.timeframe
+    if getattr(args, 'symbol', None):
+        os.environ['BTE_SYMBOL'] = args.symbol
     os.environ['BTE_PERFORMANCE'] = args.performance
     _clear_market_caches()
     apply_process_policy()

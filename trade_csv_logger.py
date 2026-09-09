@@ -222,6 +222,7 @@ class TradeCSVLogger:
         overview_metrics=None,
         file_name: str = os.path.join("outputs", "trades", "data_orders.csv"),
         monthly_report=None,
+        run_metadata=None,
     ):
         if self.optimize:
             # do not write any files during optimization
@@ -265,6 +266,8 @@ class TradeCSVLogger:
                 output_dir = os.path.dirname(file_name)
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
+                for key, value in (run_metadata or {}).items():
+                    df[key] = value
                 if monthly_report is not None:
                     monthly_summary, monthly_rows = monthly_report
                     for key, value in monthly_summary.items():

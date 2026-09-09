@@ -69,7 +69,7 @@ class PulseIntegrationTests(unittest.TestCase):
             self.assertEqual(json.loads((output/'params.json').read_text())['max_hold_bars'],3)
             with zipfile.ZipFile(output/'trades/data_orders.xlsx') as archive:
                 text=''.join(archive.read(n).decode('utf-8') for n in archive.namelist() if n.endswith('.xml'))
-                self.assertIn('RollingRangeBreakout1m',text)
+                self.assertIn(pulse.DISPLAY_NAME,text)
                 self.assertIn('max_hold_bars',text)
     def test_optimizer_rejects_cost_search(self):
         with tempfile.TemporaryDirectory() as directory:

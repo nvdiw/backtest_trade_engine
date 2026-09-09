@@ -1,5 +1,17 @@
 # Backtest Trade Engine
 
+[Unified output pipeline and simple optimizer commands (Persian)](UNIFIED_OUTPUTS_FA.md)
+
+```powershell
+python optimize.py pulse --cycles 200
+python optimize.py ma --cycles 200
+python optimize.py status CAMPAIGN_FOLDER
+python optimize.py report CAMPAIGN_FOLDER
+python optimize.py resume CAMPAIGN_FOLDER --cycles 50
+```
+
+Strategies own their data and timeframe settings. Backtests share CSV, Excel, log, monthly and chart reporting for every strategy, timeframe and symbol. Auto campaigns publish status and rejection reports even when no candidate qualifies. Resume restores the saved campaign configuration; `--cycles` adds cycles on resume.
+
 [Pulse automatic date windows and bounded campaign](PULSE_OPTIMIZE_FA.md): `python run_pulse_optimize.py --performance normal` runs up to four cycles of 98 Phase A candidates, with dataset-revision isolation and automatic checkpoint continuation.
 
 [Independent long/short settings, adaptive Auto and chart layout](DIRECTIONAL_AUTO_GUIDE_FA.md)

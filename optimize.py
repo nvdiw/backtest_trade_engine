@@ -11,6 +11,7 @@ from excel_charts import add_report_chart
 from optimize_overview import OVERVIEW_COLUMNS, comparison_rows, write_overview, print_leaders
 from optimizer_evidence import apply_profit_learning, chronological_probe_indices
 from monthly_reporting import MONTHLY_COLUMNS
+from campaign_reporting import publish_campaign
 
 import argparse
 import calendar
@@ -2480,6 +2481,7 @@ def _auto_feature_configuration(args):
     """Settings for the version-2 search engine, stored outside legacy config."""
     return {
         "learning_target": getattr(args, 'auto_learning_target', 'rank'),
+        "minimum_trades_policy": getattr(args, 'auto_trade_count_policy', 'fixed'),
         "advanced_min_candidates": int(args.auto_advanced_min_candidates),
         "halving_rungs": int(args.auto_halving_rungs),
         "halving_keep": float(args.auto_halving_keep),
@@ -2568,6 +2570,7 @@ def _restore_auto_resume_args(args, state):
         if saved_key in features:
             setattr(args, argument_name, features[saved_key])
     args.auto_learning_target = features.get('learning_target', 'rank')
+    args.auto_trade_count_policy = features.get('minimum_trades_policy', 'fixed')
     # Version-2 checkpoints predate the configurable history cap. Preserve the
     # exact 1,024-sample behavior they were trained with instead of silently
     # changing their tree model during resume.
@@ -3401,7 +3404,7 @@ def _auto_stage_fieldnames(keys):
         "objective_score", "time_normalized_score", "score",
         *IMPORTANT_RESULT_COLUMNS, *metrics,
         "profit_per_trade", "range_candles", "duration_s", *keys, "error",
-        "monthly_returns_json",
+        "monthly_returns_json", "required_trades",
     ]
 
 
@@ -3428,7 +3431,7 @@ def _upgrade_auto_stage_csv(path, keys):
 
 def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
                      params, result, duration, objective_score, error,
-                     time_normalized_score=None, range_candles=None):
+                     time_normalized_score=None, range_candles=None, required_trades=None):
     row = {
         "candidate_id": candidate_id,
         "cycle": cycle,
@@ -3440,6 +3443,7 @@ def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
         "time_normalized_score": time_normalized_score,
         "range_candles": range_candles,
         "error": error,
+        "required_trades": required_trades,
         "monthly_returns_json": (
             json.dumps(result.get("monthly_returns", []), separators=(",", ":"))
             if result and result.get("monthly_returns") is not None else ""
@@ -3582,6 +3586,12 @@ def _clear_auto_stage_checkpoint(cycle_dir, stage):
         parent.rmdir()
 
 
+def duration_trade_requirement(reference_trades, stage_candles, reference_candles):
+    if reference_trades <= 0:
+        return 0
+    return max(1, math.ceil(reference_trades * stage_candles / max(1, reference_candles)))
+
+
 def _run_auto_stage(
     args,
     cycle,
@@ -3630,6 +3640,11 @@ def _run_auto_stage(
     effective_min_trades = (
         args.min_trades if min_trades_override is None else min_trades_override
     )
+    if (state.get('optimizer_features') or {}).get('minimum_trades_policy') == 'duration':
+        reference = state['config']['ranges']['discovery']
+        effective_min_trades = duration_trade_requirement(
+            args.min_trades, _range_candle_count(range_start, range_end),
+            _range_candle_count(*reference))
     range_candles = _range_candle_count(range_start, range_end)
     current_best = _auto_stage_best(records.values())
     use_indicator_warmup = bool(
@@ -3715,6 +3730,7 @@ def _run_auto_stage(
                     params, result, duration, objective_score, error,
                     time_normalized_score=normalized_score,
                     range_candles=range_candles,
+                    required_trades=effective_min_trades,
                 ))
                 csv_file.flush()
                 records[candidate_id] = {
@@ -4639,6 +4655,18 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         "updated_at": state["updated_at"],
     }
     _write_json(output_dir / "auto_summary.json", summary)
+    publish_campaign(output_dir, state, excel=excel_enabled, cycle=max(1, int(state.get('cycles_completed', 0))))
+    if not ranked_hall:
+        fields = list(_flatten_hall_record({'robust_score': None, 'cycle': None,
+                      'candidate_id': None}, keys, 1))
+        _write_rows_atomic(output_dir / 'hall_of_fame.csv', fields, [])
+        _write_rows_atomic(output_dir / 'candidate_catalog.csv', fields, [])
+        if excel_enabled:
+            shutil.copy2(output_dir / 'campaign_report.xlsx', output_dir / 'auto_report.xlsx')
+            summary['excel_report'] = str(output_dir / 'auto_report.xlsx')
+        summary['recommended_params_file'] = None
+        summary['outcome'] = 'NO_QUALIFIED_FINALIST'
+        _write_json(output_dir / 'auto_summary.json', summary)
     if ranked_hall:
         best_record = ranked_hall[0]
         best_metrics = (best_record.get("stage_metrics", {}).get("final", {}) or {})
@@ -4846,6 +4874,7 @@ def run_auto_optimization(args, grid=None):
         saved_features = state.get("optimizer_features")
         if saved_features is not None:
             saved_features.setdefault('learning_target', 'rank')
+            saved_features.setdefault('minimum_trades_policy', 'fixed')
         if saved_features is not None and "surrogate_max_samples" not in saved_features:
             saved_features["surrogate_max_samples"] = optimizer_features[
                 "surrogate_max_samples"
@@ -5521,9 +5550,12 @@ def run_auto_optimization(args, grid=None):
             excel_enabled=bool(args.excel_top),
         )
         print("\nAuto mode stopped safely. Use --auto --resume to continue.")
-        if (output_dir / "best_params.json").is_file():
+        if hall and (output_dir / "best_params.json").is_file():
             print(f"BEST AVAILABLE PARAMETER FILE: {output_dir / 'best_params.json'}")
             print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
+        if not hall:
+            print("No qualified final winner. Checkpoint parameters are provisional.")
+        print(f"Campaign report: {output_dir / 'CAMPAIGN.md'}")
         return hall[0] if hall else None
 
     state.update({"status": "completed", "updated_at": _timestamp_now()})
@@ -5536,9 +5568,12 @@ def run_auto_optimization(args, grid=None):
         f"Auto campaign stopped after {state['cycles_completed']} completed cycle(s). "
         f"Resume with --auto --resume."
     )
-    if (output_dir / "best_params.json").is_file():
+    if hall and (output_dir / "best_params.json").is_file():
         print(f"USE THIS PARAMETER FILE: {output_dir / 'best_params.json'}")
         print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
+    if not hall:
+        print("No qualified final winner. Checkpoint parameters are provisional.")
+    print(f"Campaign report: {output_dir / 'CAMPAIGN.md'}")
     return hall[0] if hall else None
 
 
@@ -5863,6 +5898,10 @@ def _write_auto_cycle_snapshot(output_dir, hall, cycle, top_n, grid, state):
         "run_fingerprints": run_manifest.get("fingerprints"),
         "created_at": _timestamp_now(),
     }
+    if not selected:
+        publish_campaign(snapshot_dir, state, excel=True)
+        shutil.copy2(snapshot_dir / 'campaign_report.xlsx', snapshot_dir / 'snapshot_report.xlsx')
+        manifest['colored_workbook'] = 'snapshot_report.xlsx'
     _write_json(snapshot_dir / "manifest.json", manifest)
     return snapshot_dir
 
@@ -8487,7 +8526,7 @@ Tips:
         help="maximum robust winners retained across all auto cycles",
     )
     auto.add_argument(
-        "--auto-cycles", type=int, default=0,
+        "--auto-cycles", "--cycles", type=int, default=0,
         metavar="N",
         help="stop after N completed cycles (0 runs until Ctrl+C)",
     )
@@ -8559,6 +8598,8 @@ Tips:
         '--auto-learning-target', choices=('rank', 'profit-evidence'), default='rank',
         help='profit-evidence learns net return, monthly downside and failed candidates; persists across resume',
     )
+    auto.add_argument('--auto-trade-count-policy', choices=('fixed', 'duration'), default='fixed',
+                      help='duration scales the trade gate to each stage relative to Discovery')
     auto.add_argument(
         "--auto-walk-forward-folds", type=int, default=3, metavar="N",
         help="disjoint pre-Discovery time folds (0 disables; minimum enabled value is 2)",
@@ -8628,15 +8669,31 @@ Tips:
 @output_session
 def main(argv=None):
     from optimize_resume import restore_campaign
+    from optimize_commands import expand_arguments, report_command
     parser = build_parser()
     arguments = sys.argv[1:] if argv is None else list(argv)
+    simple_start = bool(arguments and not arguments[0].startswith('-')
+                        and arguments[0] not in ('resume', 'status', 'report'))
+    try:
+        if report_command(arguments):
+            return
+        arguments = expand_arguments(arguments)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     args = parser.parse_args(arguments)
+    if any(item == '--cycles' or item.startswith('--cycles=') for item in arguments):
+        args.auto = True
+    if simple_start and args.auto and not args.resume:
+        module = _adapter_from_spec(args.strategy).module
+        parser.set_defaults(**getattr(module, 'OPTIMIZER_DEFAULTS', {}))
+        args = parser.parse_args(arguments)
+        args.auto = True
     try:
         arguments = restore_campaign(parser, args, arguments)
     except (OSError, ValueError) as error:
         raise SystemExit(str(error)) from error
     try:
-        configure_runtime(args, argv)
+        configure_runtime(args, arguments)
     except (ValueError, OSError) as error:
         raise SystemExit(str(error)) from error
     if args.autopilot:

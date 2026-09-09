@@ -95,16 +95,7 @@ def render_backtest_chart(
     source_open_times = pd.to_datetime(np.asarray(open_times, dtype=object), utc=True)
     total_candles = len(source_close)
     if total_candles == 0:
-        return {
-            'final_balance': balance,
-            'total_profit': round(sum(profits_lst), 6),
-            'total_profit_percent': round(t_profit_percent, 6),
-            'closed_trades': count_closed_orders,
-            'wins': total_wins,
-            'losses': total_losses,
-            'maximum_drawdown': round(max_drawdown, 2),
-            "profit_more_than_8%": len(lst_profit_percent_per_month)
-        }
+        return None
     chart_array = np.asarray(chart_data, dtype=float)
     if chart_array.ndim != 2 or chart_array.shape[0] != total_candles:
         ypoints_total_balance = np.full(total_candles, float(balance))
@@ -758,12 +749,12 @@ def render_backtest_chart(
                 ax_equity.set_ylim(fixed_equity_ylim)
     
             ax_price.set_title(
-                (f"{chart_title} | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped}"
+                (f"{chart_title} | Last: {last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped}"
                  if chart_title else
-                 f"BTC - OHLC + MAs | Last: ${last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped} | Drag/Wheel/\u2190/\u2192 | \u2191 oldest | \u2193 latest | Hover a trade marker for full details"),
+                 f"OHLC + indicators | Last: {last_close_price:,.2f} | Candles: {len(price_df)} (x{render_step}) | Offset: {offset_clamped} | Drag/Wheel/\u2190/\u2192 | \u2191 oldest | \u2193 latest | Hover a trade marker for full details"),
                 color=chart_palette["text"],
             )
-            ax_price.set_ylabel("BTC Price")
+            ax_price.set_ylabel("Price")
             ax_equity.set_ylabel("Balance ($)")
             ax_price.tick_params(labelbottom=False)
 

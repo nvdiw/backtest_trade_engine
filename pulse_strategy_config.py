@@ -101,6 +101,7 @@ FOCUSED_PARAM_GRID = json.loads(
 )
 PHASE_A_GRID = {key: list(FULL_PARAM_GRID[key]) for key in SIGNAL_KEYS}
 PARAMETER_PROFILES = {
+    'quality': json.loads((Path(__file__).parent / 'param_grids/pulse_quality_1m.json').read_text(encoding='utf-8')),
     'focused': FOCUSED_PARAM_GRID,
     'full': FULL_PARAM_GRID,
     'signal': PHASE_A_GRID,
@@ -112,6 +113,13 @@ PARAMETER_PROFILES = {
                     for key, values in FULL_PARAM_GRID.items() if key in (*SIGNAL_KEYS, *ENHANCEMENT_KEYS)},
 }
 param_grid = FULL_PARAM_GRID
+OPTIMIZER_DEFAULTS = {
+    'profile': 'quality', 'auto_tests': 128, 'auto_validation_top': 24,
+    'auto_stress_top': 12, 'auto_walk_forward_top': 8, 'auto_walk_forward_folds': 3,
+    'auto_final_top': 4, 'auto_hall_size': 100, 'auto_advanced_min_candidates': 32,
+    'auto_halving_rungs': 0, 'auto_learning_target': 'profit-evidence',
+    'auto_trade_count_policy': 'duration', 'min_trades': 30, 'max_drawdown': 25,
+}
 STAGED_PHASES = (('signal','signal'), ('filters','filters'), ('exits','exits'), ('sizing','sizing'))
 EXECUTION_SCENARIOS = {'base': {}, 'adverse': {'fee_rate': .0007, 'slippage_rate': .0002},
                        'severe': {'fee_rate': .001, 'slippage_rate': .0005}}

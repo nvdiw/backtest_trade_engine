@@ -19,11 +19,12 @@ from trade_engine import AccountState, TradeEngine
 from pulse_strategy_config import (
     PulseConfig, SIGNAL_KEYS, ENHANCEMENT_KEYS, FULL_PARAM_GRID, FOCUSED_PARAM_GRID, PHASE_A_GRID,
     PARAMETER_PROFILES, param_grid, STAGED_PHASES, EXECUTION_SCENARIOS,
-    AUTO_DATE_DEFAULTS, IDENTIFIER, side_value, build_strategy_config,
+    AUTO_DATE_DEFAULTS, OPTIMIZER_DEFAULTS, IDENTIFIER, side_value, build_strategy_config,
     load_strategy_tune, is_valid_candidate, validate_parameter_grid,
 )
 
-DISPLAY_NAME = 'Pulse / RollingRangeBreakout1m'
+DISPLAY_NAME = 'Pulse / RollingRangeBreakout'
+SYMBOL = None  # Optional explicit market label; otherwise derived from DATA_FILE.
 STRATEGY_READY = True
 DATA_FILE = Path(__file__).resolve().parent / 'data_candle' / 'btc_1m_data_2025_to_2026.csv'
 TIMEFRAME = '1m'
@@ -149,8 +150,6 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
     interval = source.interval()
     interval_ns = interval.value
     label = timeframe_label(interval)
-    if label not in ('1m', '15m'):
-        raise ValueError('Pulse supports 1m and 15m candles')
     if end == 'latest':
         end = source.coverage()['end_exclusive']
     market = TradeEngine.load_market_data(start,end,
@@ -168,6 +167,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
     if not cfg.optimize:
         claim_output(output_dir,IDENTIFIER,'backtest')
     engine = TradeEngine(first_balance=cfg.balance,tactical_balance=cfg.balance,
+        market=market, strategy_name=DISPLAY_NAME, symbol=SYMBOL,
         optimize=cfg.optimize,verbose=verbose,write_trades=not cfg.optimize,write_excel=write_excel,
         output_dir=output_dir,fee_rate=cfg.fee_rate,slippage_rate=cfg.slippage_rate,
         funding_rate_per_8h=cfg.funding_rate_per_8h,
@@ -329,7 +329,6 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
         if render_chart:
             chart_file = Path(chart_file) if chart_file else output / 'chart.png'
             result['chart_file'] = str(chart_file)
-        engine.save_run_metadata(result, asdict(cfg))
         if render_chart:
             engine.render_strategy_chart(
                 market=dict(open_prices=opens, high_prices=high, low_prices=low, close_prices=close,
@@ -338,7 +337,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
                 price_overlays={'Upper channel': np.where(ready, upper, np.nan),
                                 'Lower channel': np.where(ready, lower, np.nan), 'Initial stop': stop_line},
                 oscillator_values=np.where(ready, atr, np.nan), oscillator_label='ATR20 SMA',
-                title=f'Pulse | BTC {label}', show=show_chart, save_path=chart_file, max_candles=plot_max_candles)
+                title=DISPLAY_NAME, show=show_chart, save_path=chart_file, max_candles=plot_max_candles)
     return result
 
 def build_parser():

@@ -26,6 +26,8 @@ from ma_strategy_config import (
 
 DEFAULT_BEST_PARAMS_PATH = output_path("ma_strategy:ma_strategy", "optimize") / "best_params.json"
 TIMEFRAME = "auto"
+DISPLAY_NAME = 'MA Strategy'
+SYMBOL = None
 
 # Shared adapter hooks, matching every other strategy plug-in.
 build_strategy_config = build_ma_strategy_config
@@ -665,6 +667,7 @@ def ma_strategy(
 
     # ---- MANAGE TRADES ----
     trade_engine = TradeEngine(
+        market=market, strategy_name=DISPLAY_NAME, symbol=SYMBOL,
         first_balance=first_balance,
         monthly_profit_percent_stop_trade=monthly_profit_percent_stop_trade,
         monthly_loss_percent_stop_trade=monthly_loss_percent_stop_trade,

@@ -13,12 +13,12 @@ import numpy as np
 import pandas as pd
 
 from chart_renderer import render_backtest_chart
-from check_monthly_data import write_monthly_summary
 from fetch_calculate_data import fetch_all_data
 from get_candle_index import get_candle_index, get_month_start_indices
 from market_data import MarketDataSource
 from trade_csv_logger import TradeCSVLogger
 from monthly_reporting import monthly_report
+from run_reporting import publish_backtest, write_metadata, market_metadata
 
 
 class _DataclassMapping:
@@ -217,7 +217,11 @@ class TradeEngine:
         funding_rate_per_8h=0.0,
         maintenance_margin_rate=0.0,
         liquidation_fee_rate=0.0,
+        market=None,
+        strategy_name=None,
+        symbol=None,
     ):
+        self.market_metadata = market_metadata(market, strategy_name or 'Strategy', os.environ.get('BTE_SYMBOL') or symbol) if market else {}
         self.write_trades = bool(write_trades) and not bool(optimize)
         self.output_dir = os.fspath(output_dir)
         self.csv_logger = csv_logger or TradeCSVLogger(
@@ -370,7 +374,7 @@ class TradeEngine:
                               title, show=False, save_path=None, max_candles=500):
         """Strategy-neutral bridge to the same interactive renderer used by MA."""
         empty = np.full(len(market['close_prices']), np.nan)
-        return render_backtest_chart(
+        payload = dict(
             **chart_state,
             **{key: market[key] for key in ('close_prices', 'close_times', 'open_times',
                                            'open_prices', 'high_prices', 'low_prices')},
@@ -386,16 +390,29 @@ class TradeEngine:
             profits_lst=account.profits_lst, t_profit_percent=result['total_profit_percent'],
             count_closed_orders=account.count_closed_orders, total_wins=account.total_wins,
             total_losses=account.total_losses, max_drawdown=account.max_drawdown,
-            lst_profit_percent_per_month=result['monthly_returns'],
+            lst_profit_percent_per_month=[value * 100 for value in result['monthly_returns']],
             chart_show=show, chart_save_path=save_path)
+        return self.render_result_chart(result, None, payload)
+
+    def render_result_chart(self, result, parameters, payload):
+        """One chart publication path for the generic and legacy state adapters."""
+        payload = dict(payload)
+        payload['chart_title'] = ' | '.join(str(value) for value in (
+            result.get('strategy_name', 'Strategy'), result.get('symbol'), result.get('timeframe')) if value)
+        chart_path = payload.get('chart_save_path') or str(Path(self.output_dir) / 'chart.png')
+        payload['chart_save_path'] = chart_path
+        chart_result = render_backtest_chart(**payload)
+        result['chart_file'] = str(chart_path)
+        if self.write_trades:
+            if parameters is None:
+                path = Path(self.output_dir) / 'params.json'
+                parameters = json.loads(path.read_text(encoding='utf-8')) if path.is_file() else {}
+            self.save_run_metadata(result, parameters)
+        return chart_result
 
     def save_run_metadata(self, result, parameters):
         """Shared JSON sidecars; callers hold their strategy workspace lock."""
-        output = Path(self.output_dir)
-        output.mkdir(parents=True, exist_ok=True)
-        for filename, payload in (('result.json', result), ('params.json', parameters)):
-            (output / filename).write_text(json.dumps(payload, indent=2,
-                default=lambda value: value.item() if isinstance(value, np.generic) else str(value)) + '\n', encoding='utf-8')
+        write_metadata(self.output_dir, result, parameters)
 
     @staticmethod
     def _safe_percent(value, base):
@@ -1850,84 +1867,9 @@ class TradeEngine:
         if accrue_open_costs:
             result['accrued_open_costs'] = round(accrued_costs, 6)
 
-        if self.verbose:
-            self.print_account_report(result, start_time, end_time)
-
-        if self.write_trades:
-            output_file = output_file or os.path.join(
-                self.output_dir, "trades", "data_orders.csv"
-            )
-            days, hours, minutes = trade_duration(start_time, end_time)
-            self.csv_logger.save_csv(
-                first_balance=first_balance,
-                final_balance=final_balance,
-                total_profit=total_profit,
-                total_profit_percent=return_percent,
-                total_fee=account.deducting_fee_total + accrued_costs,
-                start_time=start_time,
-                end_time=end_time,
-                days=days,
-                hours=hours,
-                minutes=minutes,
-                overview_metrics={
-                    **({'Strategy': dict(report_metadata)} if report_metadata else {}),
-                    "Capital": {
-                        "Starting balance": first_balance,
-                        "Final balance": final_balance,
-                        "Total profit": total_profit,
-                        "Realized profit": realized_profit,
-                        "Unrealized profit": unrealized_profit,
-                        "Total profit %": return_percent,
-                        "Total fees": account.deducting_fee_total + accrued_costs,
-                    },
-                    "Performance": {
-                        "Optimizer score": score_metrics["score"],
-                        "Maximum drawdown %": account.max_drawdown,
-                        "Win rate %": win_rate,
-                        "Profit factor": score_metrics["profit_factor"],
-                        "Expectancy %": score_metrics["expectancy_percent"],
-                        "Calmar ratio": score_metrics["calmar_ratio"],
-                    },
-                    "Long": self._overview_side_metrics("Long", directional_metrics),
-                    "Short": self._overview_side_metrics("Short", directional_metrics),
-                },
-                file_name=str(output_file),
-                monthly_report=(monthly_summary, monthly_rows),
-            )
-            write_monthly_summary(in_file=str(output_file),
-                out_file=os.path.join(self.output_dir, 'monthly', 'monthly_data_orders.csv'), quiet=True)
+        publish_backtest(self, result, {key: value for key, value in (report_metadata or {}).items() if key != 'Name'}, start_time, end_time,
+                         first_balance, (monthly_summary, monthly_rows), output_file)
         return result
-
-    @staticmethod
-    def print_account_report(result, start_time, end_time):
-        """Console report for plug-ins using the shared account finalizer."""
-        days, hours, minutes = trade_duration(start_time, end_time)
-        print('✅ BACKTEST FINISHED')
-        if result.get('strategy_name'):
-            print('Strategy:', result['strategy_name'])
-        print('Closed Trades:', result['closed_trades'], '( Longs:', result['long_trades'], '| Shorts:', result['short_trades'], ')')
-        print('Count open Trades:', result['open_positions'])
-        print('Total Wins:', result['wins'], '| Total Wins Long:', result['long_wins'], '| Total Wins Short:', result['short_wins'])
-        print('Total Losses:', result['losses'])
-        for label, key, suffix in (
-            ('Final Balance:', 'final_balance', '$'),
-            ('Final Balance (No Fee):', 'final_balance_without_fee', '$'),
-            ('Final marked balance:', 'final_balance_dynamic', '$'),
-            ('Total Fees Paid:', 'total_fees', '$'),
-            ('Maximum Drawdown:', 'maximum_drawdown', '%'),
-            ('Win Rate:', 'win_rate', '%'),
-            ('Total Profit:', 'total_profit', '$'),
-            ('Total Profit Percent:', 'total_profit_percent', '%'),
-            ('saved Money:', 'saved_money', '$'),
-        ):
-            print(label, round(result[key], 2), suffix)
-        print(f'Total Duration : {days} days, {hours} hours, {minutes} minutes')
-        print('Count Liquids:', result['liquidations'])
-        print('count_profit_months:', result['profit_months'])
-        print('count_loss_months:', result['loss_months'])
-        print('Total score:', result['score'])
-        if result.get('funding_model'):
-            print('Funding model:', result['funding_model'])
 
     def finalize_backtest(self, **state):
         """Calculate final metrics, emit reports/files, render the chart, and return results."""
@@ -2036,137 +1978,8 @@ class TradeEngine:
                     f"{side}_win_rate": wins_for_side * 100.0 / total,
                 })
 
-        if self.verbose:
-            self._print_backtest_report(
-                state=state,
-                balance=balance,
-                balance_without_fee=balance_without_fee,
-                t_profit_percent=t_profit_percent,
-                days=days,
-                hours=hours,
-                minutes=minutes,
-                win_rate=win_rate,
-                profit_months_count=profit_months_count,
-                loss_months_count=loss_months_count,
-                score=score,
-                scale_long_total=scale_long_total,
-                scale_short_total=scale_short_total,
-                scale_long_winrate=scale_long_winrate,
-                scale_short_winrate=scale_short_winrate,
-                scale_total=scale_total,
-                scale_wins=scale_wins,
-                scale_losses=scale_losses,
-                scale_winrate=scale_winrate,
-                scale_profit=scale_profit,
-                rsi_total=rsi_total,
-                rsi_wins=rsi_wins,
-                rsi_losses=rsi_losses,
-                rsi_winrate=rsi_winrate,
-                rsi_profit=rsi_profit,
-                directional_metrics=directional_metrics,
-            )
-
         total_profit = balance - first_balance
         realized_profit = sum(profits)
-        output_file = os.path.join(self.output_dir, "trades", "data_orders.csv")
-        self.csv_logger.save_csv(
-            first_balance=first_balance,
-            final_balance=balance,
-            total_profit=total_profit,
-            total_profit_percent=t_profit_percent,
-            total_fee=state["deducting_fee_total"],
-            start_time=state["first_open_time"],
-            end_time=state["last_close_time"],
-            days=days,
-            hours=hours,
-            minutes=minutes,
-            overview_metrics={
-                "Run": {
-                    "Start time": state["first_open_time"],
-                    "End time": state["last_close_time"],
-                    "Duration": f"{days}d {hours}h {minutes}m",
-                },
-                "Capital": {
-                    "Starting balance": first_balance,
-                    "Final balance": balance,
-                    "Final balance without fees": balance_without_fee,
-                    "Static balance": state["total_money_static"],
-                    "Dynamic marked balance": state["total_money_dynamic"],
-                    "Saved money": save_money,
-                    "Total profit": total_profit,
-                    "Realized profit": realized_profit,
-                    "Unrealized profit": unrealized_profit,
-                    "Total profit %": t_profit_percent,
-                    "Total fees": state["deducting_fee_total"],
-                },
-                "Performance": {
-                    "Optimizer score": score,
-                    "Maximum drawdown %": max_drawdown,
-                    "Win rate %": win_rate,
-                    "Profit factor": profit_factor,
-                    "Expectancy %": expectancy_pct,
-                    "Calmar ratio": calmar_ratio,
-                    "Profitable months": profit_months_count,
-                    "Losing months": loss_months_count,
-                },
-                "Trades": {
-                    "Closed trades": state["count_closed_orders"],
-                    "Open positions": len(open_positions),
-                    "Wins": total_wins,
-                    "Losses": total_losses,
-                    "Long trades": state["total_long"],
-                    "Long wins": state["total_wins_long"],
-                    "Long losses": state["total_long"] - state["total_wins_long"],
-                    "Short trades": state["total_short"],
-                    "Short wins": state["total_wins_short"],
-                    "Short losses": state["total_short"] - state["total_wins_short"],
-                    "Liquidations": state["total_liquids"],
-                    "Realized profit / trade": (
-                        realized_profit / state["count_closed_orders"]
-                        if state["count_closed_orders"] else 0
-                    ),
-                },
-                "Long": self._overview_side_metrics("Long", directional_metrics),
-                "Short": self._overview_side_metrics("Short", directional_metrics),
-                "RSI": {
-                    "RSI trades": rsi_total,
-                    "RSI wins": rsi_wins,
-                    "RSI losses": rsi_losses,
-                    "RSI win rate %": rsi_winrate,
-                    "RSI profit": rsi_profit,
-                    "RSI long trades": state["rsi_long_total"],
-                    "RSI long wins": state["rsi_long_wins"],
-                    "RSI long losses": state["rsi_long_losses"],
-                    "RSI long profit": state["rsi_long_total_profit"],
-                    "RSI short trades": state["rsi_short_total"],
-                    "RSI short wins": state["rsi_short_wins"],
-                    "RSI short losses": state["rsi_short_losses"],
-                    "RSI short profit": state["rsi_short_total_profit"],
-                },
-                "Scale": {
-                    "Scale trades": scale_total,
-                    "Scale wins": scale_wins,
-                    "Scale losses": scale_losses,
-                    "Scale win rate %": scale_winrate,
-                    "Scale profit": scale_profit,
-                    "Scale long trades": scale_long_total,
-                    "Scale long wins": state["scale_ma_long_wins"],
-                    "Scale long losses": state["scale_ma_long_losses"],
-                    "Scale long profit": state["scale_ma_long_total_profit"],
-                    "Scale short trades": scale_short_total,
-                    "Scale short wins": state["scale_ma_short_wins"],
-                    "Scale short losses": state["scale_ma_short_losses"],
-                    "Scale short profit": state["scale_ma_short_total_profit"],
-                },
-            },
-            file_name=output_file,
-            monthly_report=(monthly_summary, monthly_rows),
-        )
-
-        if self.write_trades:
-            write_monthly_summary(in_file=output_file,
-                out_file=os.path.join(self.output_dir, 'monthly', 'monthly_data_orders.csv'), quiet=True)
-
         result = {
             "final_balance_static": state["total_money_static"],
             "final_balance_dynamic": state["total_money_dynamic"],
@@ -2234,6 +2047,8 @@ class TradeEngine:
             **directional_metrics,
         }
         result.update(monthly_summary)
+        result.update({key: value for key, value in state.items()
+                       if '_scale_entry_attempts' in key or key.endswith('_scale_entries')})
         if state.get("research"):
             # These compact series are emitted only for finalists/audits.  They
             # are intentionally omitted from mass discovery results and CSVs.
@@ -2249,10 +2064,11 @@ class TradeEngine:
                     float(value) / 100.0 for value in monthly_profits
                     if value is not None and math.isfinite(float(value))
                 ]
-        if not optimize and 'strategy_parameters' in state:
-            if state.get('chart_payload', {}).get('chart_save_path'):
-                result['chart_file'] = str(state['chart_payload']['chart_save_path'])
-            self.save_run_metadata(result, state['strategy_parameters'])
+        result['monthly_returns'] = list(reporting_returns)
+        result['wins'], result['losses'] = total_wins, total_losses
+        parameters = state.get('strategy_parameters', {})
+        publish_backtest(self, result, parameters, state['first_open_time'], state['last_close_time'],
+                         first_balance, (monthly_summary, monthly_rows))
         if state.get("show_chart", not optimize):
             chart_payload = dict(state["chart_payload"])
             chart_payload.update(
@@ -2265,81 +2081,9 @@ class TradeEngine:
                 max_drawdown=max_drawdown,
                 lst_profit_percent_per_month=monthly_profits,
             )
-            chart_result = render_backtest_chart(**chart_payload)
-            if chart_result is not None:
-                return chart_result
+            self.render_result_chart(result, parameters, chart_payload)
 
         return result
-
-    @staticmethod
-    def _print_backtest_report(**report):
-        state = report["state"]
-        directional = report.get("directional_metrics", {})
-        print("✅ BACKTEST FINISHED")
-        print("Closed Trades:", state["count_closed_orders"], "( Longs:", state["total_long"], "| Shorts:", state["total_short"], ")")
-        print("Count open Trades:", len(state["open_positions"]))
-        print("Total Wins:", state["total_wins"], "| Total Wins Long:", state["total_wins_long"], "| Total Wins Short:", state["total_wins_short"])
-        print("Total Losses:", state["total_losses"])
-        print("Final Balance:", round(report["balance"], 2), "$")
-        print("Final Balance (No Fee):", round(report["balance_without_fee"], 2), "$")
-        print("Final balance if close, open orders:", round(state["total_money_dynamic"], 2), "$")
-        print("Total Fees Paid:", round(state["deducting_fee_total"], 2), "$")
-        print("Maximum Drawdown:", round(state["max_drawdown"], 2), "%")
-        print(f'Total Duration : {report["days"]} days, {report["hours"]} hours, {report["minutes"]} minutes')
-        print("Win Rate:", round(report["win_rate"], 2), "%")
-        print(
-            "Total Profit:",
-            round(report["balance"] - state["first_balance"], 2),
-            "$",
-        )
-        print("Total Profit Percent:", round(report["t_profit_percent"], 2), "%")
-        print("saved Money:", round(state["save_money"], 2), "$")
-        print("Count Liquids:", state["total_liquids"])
-        print("count_profit_months:", report["profit_months_count"])
-        print("count_loss_months:", report["loss_months_count"])
-        print("Total score:", report["score"])
-
-        print("\n================ LONG vs SHORT ======================\n")
-        for side in ("long", "short"):
-            label = side.upper()
-            print(
-                f"{label}: {directional.get(f'{side}_trades', 0)} trades | "
-                f"{directional.get(f'{side}_win_rate', 0):.2f}% win rate | "
-                f"{directional.get(f'{side}_net_profit', 0):.2f} net profit | "
-                f"PF {directional.get(f'{side}_profit_factor', 0):.2f} | "
-                f"expectancy {directional.get(f'{side}_expectancy', 0):.2f} | "
-                f"DD {directional.get(f'{side}_maximum_drawdown', 0):.2f}% | "
-                f"fees {directional.get(f'{side}_total_fees', 0):.2f}"
-            )
-        print(
-            "Stronger side:", directional.get("stronger_side", "BALANCED"),
-            "| Net-profit gap:", round(directional.get("directional_profit_gap", 0), 2),
-        )
-
-        print("\n================ SCALE ENTRY REPORT ================\n")
-        print("===== LONG SCALE ENTRY =====")
-        print("Profit Triggered :", state["long_profit_scale_entry_attempts"])
-        print("Profit Executed  :", state["long_profit_scale_entries"])
-        print("Profit Filtered  :", state["long_filtered_profit_scale_entries"])
-        print("Loss Triggered   :", state["long_loss_scale_entry_attempts"])
-        print("Loss Executed    :", state["long_loss_scale_entries"])
-        print("===== SHORT SCALE ENTRY =====")
-        print("Profit Triggered :", state["short_profit_scale_entry_attempts"])
-        print("Profit Executed  :", state["short_profit_scale_entries"])
-        print("Profit Filtered  :", state["short_filtered_profit_scale_entries"])
-        print("Loss Triggered   :", state["short_loss_scale_entry_attempts"])
-        print("Loss Executed    :", state["short_loss_scale_entries"])
-
-        print("\n================ SCALE PERFORMANCE =================\n")
-        print("LONG:", report["scale_long_total"], "trades |", report["scale_long_winrate"], "% winrate |", round(state["scale_ma_long_total_profit"], 2), "profit")
-        print("SHORT:", report["scale_short_total"], "trades |", report["scale_short_winrate"], "% winrate |", round(state["scale_ma_short_total_profit"], 2), "profit")
-        print("TOTAL:", report["scale_total"], "trades |", report["scale_winrate"], "% winrate |", round(report["scale_profit"], 2), "profit")
-
-        print("\n================ RSI STRATEGY REPORT ================\n")
-        print("LONG:", state["rsi_long_total"], "trades |", state["rsi_long_wins"], "wins |", round(state["rsi_long_total_profit"], 2), "profit")
-        print("SHORT:", state["rsi_short_total"], "trades |", state["rsi_short_wins"], "wins |", round(state["rsi_short_total_profit"], 2), "profit")
-        print("TOTAL:", report["rsi_total"], "trades |", report["rsi_winrate"], "% winrate |", round(report["rsi_profit"], 2), "profit")
-
 
     # check liquidation short
     def _calculate_liquidation_short(
