@@ -1,0 +1,90 @@
+{
+  "breakout_lookback_bars": [
+    30,
+    60,
+    120,
+    240
+  ],
+  "stop_atr_mult": [
+    1.5,
+    2.0,
+    3.0,
+    4.0
+  ],
+  "max_hold_bars": [
+    30,
+    60,
+    120,
+    240,
+    480
+  ],
+  "breakout_buffer_atr": [
+    0.0,
+    0.1,
+    0.25,
+    0.5
+  ],
+  "trend_ma_bars": [
+    0,
+    60,
+    120,
+    240,
+    480
+  ],
+  "min_efficiency_ratio": [
+    0.0,
+    0.15,
+    0.3,
+    0.5
+  ],
+  "min_volume_ratio": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "min_atr_cost_ratio": [
+    0.0,
+    0.5,
+    1.0,
+    2.0,
+    3.0
+  ],
+  "max_signal_range_atr": [
+    0.0,
+    2.0,
+    3.0,
+    4.0
+  ],
+  "max_entry_gap_atr": [
+    0.0,
+    0.25,
+    0.5,
+    1.0
+  ],
+  "trailing_stop_atr_mult": [
+    0.0,
+    1.5,
+    2.0,
+    3.0
+  ],
+  "trailing_activation_r": [
+    1.0,
+    2.0,
+    3.0
+  ],
+  "cooldown_bars": [
+    0,
+    5,
+    15,
+    30
+  ],
+  "enable_long": [
+    true,
+    false
+  ],
+  "enable_short": [
+    true,
+    false
+  ]
+}

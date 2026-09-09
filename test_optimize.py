@@ -846,6 +846,7 @@ class OptimizerSearchTests(unittest.TestCase):
         self.assertEqual(saved["slippage_rate"], 0.0001)
         self.assertEqual(best["params"], {"x": 4})
         self.assertEqual(auto_sheets, [
+            "Quick Compare", "Parameter Compare",
             "Dashboard", "Hall of Fame", "Directional Metrics", "Monthly Analysis",
             "Best Monthly Returns", "Parameter Importance", "Charts",
         ])

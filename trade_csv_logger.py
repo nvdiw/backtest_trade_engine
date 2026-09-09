@@ -220,7 +220,8 @@ class TradeCSVLogger:
         hours,
         minutes,
         overview_metrics=None,
-        file_name: str = os.path.join("outputs", "trades", "data_orders.csv")
+        file_name: str = os.path.join("outputs", "trades", "data_orders.csv"),
+        monthly_report=None,
     ):
         if self.optimize:
             # do not write any files during optimization
@@ -264,12 +265,21 @@ class TradeCSVLogger:
                 output_dir = os.path.dirname(file_name)
                 if output_dir:
                     os.makedirs(output_dir, exist_ok=True)
+                if monthly_report is not None:
+                    monthly_summary, monthly_rows = monthly_report
+                    for key, value in monthly_summary.items():
+                        df[key] = None
+                        df.loc[df['type'] == 'SUMMARY', key] = value
+                    stem = os.path.splitext(file_name)[0]
+                    pd.DataFrame([monthly_summary]).to_csv(stem + '_monthly_summary.csv', index=False)
+                    pd.DataFrame(monthly_rows).to_csv(stem + '_monthly_targets.csv', index=False)
                 df.to_csv(file_name, index=False, encoding="utf-8")
                 summary_file_name = os.path.splitext(file_name)[0] + "_summary.csv"
                 side_summary.to_csv(summary_file_name, index=False, encoding="utf-8")
                 if self.write_excel:
                     self._save_colored_excel(
-                        df, file_name, overview_metrics, side_summary=side_summary
+                        df, file_name, overview_metrics, side_summary=side_summary,
+                        monthly_report=monthly_report,
                     )
                 break
             except PermissionError:
@@ -285,6 +295,7 @@ class TradeCSVLogger:
     def _save_colored_excel(
         self, df: pd.DataFrame, csv_file_name: str, overview_metrics=None,
         side_summary=None,
+        monthly_report=None,
     ):
         """Create a polished multi-sheet workbook alongside the raw CSV."""
         if df.empty:
@@ -442,6 +453,13 @@ class TradeCSVLogger:
             "RSI Strategy": rsi_df,
             "Scale Strategy": scale_df,
         }
+        if monthly_report is not None:
+            monthly_summary, monthly_rows = monthly_report
+            sheets = {
+                'Monthly Summary': pd.DataFrame(list(monthly_summary.items()), columns=['Metric', 'Value']),
+                'Monthly Goals': pd.DataFrame(monthly_rows),
+                **sheets,
+            }
         with pd.ExcelWriter(excel_file_name, engine="openpyxl") as writer:
             for sheet_name, sheet_df in sheets.items():
                 sheet_df.to_excel(writer, sheet_name=sheet_name, index=False)

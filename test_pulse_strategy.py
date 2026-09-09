@@ -170,14 +170,50 @@ class PulseTests(unittest.TestCase):
         rejected = self.run_frame(tune={'min_notional':100000.})
         self.assertFalse(self.events(rejected,'entry'))
         self.assertGreater(rejected['diagnostics']['below_minimum_order'],0)
+
+    def test_leverage_and_margin_cap_change_actual_position(self):
+        for side in ('long', 'short'):
+            quantities = []
+            for leverage in (1., 3.):
+                engine = TradeEngine(first_balance=1000, tactical_balance=1000, optimize=True)
+                account = AccountState(balance=1000)
+                position, stop, rejected = engine.open_risk_position(
+                    0, [100.], ['2025-01-01'], account, side=side, stop_distance=1.,
+                    risk_per_trade=1., max_gross_exposure=10., trade_id='sizing',
+                    leverage=leverage, trade_amount_percent=.1)
+                self.assertIsNone(rejected)
+                self.assertAlmostEqual(position.margin, 100.)
+                self.assertEqual(position.leverage, leverage)
+                quantities.append(position.position_size)
+            self.assertAlmostEqual(quantities[1], 3 * quantities[0])
+
+    def test_leveraged_gap_uses_shared_liquidation_for_both_sides(self):
+        for side in ('long', 'short'):
+            frame = candles()
+            if side == 'short':
+                for col in ('Open', 'High', 'Low', 'Close'):
+                    frame[col] = 200 - frame[col]
+                frame[['High', 'Low']] = frame[['Low', 'High']].to_numpy()
+            frame.loc[23:, ['Open', 'High', 'Low', 'Close']] = 50. if side == 'long' else 200.
+            result = self.run_frame(frame, tune={'leverage':3., 'max_gross_exposure':3.})
+            self.assertEqual(result['liquidations'], 1)
+            self.assertEqual(self.events(result, 'exit')[0]['reason'], 'liquidation_exit')
+
+    def test_reject_stop_beyond_leveraged_liquidation(self):
+        engine = TradeEngine(first_balance=1000, tactical_balance=1000, optimize=True)
+        _, _, rejected = engine.open_risk_position(
+            0, [100.], ['2025-01-01'], AccountState(balance=1000), side='long',
+            stop_distance=40., risk_per_trade=.01, max_gross_exposure=3.,
+            trade_id='invalid', leverage=3.)
+        self.assertEqual(rejected, 'stop_beyond_liquidation')
     def test_shared_and_directional_schema_and_fixed_policies(self):
         adapter=resolve_strategy('pulse')
-        self.assertEqual(len(adapter.discovered_profiles()['focused']),3)
+        self.assertEqual(len(adapter.discovered_profiles()['focused']),6)
         self.assertEqual(optimize.grid_size(pulse.PHASE_A_GRID),392)
         cfg=pulse.build_strategy_config({'breakout_lookback_bars':45,'short_breakout_lookback_bars':60})
         self.assertEqual(pulse.side_value(cfg,'long','breakout_lookback_bars'),45)
         self.assertEqual(pulse.side_value(cfg,'short','breakout_lookback_bars'),60)
-        with self.assertRaises(ValueError): pulse.validate_parameter_grid({'risk_per_trade':[.01,.02]})
+        pulse.validate_parameter_grid({'risk_per_trade':[.01,.02]})
         with self.assertRaises(ValueError): pulse.build_strategy_config({'atr_period':14})
     def test_opposite_breakout_does_not_close_or_reverse(self):
         frame=candles()

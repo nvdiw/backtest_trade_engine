@@ -779,8 +779,25 @@ def ma_strategy(
     # print("len(ma_50):", len(ma_50))
     # print("len adx:", len(adx))
 
+    def record_month_equity(index):
+        marked_equity = balance + save_money
+        for position in open_positions:
+            mark_price = close_prices[index] * (
+                1.0 - slippage_rate if position.side == 'long' else 1.0 + slippage_rate)
+            marked_equity += trade_engine.position_equity(position, mark_price)
+            marked_equity -= (
+                position.entry_price * position.position_size * fee_rate
+                + mark_price * position.position_size * fee_rate
+                + trade_engine._funding_cost(position.entry_price * position.position_size,
+                                            position.open_time_value, close_times[index]))
+        research_month_end_equity[str(open_times[index])[:7]] = marked_equity
+
     # ---- MAIN ----
     for i in range(len(close_prices)):
+        # Sample before scheduling next-open executions; do this before any
+        # cooldown/monthly-stop continue so inactive months are also represented.
+        if i == len(close_prices) - 1 or str(open_times[i])[:7] != str(open_times[i + 1])[:7]:
+            record_month_equity(i)
         if not independent_directions:
             cooldowns['long'] = cooldowns['short'] = cooldown_until_index
         # A signal exists only after candle i closes, so it can be filled no
@@ -2235,30 +2252,7 @@ def ma_strategy(
         if skip_remaining_candle:
             continue
 
-        if research:
-            # Keep a compact, strategy-control-independent month-end equity
-            # series.  Open positions are marked with adverse exit slippage and
-            # accrued execution costs so statistical reports do not depend on
-            # the monthly stop feature being enabled.
-            marked_equity = balance + save_money
-            for position in open_positions:
-                mark_price = close_prices[i] * (
-                    1.0 - slippage_rate
-                    if position.side == "long"
-                    else 1.0 + slippage_rate
-                )
-                marked_equity += trade_engine.position_equity(position, mark_price)
-                marked_equity -= (
-                    position.entry_price * position.position_size * fee_rate
-                    + mark_price * position.position_size * fee_rate
-                    + trade_engine._funding_cost(
-                        position.entry_price * position.position_size,
-                        position.open_time_value,
-                        close_times[i],
-                    )
-                )
-            research_month_end_equity[str(open_times[i])[:7]] = marked_equity
-
+    record_month_equity(len(close_prices) - 1)
     research_monthly_returns = []
     previous_research_equity = first_balance
     for month_end_equity in research_month_end_equity.values():
@@ -2306,7 +2300,10 @@ def ma_strategy(
         short_liquidations=short_liquidations,
         lst_profit_percent_per_month=lst_profit_percent_per_month,
         monthly_stop_reasons=monthly_stop_reasons,
+        monthly_profit_stop_months=(sum(reason == 'profit' for reason in monthly_stop_reasons)
+                                    + int(pending_monthly_stop_reason == 'profit')),
         research_monthly_returns=research_monthly_returns,
+        reporting_month_labels=list(research_month_end_equity),
         long_profit_scale_entry_attempts=long_profit_scale_entry_attempts,
         long_loss_scale_entry_attempts=long_loss_scale_entry_attempts,
         long_filtered_profit_scale_entries=long_filtered_profit_scale_entries,

@@ -23,41 +23,96 @@ class PulseConfig:
     short_stop_atr_mult: float | None = None
     long_max_hold_bars: int | None = None
     short_max_hold_bars: int | None = None
+    breakout_buffer_atr: float = 0.0
+    trend_ma_bars: int = 0
+    min_efficiency_ratio: float = 0.0
+    min_volume_ratio: float = 0.0
+    min_atr_cost_ratio: float = 0.0
+    max_signal_range_atr: float = 0.0
+    trailing_stop_atr_mult: float = 0.0
+    trailing_activation_r: float = 1.0
+    cooldown_bars: int = 0
+    max_entry_gap_atr: float = 0.0
+    long_breakout_buffer_atr: float | None = None
+    long_trend_ma_bars: int | None = None
+    long_min_efficiency_ratio: float | None = None
+    long_min_volume_ratio: float | None = None
+    long_min_atr_cost_ratio: float | None = None
+    long_max_signal_range_atr: float | None = None
+    long_trailing_stop_atr_mult: float | None = None
+    long_trailing_activation_r: float | None = None
+    long_cooldown_bars: int | None = None
+    long_max_entry_gap_atr: float | None = None
+    short_breakout_buffer_atr: float | None = None
+    short_trend_ma_bars: int | None = None
+    short_min_efficiency_ratio: float | None = None
+    short_min_volume_ratio: float | None = None
+    short_min_atr_cost_ratio: float | None = None
+    short_max_signal_range_atr: float | None = None
+    short_trailing_stop_atr_mult: float | None = None
+    short_trailing_activation_r: float | None = None
+    short_cooldown_bars: int | None = None
+    short_max_entry_gap_atr: float | None = None
     atr_period: int = 20
     enable_long: bool = True
     enable_short: bool = True
     balance: float = 1000.0
     risk_per_trade: float = .0025
     max_gross_exposure: float = 1.0
+    leverage: float = 1.0
+    trade_amount_percent: float = 1.0
+    maintenance_margin_rate: float = 0.005
+    liquidation_fee_rate: float = 0.002
     quantity_step: float = 0.0
     min_quantity: float = 0.0
     min_notional: float = 0.0
     fee_rate: float = .0005
     slippage_rate: float = .0001
     funding_rate_per_8h: float = 0.0
+    monthly_profit_target_percent: float = 8.0
     optimize: bool = False
 
 SIGNAL_KEYS = ('breakout_lookback_bars', 'stop_atr_mult', 'max_hold_bars')
+ENHANCEMENT_KEYS = ('breakout_buffer_atr', 'trend_ma_bars', 'min_efficiency_ratio', 'min_volume_ratio', 'min_atr_cost_ratio', 'max_signal_range_atr', 'trailing_stop_atr_mult', 'trailing_activation_r', 'cooldown_bars', 'max_entry_gap_atr')
+# Search only trading decisions. Capital, costs and exchange constraints live above.
 FULL_PARAM_GRID = {
     'breakout_lookback_bars': [15, 20, 30, 45, 60, 90, 120],
     'stop_atr_mult': [1.25, 1.5, 1.75, 2., 2.25, 2.5, 3.],
     'max_hold_bars': [10, 15, 20, 30, 45, 60, 90, 120],
+    'breakout_buffer_atr': [0.0, 0.1, 0.25, 0.5],
+    'trend_ma_bars': [0, 50, 100, 200],
+    'min_efficiency_ratio': [0.0, 0.2, 0.35, 0.5],
+    'min_volume_ratio': [0.0, 1.0, 1.5, 2.0],
+    'min_atr_cost_ratio': [0.0, 1.0, 2.0, 3.0],
+    'max_signal_range_atr': [0.0, 2.0, 3.0, 4.0],
+    'trailing_stop_atr_mult': [0.0, 1.5, 2.0, 3.0],
+    'trailing_activation_r': [1.0, 2.0, 3.0],
+    'cooldown_bars': [0, 5, 15, 30],
+    'max_entry_gap_atr': [0.0, 0.25, 0.5, 1.0],
+    'risk_per_trade': [0.001, 0.0025, 0.005],
+    'max_gross_exposure': [1.0, 2.0, 3.0, 5.0],
+    'leverage': [1.0, 2.0, 3.0, 5.0, 8.0, 10.0],
+    'trade_amount_percent': [0.25, 0.5, 0.75, 1.0],
 }
+SIZING_KEYS = ('risk_per_trade', 'max_gross_exposure', 'leverage', 'trade_amount_percent')
 # Same file-based focused workflow as MA; independent from the full grid.
 FOCUSED_PARAM_GRID = json.loads(
     (Path(__file__).parent / 'param_grids' / 'pulse_focused.json').read_text(encoding='utf-8')
 )
-PHASE_A_GRID = FULL_PARAM_GRID  # Compatibility name for the Phase A research grid.
+PHASE_A_GRID = {key: list(FULL_PARAM_GRID[key]) for key in SIGNAL_KEYS}
 PARAMETER_PROFILES = {
     'focused': FOCUSED_PARAM_GRID,
     'full': FULL_PARAM_GRID,
-    'signal': FULL_PARAM_GRID,
+    'signal': PHASE_A_GRID,
+    'filters': {k: FULL_PARAM_GRID[k] for k in (*ENHANCEMENT_KEYS[:6], 'max_entry_gap_atr')},
+    'exits': {k: FULL_PARAM_GRID[k] for k in ('max_hold_bars', *ENHANCEMENT_KEYS[6:9])},
+    'sizing': {k: FULL_PARAM_GRID[k] for k in SIZING_KEYS},
     'directional': {f'{side}_{key}': list(values)
                     for side in ('long', 'short')
-                    for key, values in FULL_PARAM_GRID.items()},
+                    for key, values in FULL_PARAM_GRID.items() if key in (*SIGNAL_KEYS, *ENHANCEMENT_KEYS)},
 }
 param_grid = FULL_PARAM_GRID
-STAGED_PHASES = (('signal','signal'),)
+STAGED_PHASES = (('signal','signal'), ('filters','filters'), ('exits','exits'), ('sizing','sizing'))
 EXECUTION_SCENARIOS = {'base': {}, 'adverse': {'fee_rate': .0007, 'slippage_rate': .0002},
                        'severe': {'fee_rate': .001, 'slippage_rate': .0005}}
 
@@ -86,13 +141,26 @@ def build_strategy_config(tune=None):
                 raise ValueError(f'{key} must be finite and use the declared type')
             values[key] = int(number) if isinstance(default,int) else number
     cfg = PulseConfig(**values)
+    if cfg.monthly_profit_target_percent < 0:
+        raise ValueError('monthly_profit_target_percent must be nonnegative')
     if cfg.atr_period != 20:
         raise ValueError('Pulse fixes atr_period=20')
     for side in ('long','short'):
         if any(side_value(cfg,side,key) <= 0 for key in SIGNAL_KEYS):
             raise ValueError('Lookback, hold bars and ATR multiplier must be positive')
-    if cfg.balance <= 0 or not 0 < cfg.risk_per_trade <= 1 or not 0 < cfg.max_gross_exposure <= 1:
-        raise ValueError('Positive balance, risk in (0,1] and unlevered exposure in (0,1] required')
+    for side in ('long', 'short'):
+        if any(side_value(cfg, side, key) < 0 for key in ENHANCEMENT_KEYS):
+            raise ValueError('Pulse filters, trailing settings and cooldown must be nonnegative')
+        if side_value(cfg, side, 'min_efficiency_ratio') > 1:
+            raise ValueError('min_efficiency_ratio must be in [0,1]')
+        if side_value(cfg, side, 'trend_ma_bars') == 1:
+            raise ValueError('trend_ma_bars must be zero (disabled) or at least 2')
+    if cfg.balance <= 0 or not 0 < cfg.risk_per_trade <= 1 or cfg.max_gross_exposure <= 0:
+        raise ValueError('Positive balance/exposure and risk in (0,1] required')
+    if cfg.leverage < 1 or not 0 < cfg.trade_amount_percent <= 1:
+        raise ValueError('Leverage >= 1 and trade_amount_percent in (0,1] required')
+    if not 0 <= cfg.maintenance_margin_rate < 1 / cfg.leverage or not 0 <= cfg.liquidation_fee_rate < 1:
+        raise ValueError('Invalid maintenance margin or liquidation fee')
     if not (cfg.enable_long or cfg.enable_short):
         raise ValueError('Enable at least one side')
     if min(cfg.quantity_step,cfg.min_quantity,cfg.min_notional,cfg.fee_rate,cfg.slippage_rate,cfg.funding_rate_per_8h) < 0 or max(cfg.fee_rate,cfg.slippage_rate) >= 1:
@@ -111,10 +179,13 @@ def is_valid_candidate(params):
         return False
 
 def validate_parameter_grid(grid):
-    allowed = set(SIGNAL_KEYS) | {f'{side}_{key}' for side in ('long','short') for key in SIGNAL_KEYS}
-    if set(grid) - allowed:
-        raise ValueError('Pulse grids tune signal parameters only; risk and execution costs are fixed policies')
+    allowed = {'enable_long', 'enable_short'} | set(SIGNAL_KEYS) | set(ENHANCEMENT_KEYS) | set(SIZING_KEYS) | {f'{side}_{key}' for side in ('long','short') for key in (*SIGNAL_KEYS, *ENHANCEMENT_KEYS)}
+    defaults = asdict(PulseConfig())
+    if set(grid) - set(defaults):
+        raise ValueError('Unknown Pulse grid parameters: ' + ', '.join(sorted(set(grid) - set(defaults))))
     for key,values in grid.items():
+        if key not in allowed:
+            raise ValueError('Pulse grids tune signal and sizing parameters only; capital and execution costs are fixed policies')
         if not values or any(not is_valid_candidate({key:value}) for value in values):
             raise ValueError(f'Invalid Pulse grid: {key}')
 

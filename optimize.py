@@ -8,6 +8,9 @@ Examples:
 """
 
 from excel_charts import add_report_chart
+from optimize_overview import OVERVIEW_COLUMNS, comparison_rows, write_overview, print_leaders
+from optimizer_evidence import apply_profit_learning, chronological_probe_indices
+from monthly_reporting import MONTHLY_COLUMNS
 
 import argparse
 import calendar
@@ -105,6 +108,7 @@ def _strategy_staged_phases(args):
     return tuple(phases)
 
 RESULT_COLUMNS = [
+    *MONTHLY_COLUMNS,
     "final_balance_static", "final_balance_dynamic", "final_balance",
     "final_balance_without_fee",
     "total_profit", "realized_profit", "unrealized_profit", "open_positions",
@@ -141,6 +145,7 @@ RESULT_COLUMNS = [
 ]
 
 IMPORTANT_RESULT_COLUMNS = [
+    *MONTHLY_COLUMNS,
     "total_profit_percent", "total_profit", "maximum_drawdown",
     "closed_trades", "win_rate", "profit_factor", "expectancy_percent",
     "calmar_ratio", "liquidations", "final_balance", "total_fees",
@@ -2272,6 +2277,8 @@ def _read_resume_records(path, grid, base_tune):
 
 
 def _load_base_tune(args):
+    if getattr(args, '_resume_base_tune', None) is not None:
+        return dict(args._resume_base_tune), 'frozen campaign baseline'
     source = getattr(args, "base_source", "config")
     if source == "config":
         adapter = _adapter_from_args(args)
@@ -2472,6 +2479,7 @@ def _auto_configuration(args, profile, grid, base_tune, base_description, resolv
 def _auto_feature_configuration(args):
     """Settings for the version-2 search engine, stored outside legacy config."""
     return {
+        "learning_target": getattr(args, 'auto_learning_target', 'rank'),
         "advanced_min_candidates": int(args.auto_advanced_min_candidates),
         "halving_rungs": int(args.auto_halving_rungs),
         "halving_keep": float(args.auto_halving_keep),
@@ -2545,6 +2553,7 @@ def _restore_auto_resume_args(args, state):
 
     features = state.get("optimizer_features") or {}
     feature_mapping = {
+        "learning_target": "auto_learning_target",
         "advanced_min_candidates": "auto_advanced_min_candidates",
         "halving_rungs": "auto_halving_rungs",
         "halving_keep": "auto_halving_keep",
@@ -2558,6 +2567,7 @@ def _restore_auto_resume_args(args, state):
     for saved_key, argument_name in feature_mapping.items():
         if saved_key in features:
             setattr(args, argument_name, features[saved_key])
+    args.auto_learning_target = features.get('learning_target', 'rank')
     # Version-2 checkpoints predate the configurable history cap. Preserve the
     # exact 1,024-sample behavior they were trained with instead of silently
     # changing their tree model during resume.
@@ -2614,6 +2624,8 @@ def _load_discovery_history(output_dir, keys):
     output_dir = Path(output_dir)
     cache_path = output_dir / "surrogate_history_cache.json.gz"
     cycles_dir = Path(output_dir) / "cycles"
+    saved_state = _load_json(output_dir / 'auto_state.json', {})
+    evidence_enabled = (saved_state.get('optimizer_features') or {}).get('learning_target') == 'profit-evidence'
     plan_paths = sorted(cycles_dir.glob("cycle_*/discovery_candidates.json"))
     cached_history, cached_cycle = _read_surrogate_history_cache(cache_path, keys)
     if cached_history is None:
@@ -2643,6 +2655,21 @@ def _load_discovery_history(output_dir, keys):
         candidates = _read_candidate_plan(plan_path)
         cycle_records = _read_auto_stage_records(results_path, candidates)
         _annotate_discovery_learning_scores(cycle_records)
+        if evidence_enabled:
+            stages = {'discovery': cycle_records}
+            for stage in AUTO_STAGE_ORDER:
+                if stage in ('discovery', 'walk_forward'):
+                    continue
+                stage_plan = plan_path.with_name(f'{stage}_candidates.json')
+                if stage_plan.is_file():
+                    stages[stage] = _read_auto_stage_records(
+                        _resolve_csv_path(plan_path.with_name(f'{stage}_results.csv')),
+                        _read_candidate_plan(stage_plan))
+            walk = _load_json(plan_path.with_name('walk_forward_summary.json'), {})
+            if walk.get('records'):
+                stages['walk_forward'] = walk['records']
+            _apply_funnel_learning_scores(cycle_records, stages)
+            apply_profit_learning(cycle_records, stages, AUTO_STAGE_WEIGHTS)
         for record in cycle_records:
             score = _surrogate_target(record)
             if score is not None and all(key in record["params"] for key in keys):
@@ -2903,6 +2930,13 @@ def _select_surrogate_candidates(
     random.Random(seed + 104729).shuffle(probe_indices)
     validation_count = max(1, min(len(probe_indices)-3, max(8, len(probe_indices) // 5)))
     validation_indices, fit_indices = probe_indices[:validation_count], probe_indices[validation_count:]
+    probe_scope = 'held-back search configurations, never reporting OOS'
+    if features.get('learning_target') == 'profit-evidence':
+        chronological = chronological_probe_indices(training_history)
+        if chronological:
+            validation_indices, fit_indices = chronological
+            validation_count = len(validation_indices)
+            probe_scope = 'latest complete search cycles, never market OOS or holdout'
     probe = ExtraTreesSurrogate(n_trees=min(16, features['surrogate_trees']),
                                 max_depth=8, min_leaf=3, seed=seed + 17).fit(
         [training_features[i] for i in fit_indices], [targets[i] for i in fit_indices])
@@ -3004,10 +3038,11 @@ def _select_surrogate_candidates(
         "model": "dependency_free_extra_trees",
         "validation_rank_correlation": rank_correlation,
         "validation_samples": validation_count,
-        "validation_scope": "held-back search configurations, never reporting OOS",
+        "validation_scope": probe_scope,
         "history_samples": len(usable_history),
         "training_samples": len(training_history),
-        "training_target": "normalized_and_robust_funnel_rank",
+        "training_target": ("profit_evidence_v1" if features.get('learning_target') == 'profit-evidence'
+                            else "normalized_and_robust_funnel_rank"),
         "training_sample_method": "deterministic_learning_quantiles",
         "candidate_pool": len(candidates),
         "selected_candidates": len(selected),
@@ -4045,6 +4080,7 @@ def _flatten_hall_record(record, keys, rank, state=None):
     for metric in metric_names:
         row[f"final_{metric}"] = final_metrics.get(metric)
     row.update(_monthly_performance_summary(final_metrics.get("monthly_returns")))
+    row.update({key: final_metrics.get(key) for key in MONTHLY_COLUMNS})
     if state is not None:
         row.update(_range_reporting_summary(state))
     for stage in AUTO_STAGE_ORDER:
@@ -4176,6 +4212,13 @@ def _save_auto_workbook(
         f".{output_path.stem}.building{output_path.suffix}"
     )
     with pd.ExcelWriter(staging_path, engine="openpyxl") as writer:
+        pd.DataFrame([
+            {key: row.get(key) for key in (*OVERVIEW_COLUMNS, *MONTHLY_COLUMNS)} for row in hall_rows[:5]
+        ]).to_excel(writer, sheet_name="Quick Compare", index=False)
+        comparison_keys = list((state.get('config') or {}).get('parameter_grid') or {})
+        if comparison_keys:
+            pd.DataFrame(comparison_rows(hall_rows, comparison_keys)).to_excel(
+                writer, sheet_name="Parameter Compare", index=False)
         pd.DataFrame(dashboard_rows).to_excel(writer, sheet_name="Dashboard", index=False)
         pd.DataFrame(hall_rows).to_excel(writer, sheet_name="Hall of Fame", index=False)
         pd.DataFrame(directional_rows).to_excel(
@@ -4527,6 +4570,7 @@ def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled
         hall_rows.append(row)
         candidate_catalog.append(summary)
     _write_json(output_dir / "candidate_catalog.json", candidate_catalog)
+    write_overview(output_dir, hall_rows, keys, state)
     if candidate_catalog:
         _write_json(output_dir / "best_candidate_summary.json", candidate_catalog[0])
     importance_rows = [
@@ -4760,6 +4804,8 @@ def run_auto_optimization(args, grid=None):
         base_description = saved_config.get("base_source", "saved checkpoint")
     else:
         base_tune, base_description = _load_base_tune(args)
+        if getattr(args, 'auto_learning_target', 'rank') == 'profit-evidence':
+            base_tune = _freeze_strategy_tune(_adapter_from_args(args), base_tune)
     resolved_end = _latest_market_end() if args.auto_end == "latest" else args.auto_end
     config = _auto_configuration(
         args, profile, grid, base_tune, base_description, resolved_end
@@ -4798,6 +4844,8 @@ def run_auto_optimization(args, grid=None):
                 "profile, ranges, test counts, base parameters, and constraints"
             )
         saved_features = state.get("optimizer_features")
+        if saved_features is not None:
+            saved_features.setdefault('learning_target', 'rank')
         if saved_features is not None and "surrogate_max_samples" not in saved_features:
             saved_features["surrogate_max_samples"] = optimizer_features[
                 "surrogate_max_samples"
@@ -4927,6 +4975,7 @@ def run_auto_optimization(args, grid=None):
             f"{args.auto_final_top} | profile: {profile}"
         )
     print(f"Latest market end: {resolved_end}")
+    print(f"Learning target: {optimizer_features.get('learning_target', 'rank')}")
     print(
         "Search intelligence: normalized funnel learning | "
         "quality + uncertainty + diversity selection | directed mutation"
@@ -5227,6 +5276,8 @@ def run_auto_optimization(args, grid=None):
                 )
                 return hall[0] if hall else None
             _annotate_discovery_learning_scores(discovery_records)
+            if optimizer_features.get('learning_target') == 'profit-evidence':
+                apply_profit_learning(discovery_records, {'discovery': discovery_records}, AUTO_STAGE_WEIGHTS)
             if advanced and history_cache is None:
                 history_cache = _load_discovery_history(output_dir, keys)
             if history_cache is not None:
@@ -5371,6 +5422,8 @@ def run_auto_optimization(args, grid=None):
             finalists = _combine_auto_stage_records(stage_results)
             if history_cache is not None:
                 _apply_funnel_learning_scores(history_cache, stage_results)
+                if optimizer_features.get('learning_target') == 'profit-evidence':
+                    apply_profit_learning(history_cache, stage_results, AUTO_STAGE_WEIGHTS)
                 history_cache = _write_surrogate_history_cache(
                     output_dir / "surrogate_history_cache.json.gz",
                     history_cache,
@@ -5406,6 +5459,11 @@ def run_auto_optimization(args, grid=None):
                 excel_enabled=bool(args.excel_top),
             )
             completed_cycles = int(state["cycles_completed"])
+            print_leaders([
+                _flatten_hall_record(record, keys, rank)
+                for rank, record in enumerate(
+                    sorted(hall, key=_auto_candidate_rank_key, reverse=True)[:3], 1)
+            ], output_dir)
             snapshot_every = max(1, int(getattr(args, "snapshot_cycles", 50)))
             if completed_cycles % snapshot_every == 0:
                 snapshot_dir = _write_auto_cycle_snapshot(
@@ -5432,7 +5490,11 @@ def run_auto_optimization(args, grid=None):
             )
             print(
                 "Most influential parameters: "
-                + ", ".join(f"{key} ({item['weight']:.1%})" for key, item in important)
+                + ", ".join(
+                    f"{key}={hall[0].get('effective_params', {}).get(key)!r} "
+                    f"(influence {item['weight']:.1%})" if hall
+                    else f"{key} ({item['weight']:.1%})"
+                    for key, item in important)
             )
             directed = sorted(
                 (
@@ -5620,10 +5682,11 @@ def _write_staged_ranking(output_dir, records, top_n, *, snapshot_dir=None,
         output_dir / "best_candidate_summary.json",
         _candidate_summary(ranked[0], 1, Path("best_params.json")),
     )
+    parameter_keys = tuple(dict.fromkeys(key for record in ranked for key in record['effective_params']))
+    workbook_rows = [_flatten_hall_record(record, parameter_keys, rank, state=state)
+                     for rank, record in enumerate(ranked, 1)]
+    write_overview(output_dir, workbook_rows, parameter_keys, state or {})
     if excel_enabled:
-        parameter_keys = tuple(dict.fromkeys(key for record in ranked for key in record['effective_params']))
-        workbook_rows = [_flatten_hall_record(record, parameter_keys, rank, state=state)
-                         for rank, record in enumerate(ranked, 1)]
         _save_auto_workbook(output_dir, workbook_rows, [], state=state)
         if snapshot_dir is not None:
             Path(snapshot_dir).mkdir(parents=True, exist_ok=True)
@@ -8253,8 +8316,8 @@ Tips:
     output = parser.add_argument_group("output, checkpoints, and planning")
     output.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, metavar="PATH",
                         help="directory for reports; CLI default: outputs/<strategy>/optimize (research/holdout for those modes)")
-    output.add_argument("--resume", action="store_true",
-                        help="require a compatible checkpoint; auto detects one without this flag")
+    output.add_argument("--resume", nargs="?", const=True, default=False, metavar="FOLDER",
+                        help="resume with saved settings; optionally give a campaign path or unique folder name")
     output.add_argument("--log-every", type=int, default=10, metavar="N",
                         help="print progress every N completed tests (0 is silent)")
     output.add_argument("--top-n", type=int, default=20, metavar="N",
@@ -8493,6 +8556,10 @@ Tips:
         help="representative historical samples retained for tree training",
     )
     auto.add_argument(
+        '--auto-learning-target', choices=('rank', 'profit-evidence'), default='rank',
+        help='profit-evidence learns net return, monthly downside and failed candidates; persists across resume',
+    )
+    auto.add_argument(
         "--auto-walk-forward-folds", type=int, default=3, metavar="N",
         help="disjoint pre-Discovery time folds (0 disables; minimum enabled value is 2)",
     )
@@ -8560,7 +8627,14 @@ Tips:
 @runtime_session
 @output_session
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    from optimize_resume import restore_campaign
+    parser = build_parser()
+    arguments = sys.argv[1:] if argv is None else list(argv)
+    args = parser.parse_args(arguments)
+    try:
+        arguments = restore_campaign(parser, args, arguments)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
     try:
         configure_runtime(args, argv)
     except (ValueError, OSError) as error:
@@ -8577,7 +8651,12 @@ def main(argv=None):
             args.snapshot_cycles = args.stage_cycles * (2 * len(STAGED_AUTO_PHASES) + 1)
     try:
         args._strategy_adapter = _adapter_from_spec(args.strategy)
-        args._parameter_profiles = _profiles_from_args(args)
+        if getattr(args, '_resume_grid', None):
+            args._parameter_profiles = {args.profile: args._resume_grid}
+        else:
+            args._parameter_profiles = _profiles_from_args(args)
+        if getattr(args, '_resume_state', None):
+            _restore_auto_resume_args(args, args._resume_state)
     except (FileNotFoundError, ModuleNotFoundError, ValueError) as error:
         raise SystemExit(str(error)) from error
     default_profile = "full" if args.auto else "focused"
@@ -8589,7 +8668,6 @@ def main(argv=None):
             f"unknown profile {args.profile!r}; available profiles: "
             + ", ".join(args._parameter_profiles)
         )
-    arguments = sys.argv[1:] if argv is None else list(argv)
     explicit = lambda flag: any(a == flag or a.startswith(flag + '=') for a in arguments)
     _apply_strategy_date_defaults(args, args._strategy_adapter.module, arguments)
     workflow = 'research' if args.research else 'holdout' if args.sealed_holdout else 'optimize'
@@ -8989,6 +9067,13 @@ def main(argv=None):
     }
     resolved_cli_config["resolved_strategy"] = args._strategy_adapter.identifier
     resolved_cli_config["resolved_parameter_profiles"] = args._parameter_profiles
+    campaign_config_path = Path(args.output_dir) / 'campaign_config.json'
+    if not campaign_config_path.exists():
+        if not args.auto and not args.research and not args.sealed_holdout:
+            baseline, _ = _load_base_tune(args)
+            resolved_cli_config['frozen_base_tune'] = _freeze_strategy_tune(
+                args._strategy_adapter, baseline)
+        _write_json(campaign_config_path, resolved_cli_config)
     if args.sealed_holdout:
         _run_research_preflight(args, args.output_dir, resolved_cli_config)
         run_sealed_holdout(args)

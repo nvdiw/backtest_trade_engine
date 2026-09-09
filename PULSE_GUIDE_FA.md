@@ -1,6 +1,6 @@
 # Pulse — Rolling Range Breakout 1m
 
-تنظیمات و validatorها در `pulse_strategy_config.py` هستند. `FULL_PARAM_GRID` شبکهٔ کامل را تعریف می‌کند؛ `FOCUSED_PARAM_GRID` از `param_grids/pulse_focused.json` خوانده می‌شود. مقدارهای اولیهٔ این دو برابرند، اما مستقل و قابل ویرایش‌اند. `pulse_strategy.py` منطق معامله و warmup را نگه می‌دارد و تنظیمات را برای رابط مشترک strategy adapter وارد می‌کند. راهنمای بازه‌ها و دستور اجرا: [Optimize خودکار Pulse](PULSE_OPTIMIZE_FA.md).
+تنظیمات و validatorها در `pulse_strategy_config.py` هستند. `FULL_PARAM_GRID` سه پارامتر سیگنال و چهار پارامتر ریسک، exposure، اهرم و سهم مارجین را جست‌وجو می‌کند. سرمایه و هزینه‌ها فقط در config هستند. مقدار `None` در overrideهای جهت یعنی ارث‌بری از پارامتر مشترک. `FOCUSED_PARAM_GRID` از `param_grids/pulse_focused.json` خوانده می‌شود و شش پارامتر مستقل Long و Short را برای مرحلهٔ بعد جست‌وجو می‌کند. `pulse_strategy.py` منطق معامله و warmup را نگه می‌دارد. راهنمای بازه‌ها و دستور اجرا: [Optimize خودکار Pulse](PULSE_OPTIMIZE_FA.md).
 
 Pulse یک فرضیه پژوهشی برای شکست محدوده است؛ پیاده‌سازی و عبور از تست‌ها به معنی سودآوری نیست. استراتژی اصلی MA جایگزین نشده است.
 
@@ -72,7 +72,11 @@ optimize در `outputs/pulse/optimize/` و ارزیابی ثابت در `outputs
 | `enable_long` / `enable_short` | true / true | فعال‌بودن سمت‌ها |
 | `balance` | 1000.0 | سرمایه شروع |
 | `risk_per_trade` | 0.0025 | ریسک اسمی فاصله استاپ، بدون هزینه و گپ |
-| `max_gross_exposure` | 1.0 | سقف ارزش ناخالص نسبت به equity؛ حداکثر 1 |
+| `max_gross_exposure` | 1.0 | سقف ارزش ناخالص نسبت به equity |
+| `leverage` | 1.0 | اهرم موقعیت؛ حداقل 1 |
+| `trade_amount_percent` | 1.0 | سقف سهم equity برای مارجین؛ 0.25 یعنی 25٪ |
+| `maintenance_margin_rate` | 0.005 | فرض ثابت مارجین نگهداری موتور |
+| `liquidation_fee_rate` | 0.002 | فرض ثابت هزینهٔ liquidation موتور |
 | `quantity_step` | 0.0 | صفر: گردکردن غیرفعال؛ مقدار مثبت: گردکردن رو به پایین |
 | `min_quantity` | 0.0 | حداقل مقدار سفارش |
 | `min_notional` | 0.0 | حداقل ارزش سفارش |
@@ -91,9 +95,9 @@ optimize در `outputs/pulse/optimize/` و ارزیابی ثابت در `outputs
 | `stop_atr_mult` | 1.25, 1.50, 1.75, 2.00, 2.25, 2.50, 3.00 |
 | `max_hold_bars` | 10, 15, 20, 30, 45, 60, 90, 120 |
 
-پروفایل‌های `focused`، `full` و `signal` همین سه بعد مشترک را دارند. پروفایل `directional` شش override مستقل Phase B را جست‌وجو می‌کند و پیش‌فرض نیست. برای Phase A از config اولیه و overrideهای null شروع کنید؛ فایل برنده Phase B را به‌عنوان مبنای آزمایش مشترک استفاده نکنید. در Pulse تغییر پیوسته grid توسط Auto غیرفعال است؛ پس Auto پس از تمام‌شدن کاندیداهای تازه ممکن است زودتر از سقف سیکل متوقف شود. تکرار بی‌دلیل ۱۰۰ سیکل، ۳۹۲ ترکیب را به آزمایش مستقل بیشتری تبدیل نمی‌کند.
+پروفایل `signal` همین سه بعد مشترک را دارد. `full` چهار بعد اندازه و ریسک را نیز اضافه می‌کند و 42,336 ترکیب اسمی دارد. `focused` و `directional` شش override مستقل Phase B را جست‌وجو می‌کنند. برای Phase A از config اولیه و overrideهای null شروع کنید؛ فایل برنده Phase B را به‌عنوان مبنای آزمایش مشترک استفاده نکنید. در Pulse تغییر پیوسته grid توسط Auto غیرفعال است؛ پس Auto پس از تمام‌شدن کاندیداهای تازه ممکن است زودتر از سقف سیکل متوقف شود.
 
-ریسک، ATR period و هزینه‌ها در grid قابل optimize نیستند. سناریوهای هزینه فقط برای stress استفاده می‌شوند. نرخ‌های پیش‌فرض ادعای نرخ واقعی هیچ صرافی نیستند.
+ریسک و اندازه در Full قابل جست‌وجو هستند. ATR period، سرمایه و هزینه‌ها در grid قابل optimize نیستند. سناریوهای هزینه فقط برای stress استفاده می‌شوند. نرخ‌های پیش‌فرض ادعای نرخ واقعی هیچ صرافی نیستند.
 
 ## فرمان‌های واقعی پروژه
 
@@ -129,7 +133,7 @@ python optimize.py --strategy pulse --mode smart --profile focused --tests 8 --d
 آزمایش کامل Phase A: جست‌وجوی ۳۹۲ ترکیب در سال ۲۰۲۵، انتخاب ثانویه در ژانویه تا مارس ۲۰۲۶. آوریل تا ژوئیه ۲۰۲۶ در این فرمان مصرف نمی‌شود. validation همچنان بخشی از انتخاب است، نه اثبات خارج از نمونه. آستانه‌های پایین پیشنهاد یک آزمایش قابل‌تکرار هستند و معیار سودآوری قطعی نیستند:
 
 ```powershell
-python optimize.py --strategy pulse --mode grid --profile focused --base-source config --date-policy fixed --start 2025-01-01 --end 2026-01-01 --validation-start 2026-01-01 --validation-end 2026-04-01 --validation-top 20 --min-trades 100 --max-drawdown 25 --performance normal --output-dir outputs/pulse/optimize/phase_a_392
+python optimize.py --strategy pulse --mode grid --profile signal --base-source config --date-policy fixed --start 2025-01-01 --end 2026-01-01 --validation-start 2026-01-01 --validation-end 2026-04-01 --validation-top 20 --min-trades 100 --max-drawdown 25 --performance normal --output-dir outputs/pulse/optimize/phase_a_392
 ```
 
 این فرمان با `--dry-run` بررسی شد و ۳۹۲ کاندیدا اعلام کرد؛ آزمایش کامل و holdout در این مرحله اجرا نشده‌اند. برای ادامه همان اجرای قابل‌ادامه، `--resume` را به همان فرمان اضافه کنید. از `--autopilot` یا `--directional` عمومی MA برای Pulse استفاده نکنید؛ انتخاب Phase B با `--profile directional` است.
@@ -148,5 +152,5 @@ python optimize.py --strategy pulse --mode grid --profile focused --base-source 
 - هزینه ورود و خروج طبق دفتر موجود موتور هنگام بسته‌شدن تسویه می‌شود. برای موقعیت باز، Pulse هزینه ورود و funding تخمینی انباشته را در equity و گزارش نهایی لحاظ می‌کند. خروج پایان بازه ساخته نمی‌شود؛ سود باز، باز باقی می‌ماند و کارمزد خروج انجام‌نشده اخذ نمی‌شود.
 - funding موتور یک نرخ ثابت هزینه‌ای و تابع مدت نگهداری است؛ جریان تاریخی نرخ‌های مثبت/منفی یا تسویه واقعی صرافی نیست. با پیش‌فرض صفر، funding حذف شده و این موضوع در `funding_model` ثبت می‌شود؛ نتیجه برای perpetual با هزینه کامل تأییدشده نیست.
 - spread، تأخیر، عمق، partial fill، tick size قیمت و برنامه تاریخی funding از OHLCV قابل بازسازی نیستند. لغزش ثابت فقط فرض اجرایی است. quantity step و minimumها قابل تنظیم‌اند اما از صرافی دریافت نمی‌شوند.
-- Pulse با exposure حداکثر 1 و بدون اهرم پژوهش می‌شود. شبیه‌سازی نوع قرارداد و قوانین liquidation یک صرافی مشخص انجام نشده است. استاپ و ریسک اسمی، زیان گپ را محدود نمی‌کنند.
+- پیش‌فرض Pulse همچنان اهرم و exposure برابر 1 دارد؛ Full اندازه و اهرم را نیز جست‌وجو می‌کند. liquidation از کد مشترک موتور استفاده می‌کند؛ نوع قرارداد و قوانین یک صرافی مشخص شبیه‌سازی نشده‌اند. استاپ و ریسک اسمی، زیان گپ را محدود نمی‌کنند.
 - هیچ اتصال سفارش، کلید API، paper trading یا live trading اضافه نشده است.

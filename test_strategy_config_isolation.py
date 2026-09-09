@@ -1,6 +1,7 @@
 import subprocess
 import sys
 import unittest
+from dataclasses import asdict
 from pathlib import Path
 
 import optimize
@@ -10,6 +11,16 @@ from strategy_adapter import resolve_strategy
 
 
 class StrategyConfigIsolationTests(unittest.TestCase):
+    def test_pulse_full_searches_decisions_not_fixed_policies(self):
+        self.assertEqual(set(pulse.FULL_PARAM_GRID), set(pulse.SIGNAL_KEYS) | set(pulse.ENHANCEMENT_KEYS) | set(pulse.SIZING_KEYS))
+        self.assertGreater(optimize.grid_size(pulse.FULL_PARAM_GRID), 42336)
+        pulse.validate_parameter_grid(pulse.FULL_PARAM_GRID)
+        for key in ('balance', 'fee_rate', 'optimize', 'quantity_step'):
+            with self.assertRaisesRegex(ValueError, 'fixed policies'):
+                pulse.validate_parameter_grid({key: [asdict(pulse.PulseConfig())[key]]})
+        self.assertEqual(set(pulse.FOCUSED_PARAM_GRID), {
+            f'{side}_{key}' for side in ('long', 'short') for key in pulse.SIGNAL_KEYS})
+
     def test_both_configs_use_shared_adapter_contract(self):
         for name, module in [('ma', ma), ('pulse', pulse)]:
             adapter = resolve_strategy(name)
@@ -19,7 +30,7 @@ class StrategyConfigIsolationTests(unittest.TestCase):
 
     def test_pulse_focus_does_not_mutate_full_or_ma(self):
         before = list(ma.FULL_PARAM_GRID['ma_50_period'])
-        values = pulse.FOCUSED_PARAM_GRID['max_hold_bars']
+        values = pulse.FOCUSED_PARAM_GRID['long_max_hold_bars']
         original = list(values)
         try:
             values[:] = [17]

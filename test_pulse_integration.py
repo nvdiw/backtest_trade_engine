@@ -23,7 +23,7 @@ class PulseIntegrationTests(unittest.TestCase):
             frame['High']=wave+.2; frame['Low']=wave-.2
             frame.to_csv(data,index=False)
             grid=root/'grid.json'
-            grid.write_text(json.dumps({'breakout_lookback_bars':[15,20],
+            grid.write_text(json.dumps({**{k: [getattr(pulse.PulseConfig(), k)] for k in pulse.FULL_PARAM_GRID}, 'breakout_lookback_bars':[15,20],
                                         'stop_atr_mult':[1.5,2.], 'max_hold_bars':[10,15]}))
             common=['--strategy','pulse','--param-grid',str(grid),'--data-file',str(data),
                     '--date-policy','fixed','--excel-top','2','--seed','17']
@@ -55,7 +55,7 @@ class PulseIntegrationTests(unittest.TestCase):
             state=json.loads((auto/'auto_state.json').read_text())
             self.assertEqual(state['cycles_completed'],2)
             self.assertEqual(state['config']['strategy'],pulse.IDENTIFIER)
-            self.assertEqual(len(state['config']['parameter_grid']),3)
+            self.assertEqual(len(state['config']['parameter_grid']),len(pulse.FULL_PARAM_GRID))
             self.assertTrue((auto/'snapshots/cycles_000002/best_params.json').exists())
     def test_backtest_xlsx_contains_strategy_and_parameters(self):
         with tempfile.TemporaryDirectory() as directory:

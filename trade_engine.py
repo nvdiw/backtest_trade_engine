@@ -18,6 +18,7 @@ from fetch_calculate_data import fetch_all_data
 from get_candle_index import get_candle_index, get_month_start_indices
 from market_data import MarketDataSource
 from trade_csv_logger import TradeCSVLogger
+from monthly_reporting import monthly_report
 
 
 class _DataclassMapping:
@@ -583,14 +584,17 @@ class TradeEngine:
 
     def open_risk_position(self, i, prices, times, account, *, side, stop_distance,
                            risk_per_trade, max_gross_exposure, trade_id,
-                           quantity_step=0.0, min_quantity=0.0, min_notional=0.0):
-        """Risk-budgeted 1x entry using the existing fills and account ledger.
+                           quantity_step=0.0, min_quantity=0.0, min_notional=0.0,
+                           leverage=1.0, trade_amount_percent=1.0):
+        """Risk-budgeted entry with exposure and margin caps in the shared ledger.
 
         Risk excludes costs/gaps. Reserve both estimated fees in the cash cap;
         the existing ledger charges entry and exit fees together when closed.
         """
         if side not in ('long', 'short'):
             raise ValueError('side must be long or short')
+        if not math.isfinite(leverage) or leverage < 1 or not 0 < trade_amount_percent <= 1:
+            raise ValueError('Invalid leverage or margin allocation')
         if not math.isfinite(stop_distance) or stop_distance <= 0:
             return None, None, 'invalid_stop_distance'
         fill = float(prices[i]) * (1 + self.slippage_rate if side == 'long' else 1 - self.slippage_rate)
@@ -599,7 +603,8 @@ class TradeEngine:
             return None, None, 'insufficient_balance'
         qty = min(equity * risk_per_trade / stop_distance,
                   equity * max_gross_exposure / fill,
-                  account.balance / (fill * (1 + 2 * self.fee_rate)))
+                  equity * trade_amount_percent * leverage / fill,
+                  account.balance / (fill * (1 / leverage + 2 * self.fee_rate)))
         if quantity_step:
             from decimal import Decimal, ROUND_FLOOR
             step = Decimal(str(quantity_step))
@@ -609,9 +614,12 @@ class TradeEngine:
         stop = fill - stop_distance if side == 'long' else fill + stop_distance
         if stop <= 0:
             return None, None, 'invalid_stop_price'
-        fraction = qty * fill / account.tactical_balance
+        # Stop must precede liquidation intrabar; gaps are handled at the next open.
+        if leverage > 1 and stop_distance / fill >= 1 / leverage - self.maintenance_margin_rate:
+            return None, None, 'stop_beyond_liquidation'
+        fraction = qty * fill / (leverage * account.tactical_balance)
         method = self.open_long if side == 'long' else self.open_short
-        opened = method(i, prices, times, account, trade_amount_percent=fraction, leverage=1.0)
+        opened = method(i, prices, times, account, trade_amount_percent=fraction, leverage=leverage)
         position = Position.from_open_result(opened, trade_id=trade_id, side=side,
                                             entry_index=i, high_price=opened['entry_price'],
                                             low_price=opened['entry_price'], reason='range_breakout')
@@ -1736,6 +1744,8 @@ class TradeEngine:
         extra_metrics=None,
         accrue_open_costs=False,
         report_metadata=None,
+        monthly_profit_target_percent=8.0,
+        monthly_return_months=None,
     ):
         """Build the generic optimizer/report result for any strategy.
 
@@ -1833,6 +1843,9 @@ class TradeEngine:
         }
         if extra_metrics:
             result.update(dict(extra_metrics))
+        monthly_summary, monthly_rows = monthly_report(
+            start_time, end_time, monthly_returns, monthly_profit_target_percent, monthly_return_months)
+        result.update(monthly_summary)
 
         if accrue_open_costs:
             result['accrued_open_costs'] = round(accrued_costs, 6)
@@ -1879,6 +1892,7 @@ class TradeEngine:
                     "Short": self._overview_side_metrics("Short", directional_metrics),
                 },
                 file_name=str(output_file),
+                monthly_report=(monthly_summary, monthly_rows),
             )
             write_monthly_summary(in_file=str(output_file),
                 out_file=os.path.join(self.output_dir, 'monthly', 'monthly_data_orders.csv'), quiet=True)
@@ -1964,6 +1978,13 @@ class TradeEngine:
 
         monthly_stop_reasons = state["monthly_stop_reasons"]
         monthly_profits = state["lst_profit_percent_per_month"]
+        reporting_returns = state.get('research_monthly_returns')
+        if reporting_returns is None:
+            reporting_returns = [float(value) / 100 for value in monthly_profits]
+        monthly_summary, monthly_rows = monthly_report(
+            state['first_open_time'], state['last_close_time'], reporting_returns,
+            self.monthly_profit_percent_stop_trade, state.get('reporting_month_labels'))
+        monthly_summary['monthly_profit_stop_months'] = state.get('monthly_profit_stop_months')
         if monthly_stop_reasons:
             profit_months_count = sum(reason == "profit" for reason in monthly_stop_reasons)
             loss_months_count = sum(reason == "loss" for reason in monthly_stop_reasons)
@@ -2139,6 +2160,7 @@ class TradeEngine:
                 },
             },
             file_name=output_file,
+            monthly_report=(monthly_summary, monthly_rows),
         )
 
         if self.write_trades:
@@ -2211,6 +2233,7 @@ class TradeEngine:
             "scale_short_profit": state["scale_ma_short_total_profit"],
             **directional_metrics,
         }
+        result.update(monthly_summary)
         if state.get("research"):
             # These compact series are emitted only for finalists/audits.  They
             # are intentionally omitted from mass discovery results and CSVs.
