@@ -164,7 +164,7 @@ class MarketDataSource:
 
     def month_start_indices(self, start: int, end: int) -> list[int]:
         window = self.open_times().iloc[int(start):int(end)]
-        month_keys = window.dt.strftime("%Y-%m")
+        month_keys = window.dt.year * 12 + window.dt.month
         keep = ~month_keys.duplicated()
         return [int(index) for index in window.index[keep]]
 
@@ -206,10 +206,15 @@ def _load_market_window(
         raise ValueError("the selected start/end range contains no candles")
 
     open_time_values = frame["Open time"].astype(str).tolist()
-    close_time_values = (
+    close_timestamps = (
         pd.to_datetime(frame["Close time"], utc=True, format="mixed", errors="raise")
         + pd.Timedelta(milliseconds=1)
-    ).dt.strftime("%Y-%m-%d %H:%M:%S.%f").tolist()
+    )
+    # NumPy formats the same microsecond-resolution UTC strings in bulk;
+    # Python strftime per candle is costly for multi-year minute histories.
+    close_time_values = np.char.replace(np.datetime_as_string(
+        close_timestamps.dt.tz_localize(None).to_numpy(dtype='datetime64[us]'),
+        unit='us'), 'T', ' ').tolist()
     open_time_ns = np.asarray(
         pd.to_datetime(
             frame["Open time"], utc=True, format="mixed", errors="raise"

@@ -24,6 +24,7 @@ class CampaignUsabilityTests(unittest.TestCase):
                 'data_file': 'candles.csv', 'base_source': 'file',
                 'base_params': 'seed.json', 'auto_tests': 123,
                 'auto_cycles': 4, 'workers': 99, 'snapshot_cycles': 50,
+                'seed_campaign': 'old-source-folder',
             }))
             args = self.restore(['--resume', temp, '--workers', '2'])
             self.assertEqual(args.strategy, 'pulse')
@@ -32,6 +33,7 @@ class CampaignUsabilityTests(unittest.TestCase):
             self.assertEqual(args.auto_tests, 123)
             self.assertEqual(args.workers, 2)
             self.assertNotEqual(args.auto_cycles, 4)
+            self.assertIsNone(args.seed_campaign)
             self.assertTrue(args.auto)
             self.assertTrue(args.resume)
 

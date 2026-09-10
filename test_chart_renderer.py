@@ -5,11 +5,39 @@ from pathlib import Path
 import matplotlib
 matplotlib.use("Agg")
 import numpy as np
+import pandas as pd
+from unittest.mock import patch
 
 from chart_renderer import nearest_marker_in_pixels, render_backtest_chart
 
 
 class ChartRendererTests(unittest.TestCase):
+    def test_first_frame_only_parses_visible_timestamps(self):
+        original = render_backtest_chart
+        parse = pd.to_datetime
+        counts = []
+
+        def tracked(values, *args, **kwargs):
+            if not isinstance(values, str) and hasattr(values, '__len__'):
+                counts.append(len(values))
+            return parse(values, *args, **kwargs)
+
+        def large_history(**kwargs):
+            count = 100_000
+            for key in ('close_prices', 'open_prices', 'high_prices', 'low_prices',
+                        'ema_16', 'ma_50', 'ma_100', 'ma_200', 'rsi_values'):
+                kwargs[key] = np.resize(kwargs[key], count)
+            times = pd.date_range('2025-01-01', periods=count, freq='min').astype(str).tolist()
+            kwargs.update(open_times=times, close_times=times,
+                          chart_data=np.column_stack((np.arange(count), np.ones(count)*1000, np.ones(count)*1000)))
+            with patch('chart_renderer.pd.to_datetime', side_effect=tracked):
+                return original(**kwargs)
+
+        with patch(__name__ + '.render_backtest_chart', side_effect=large_history):
+            self.test_headless_chart_export()
+        self.assertTrue(counts)
+        self.assertLessEqual(max(counts), 24)
+
     def test_marker_hover_uses_rendered_sequential_coordinates(self):
         points = [
             {"x": 3.0, "y": 104.5, "text": "LONG OPEN"},

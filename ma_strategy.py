@@ -34,9 +34,12 @@ build_strategy_config = build_ma_strategy_config
 load_strategy_tune = load_ma_strategy_tune
 
 
-def resolve_parameter_source(source="config", *, params_file=None,
+def resolve_parameter_source(source=None, *, params_file=None,
                              best_params=DEFAULT_BEST_PARAMS_PATH):
     """Return parameter overrides and a human-readable source description."""
+    source = source or ('file' if params_file else 'config')
+    if params_file and source != 'file':
+        raise ValueError('use --params-file FILE alone, or --params-source config/best alone')
     if source == "config":
         return None, "ma_strategy_config.py"
     if source == "best":
@@ -2414,14 +2417,14 @@ def build_parser():
     parser.add_argument("--end", default="2026-02-23",
                         help="exclusive YYYY-MM-DD date or candle index")
     parser.add_argument(
-        "--params-source", choices=("config", "best", "file"), default="config",
+        "--params-source", choices=("config", "best", "file"), default=None,
         help="config=ma_strategy_config.py, best=optimizer winner, file=custom JSON",
     )
     parser.add_argument(
         "--best-params", default=str(DEFAULT_BEST_PARAMS_PATH),
         help="best_params.json used by --params-source=best",
     )
-    parser.add_argument("--params-file", help="JSON used by --params-source=file")
+    parser.add_argument("--params-file", help="load parameter JSON directly; no source flag needed")
     parser.add_argument(
         "--config", dest="legacy_config",
         help="legacy alias for --params-source=file --params-file=FILE",
@@ -2475,7 +2478,7 @@ def main(argv=None):
         print(json.dumps(asdict(build_ma_strategy_config()), indent=2, sort_keys=True))
         return 0
     if args.legacy_config:
-        if args.params_source != "config" or args.params_file:
+        if args.params_source not in (None, "config") or args.params_file:
             parser.error("--config cannot be combined with --params-source/--params-file")
         args.params_source = "file"
         args.params_file = args.legacy_config

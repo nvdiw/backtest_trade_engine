@@ -51,11 +51,20 @@ class PulseOptimizeDateTests(unittest.TestCase):
         command = campaign_arguments(args, coverage, stat)
         parsed = optimize.build_parser().parse_args(command)
         self.assertEqual(parsed.auto_cycles, 4)
-        self.assertEqual(parsed.auto_tests, 98)
+        self.assertEqual(parsed.auto_tests, 256)
+        for key, value in pulse.OPTIMIZER_DEFAULTS.items():
+            self.assertEqual(getattr(parsed, key), value)
         self.assertEqual(parsed.auto_halving_rungs, 0)
+        self.assertEqual(parsed.profile, 'quality')
+        self.assertIn('long_leverage', pulse.PARAMETER_PROFILES[parsed.profile])
+        self.assertIn('short_leverage', pulse.PARAMETER_PROFILES[parsed.profile])
         self.assertEqual(command, campaign_arguments(args, coverage, stat))
         changed = campaign_arguments(args, coverage, SimpleNamespace(st_size=101, st_mtime_ns=2))
         self.assertNotEqual(parsed.output_dir, optimize.build_parser().parse_args(changed).output_dir)
+        args.profile = 'signal'
+        signal = optimize.build_parser().parse_args(campaign_arguments(args, coverage, stat))
+        self.assertEqual(signal.profile, 'signal')
+        self.assertNotEqual(parsed.output_dir, signal.output_dir)
 
     def test_phase_a_four_cycles_cover_grid(self):
         generator = optimize.SmartCandidateGenerator(

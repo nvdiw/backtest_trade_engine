@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import load_workbook
@@ -9,6 +10,27 @@ from trade_csv_logger import TradeCSVLogger
 
 
 class TradeCSVLoggerWorkbookTests(unittest.TestCase):
+    def test_dimension_scans_do_not_scale_per_trade_row(self):
+        from openpyxl.worksheet.worksheet import Worksheet
+        original = Worksheet.max_column.fget
+        counts = []
+        for count in (20, 200):
+            scans = []
+            def tracked(sheet):
+                scans.append(sheet.title)
+                return original(sheet)
+            logger = TradeCSVLogger()
+            logger.rows = [dict(trade_id=f'pulse_{i}', type='LONG', side='LONG', profit=1.,
+                                open_time='2026-01-01 00:00:00', close_time='2026-01-01 00:01:00')
+                           for i in range(count)]
+            with tempfile.TemporaryDirectory() as directory, patch.object(Worksheet, 'max_column', property(tracked)):
+                logger.save_csv(first_balance=1000, final_balance=1000+count,
+                                total_profit=count, total_profit_percent=count/10, total_fee=0,
+                                start_time='2026-01-01', end_time='2026-01-02', days=1, hours=0, minutes=0,
+                                file_name=str(Path(directory)/'trades.csv'))
+            counts.append(len(scans))
+        self.assertLessEqual(counts[1], counts[0] + 10)
+
     def test_default_workbook_has_frozen_separate_strategy_sheets(self):
         logger = TradeCSVLogger()
         logger.rows = [

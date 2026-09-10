@@ -262,6 +262,21 @@ class PulseTests(unittest.TestCase):
             self.assertEqual(result, quiet)
             self.assertTrue((self.root/'quiet/result.json').exists())
 
+    def test_monthly_target_does_not_stop_entries_after_eight_percent(self):
+        frame = candles()
+        frame.loc[22:, ['Open', 'High', 'Low', 'Close']] = [120., 121., 119., 120.]
+        frame.loc[22, ['Open', 'Low']] = [102., 102.]
+        frame.loc[60, ['High', 'Close']] = [123., 122.]
+        frame.loc[61:, ['Open', 'High', 'Low', 'Close']] = [122., 123., 121., 122.]
+        result = self.run_frame(frame, tune={'risk_per_trade': 1., 'monthly_profit_target_percent': 8.})
+        comparison = self.run_frame(frame, tune={'risk_per_trade': 1., 'monthly_profit_target_percent': 1000.})
+        self.assertGreater(result['trade_profits'][0], 80.)  # First exit earns >8% of starting equity.
+        self.assertGreaterEqual(len(self.events(result, 'entry')), 2)
+        self.assertGreater(self.events(result, 'entry')[1]['bar'], self.events(result, 'exit')[0]['bar'])
+        self.assertEqual(result['events'], comparison['events'])
+        self.assertEqual(result['final_balance'], comparison['final_balance'])
+        self.assertFalse(result['monthly_loss_stop_enabled'])
+
     def test_optimizer_stays_silent_even_if_verbose_is_requested(self):
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):

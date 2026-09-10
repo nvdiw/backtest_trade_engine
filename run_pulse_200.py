@@ -10,24 +10,16 @@ ROOT = Path(__file__).resolve().parent
 
 
 def search_grid(timeframe):
-    minute = timeframe == '1m'
-    return {
-        'breakout_lookback_bars': [30, 60, 120, 240] if minute else [10, 20, 30, 60],
-        'stop_atr_mult': [1.5, 2.0, 3.0, 4.0],
-        'max_hold_bars': [30, 60, 120, 240, 480] if minute else [4, 8, 16, 32],
-        'breakout_buffer_atr': [0., .1, .25, .5],
-        'trend_ma_bars': [0, 60, 120, 240, 480] if minute else [0, 16, 32, 64],
-        'min_efficiency_ratio': [0., .15, .3, .5],
-        'min_volume_ratio': [0., 1., 1.5, 2.],
-        'min_atr_cost_ratio': [0., .5, 1., 2., 3.],
-        'max_signal_range_atr': [0., 2., 3., 4.],
-        'max_entry_gap_atr': [0., .25, .5, 1.],
-        'trailing_stop_atr_mult': [0., 1.5, 2., 3.],
-        'trailing_activation_r': [1., 2., 3.],
-        'cooldown_bars': [0, 5, 15, 30] if minute else [0, 1, 2, 4],
-        'enable_long': [True, False],
-        'enable_short': [True, False],
-    }
+    from pulse_strategy_config import PARAMETER_PROFILES
+    grid = {key: list(values) for key, values in PARAMETER_PROFILES['quality'].items()}
+    if timeframe == '15m':
+        for side in ('long', 'short'):
+            grid.update({f'{side}_{key}': values for key, values in dict(
+                breakout_lookback_bars=[10, 20, 30, 60], max_hold_bars=[4, 8, 16, 32],
+                trend_ma_bars=[0, 16, 32, 64], cooldown_bars=[0, 1, 2, 4]).items()})
+    elif timeframe != '1m':
+        raise ValueError('Pulse quality search supports 1m or 15m')
+    return grid
 
 
 def build_parser():
@@ -36,6 +28,7 @@ def build_parser():
     parser.add_argument('--data-file')
     parser.add_argument('--output-dir')
     parser.add_argument('--resume', metavar='FOLDER')
+    parser.add_argument('--seed-campaign', metavar='FOLDER')
     parser.add_argument('--cycles', type=int, default=200, help='additional completed cycles for this invocation')
     parser.add_argument('--tests', type=int, default=128, help='Discovery candidates per cycle (minimum 32)')
     parser.add_argument('-w', '--workers', type=int)
@@ -53,18 +46,23 @@ def campaign_arguments(args):
     if args.dry_run:
         controls += ['--dry-run']
     if args.resume:
+        if args.seed_campaign:
+            raise ValueError('--seed-campaign starts a new campaign; do not combine it with --resume')
         return ['--resume', args.resume, *controls]
+    if args.seed_campaign:
+        controls += ['--seed-campaign', args.seed_campaign]
     data_file = Path(args.data_file) if args.data_file else ROOT / 'data_candle' / (
         'btc_1m_data_2025_to_2026.csv' if args.timeframe == '1m' else 'btc_15m_data_2018_to_2026.csv')
     source = MarketDataSource(data_file, args.timeframe)
     source.interval()  # Reject a mislabeled dataset before creating outputs.
     stat = source.data_file.stat()
     recipe = json.dumps({'grid': search_grid(args.timeframe), 'tests': args.tests,
-                         'version': 1}, sort_keys=True)
+                         'seed_campaign': str(Path(args.seed_campaign).resolve()) if args.seed_campaign else None,
+                         'version': 2}, sort_keys=True)
     revision = hashlib.sha256(
         f'{source.data_file}|{stat.st_size}|{stat.st_mtime_ns}|{recipe}'.encode()).hexdigest()[:12]
     output = Path(args.output_dir) if args.output_dir else (
-        ROOT / 'outputs/pulse/optimize' / f'quality_{args.timeframe}_v1_{revision}')
+        ROOT / 'outputs/pulse/optimize' / f'quality_{args.timeframe}_v2_{revision}')
     # Module-backed grids make dry-run read-only and require no generated script.
     grid_spec = f'run_pulse_200:GRID_{args.timeframe.upper()}'
     return [
@@ -94,7 +92,7 @@ def main(argv=None):
         command = campaign_arguments(args)
     except (ValueError, OSError) as error:
         parser.error(str(error))
-    print('Pulse quality campaign | net costs, filters, exits and side selection | fixed default sizing')
+    print('Pulse quality campaign | LONG + SHORT enabled | independent signals, exits and sizing per side')
     print(f'{args.cycles} cycles requested; snapshots every 50 for new campaigns.')
     import optimize
     optimize.main(command)

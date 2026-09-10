@@ -34,6 +34,7 @@ MINUTE_NS = 60_000_000_000
 def required_indicator_warmup(config):
     cfg = config if isinstance(config,PulseConfig) else build_strategy_config(config)
     return max(side_value(cfg,'long',SIGNAL_KEYS[0]),side_value(cfg,'short',SIGNAL_KEYS[0]),20,
+               80 if any(side_value(cfg, side, 'max_atr_expansion') for side in ('long', 'short')) else 0,
                side_value(cfg,'long','trend_ma_bars'),side_value(cfg,'short','trend_ma_bars')) + 1
 
 def maximum_optimizer_warmup(grid,base_tune=None):
@@ -60,6 +61,16 @@ def raw_breakouts(close,upper,lower):
     return bool(close > upper),bool(close < lower)
 
 
+def atr_expansion(atr, times_ns, interval_ns=MINUTE_NS):
+    """Current ATR / previous 60 ATRs; require entirely contiguous history."""
+    average = pd.Series(atr).shift(1).rolling(60, min_periods=60).mean().to_numpy()
+    ratio = np.divide(atr, average, out=np.full(len(atr), np.nan), where=average > 0)
+    count = np.arange(len(atr)) - np.maximum.accumulate(
+        np.where(np.r_[True, np.diff(times_ns) != interval_ns], np.arange(len(atr)), 0)) + 1
+    ratio[count < 81] = np.nan
+    return ratio
+
+
 def quality_features(close, volume, times_ns, trend_long, trend_short, interval_ns=MINUTE_NS):
     """Closed-bar features with finite windows and no pre-gap history leakage."""
     count = np.arange(len(close)) - np.maximum.accumulate(
@@ -83,6 +94,20 @@ def quality_features(close, volume, times_ns, trend_long, trend_short, interval_
     return result
 
 
+def entry_quality_score(side, i, close, high, low, upper, lower, atr, quality):
+    """0..100, four equal closed-bar confirmations; a heuristic, not a probability."""
+    direction = 1 if side == 'long' else -1
+    boundary = upper[i] if side == 'long' else lower[i]
+    span = high[i] - low[i]
+    location = ((close[i] - low[i]) if side == 'long' else (high[i] - close[i])) / span if span > 0 else 0.
+    strength = direction * (close[i] - boundary) / atr[i] if atr[i] > 0 else 0.
+    components = np.asarray([location, strength, quality['efficiency'][i],
+                             quality['relative_volume'][i] / 2.], dtype=float)
+    if not np.isfinite(components).all():
+        return 0.
+    return float(np.clip(components, 0., 1.).sum() * 25.)
+
+
 def entry_filter_reason(cfg, side, i, close, high, low, upper, lower, atr, quality):
     """Return one explainable rejection, using information available at signal close."""
     setting = lambda key: side_value(cfg, side, key)
@@ -102,6 +127,11 @@ def entry_filter_reason(cfg, side, i, close, high, low, upper, lower, atr, quali
         return 'cost_filter'
     if setting('max_signal_range_atr') and high[i] - low[i] > setting('max_signal_range_atr') * atr[i]:
         return 'signal_spike_filter'
+    if setting('entry_score_min') and entry_quality_score(side, i, close, high, low, upper, lower, atr, quality) < setting('entry_score_min'):
+        return 'entry_score_filter'
+    expansion_limit = setting('max_atr_expansion')
+    if expansion_limit and (not np.isfinite(quality['atr_expansion'][i]) or quality['atr_expansion'][i] > expansion_limit):
+        return 'volatility_expansion_filter'
     return None
 
 def _prepare(market,cfg,now,interval_ns=MINUTE_NS):
@@ -131,6 +161,7 @@ def _prepare(market,cfg,now,interval_ns=MINUTE_NS):
             raise ValueError('Pulse requires finite nonnegative volume')
         _FEATURE_CACHE[key] = (*rolling_features(high,low,close,ns,key[-4],key[-3],interval_ns),
                               quality_features(close,volume,ns,key[-2],key[-1],interval_ns))
+        _FEATURE_CACHE[key][4]['atr_expansion'] = atr_expansion(_FEATURE_CACHE[key][2], ns, interval_ns)
         if len(_FEATURE_CACHE) > 8:
             _FEATURE_CACHE.popitem(last=False)
     _FEATURE_CACHE.move_to_end(key)
@@ -170,6 +201,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
         market=market, strategy_name=DISPLAY_NAME, symbol=SYMBOL,
         optimize=cfg.optimize,verbose=verbose,write_trades=not cfg.optimize,write_excel=write_excel,
         output_dir=output_dir,fee_rate=cfg.fee_rate,slippage_rate=cfg.slippage_rate,
+        monthly_profit_close_filter=False, monthly_loss_close_filter=False,
         funding_rate_per_8h=cfg.funding_rate_per_8h,
         maintenance_margin_rate=cfg.maintenance_margin_rate,
         liquidation_fee_rate=cfg.liquidation_fee_rate)
@@ -178,7 +210,8 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
     chart_state = engine.create_chart_state(optimize=cfg.optimize, enabled=render_chart)
     stop_line = np.full(len(ns), np.nan) if render_chart else None
     position,stop,pending = None,None,None
-    initial_risk, trailing_active = 0.0, False
+    initial_risk, entry_boundary, stop_reason = 0.0, 0.0, 'stop_exit'
+    best_close_gain = 0.0
     next_signal_index = {'long': 0, 'short': 0}
     armed = {'long':True,'short':True}
     events,diagnostics = [],Counter()
@@ -206,6 +239,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
     for i in range(len(ns)):
         current_month = str(times[i])[:7]
         if current_month != month:
+            # Reporting only: monthly returns never gate Pulse entries/exits.
             monthly_returns.append(equity/month_equity-1 if month_equity > 0 else 0)
             month,month_equity = current_month,equity
             monthly_return_months.append(month)
@@ -231,10 +265,10 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
         if position and not exited:
             breached = opens[i] <= stop if position.side == 'long' else opens[i] >= stop
             if breached:
-                exit_position(i,opens[i],'trailing_stop_exit' if trailing_active else 'stop_exit',times[i])
+                exit_position(i,opens[i],stop_reason,times[i])
                 exited = True
         if pending and pending['kind'] == 'exit' and position:
-            exit_position(i,opens[i],'time_exit',times[i])
+            exit_position(i,opens[i],pending.get('reason', 'time_exit'),times[i])
             exited = True
         elif pending and pending['kind'] == 'entry' and position is None:
             side = pending['side']
@@ -251,14 +285,15 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
             side = pending['side']
             trade_id += 1
             position,stop,rejected = engine.open_risk_position(i,opens,times,account,
-                side=side,stop_distance=pending['distance'],risk_per_trade=cfg.risk_per_trade,
-                max_gross_exposure=cfg.max_gross_exposure,quantity_step=cfg.quantity_step,
-                leverage=cfg.leverage,trade_amount_percent=cfg.trade_amount_percent,
+                side=side,stop_distance=pending['distance'],risk_per_trade=side_value(cfg,side,'risk_per_trade'),
+                max_gross_exposure=side_value(cfg,side,'max_gross_exposure'),quantity_step=cfg.quantity_step,
+                leverage=side_value(cfg,side,'leverage'),trade_amount_percent=side_value(cfg,side,'trade_amount_percent'),
                 min_quantity=cfg.min_quantity,min_notional=cfg.min_notional,trade_id=f'pulse_{trade_id:07d}')
             if rejected:
                 diagnostics[rejected] += 1
             else:
-                initial_risk, trailing_active = pending['distance'], False
+                initial_risk, entry_boundary, stop_reason = pending['distance'], pending['boundary'], 'stop_exit'
+                best_close_gain = 0.0
                 armed[side] = False
                 emit('entry',i,side=side,price=position.entry_price,stop=stop,signal_atr=pending['atr'],
                      quantity=position.position_size,margin=position.margin,leverage=position.leverage,
@@ -267,7 +302,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
         if position:
             reference = engine.protective_stop_reference(position.side,stop,opens[i],high[i],low[i])
             if reference is not None:
-                exit_position(i,reference,'trailing_stop_exit' if trailing_active else 'stop_exit',closes_at[i])
+                exit_position(i,reference,stop_reason,closes_at[i])
                 exited = True
         equity = account.balance + (engine.position_equity(position,close[i]) - engine.accrued_position_costs(position,closes_at[i]) if position else 0)
         engine.update_account_drawdown(account,equity)
@@ -276,6 +311,11 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
             if position:
                 stop_line[i] = stop
         if ready[i]:
+            for direction, raw in (('long', close[i] > upper[i]), ('short', close[i] < lower[i])):
+                if raw:
+                    diagnostics[direction + '_raw_breakout_bars'] += 1
+                    if position:
+                        diagnostics[direction + '_blocked_by_open_position_bars'] += 1
             if close[i] <= upper[i]: armed['long'] = True
             if close[i] >= lower[i]: armed['short'] = True
         next_exists = i+1 < len(ns) and ns[i+1]-ns[i] == interval_ns
@@ -286,12 +326,34 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
             multiplier = side_value(cfg,position.side,'trailing_stop_atr_mult')
             direction = 1 if position.side == 'long' else -1
             gain = direction * (close[i] - position.entry_price)
+            best_close_gain = max(best_close_gain, gain)
+            activation = side_value(cfg, position.side, 'breakeven_activation_r')
+            if activation and gain >= initial_risk * activation:
+                # Price covering modeled entry/exit fees and exit slippage.
+                # Funding and adverse gaps can still produce a net loss.
+                proposed = position.entry_price * (1 + direction * cfg.fee_rate) / (
+                    (1 - direction * cfg.fee_rate) * (1 - direction * cfg.slippage_rate))
+                if direction * (proposed - stop) > 0 and direction * (close[i] - proposed) > 0:
+                    stop, stop_reason = proposed, 'breakeven_stop_exit'
+                    emit('stop_update', i, side=position.side, stop=float(stop),
+                         effective_bar=int(market['start']+i+1), source='breakeven')
             if multiplier and np.isfinite(atr[i]) and gain >= initial_risk * side_value(cfg,position.side,'trailing_activation_r'):
                 proposed = close[i] - direction * multiplier * atr[i]
                 if proposed > 0 and direction * (proposed - stop) > 0:
-                    stop, trailing_active = proposed, True
+                    stop, stop_reason = proposed, 'trailing_stop_exit'
                     emit('stop_update',i,side=position.side,stop=float(stop),effective_bar=int(market['start']+i+1))
-            if i-position.entry_index+1 >= side_value(cfg,position.side,'max_hold_bars'):
+            held_bars = i - position.entry_index + 1
+            failure_window = side_value(cfg, position.side, 'failed_breakout_bars')
+            if failure_window and held_bars <= failure_window and direction * (close[i] - entry_boundary) < 0:
+                pending = {'kind': 'exit', 'reason': 'failed_breakout_exit'}
+                emit('failed_breakout_signal', i, side=position.side, boundary=float(entry_boundary))
+            elif (side_value(cfg, position.side, 'stagnation_exit_bars')
+                  and held_bars >= side_value(cfg, position.side, 'stagnation_exit_bars')
+                  and best_close_gain < initial_risk * side_value(cfg, position.side, 'stagnation_min_progress_r')):
+                pending = {'kind': 'exit', 'reason': 'stagnation_exit'}
+                emit('stagnation_signal', i, side=position.side,
+                     best_progress_r=float(best_close_gain / initial_risk), held_bars=held_bars)
+            elif held_bars >= side_value(cfg,position.side,'max_hold_bars'):
                 pending = {'kind':'exit'}
                 emit('time_signal',i,side=position.side)
             continue
@@ -306,12 +368,17 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
                          entry_filter_reason(cfg,side,i,close,high,low,upper,lower,atr,quality))
             if rejection:
                 diagnostics[rejection] += 1
+                diagnostics[side + '_' + rejection] += 1
                 emit('entry_rejected',i,side=side,reason=rejection)
                 continue
             pending = dict(kind='entry',side=side,atr=float(atr[i]),
+                boundary=float(upper[i] if side == 'long' else lower[i]),
                 signal_close=float(close[i]),
                 distance=side_value(cfg,side,'stop_atr_mult')*float(atr[i]),signal_bar=int(market['start']+i))
-            emit('signal',i,side=side,upper=float(upper[i]),lower=float(lower[i]),atr=float(atr[i]))
+            diagnostics[side + '_entry_signals'] += 1
+            score_details = ({'entry_score': entry_quality_score(side, i, close, high, low, upper, lower, atr, quality)}
+                             if side_value(cfg, side, 'entry_score_min') and trace else {})
+            emit('signal',i,side=side,upper=float(upper[i]),lower=float(lower[i]),atr=float(atr[i]), **score_details)
     monthly_returns.append(equity/month_equity-1 if month_equity > 0 else 0)
     result = engine.finalize_account(account,first_balance=cfg.balance,
         open_positions=[position] if position else [],ending_mark_price=close[-1],
@@ -342,9 +409,16 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
 
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--start',default='2025-01-01')
-    parser.add_argument('--end',default='2025-01-03')
-    parser.add_argument('--params-file')
+    parser.add_argument('--start')
+    parser.add_argument('--end')
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--params-file')
+    source.add_argument('--campaign', help='replay a ranked candidate using the stored market and stage dates')
+    parser.add_argument('--params-source', choices=('config', 'best', 'file'), default=None,
+                        help='optional: --params-file alone automatically selects file')
+    parser.add_argument('--best-params', default='outputs/pulse/optimize/best_params.json')
+    parser.add_argument('--rank', type=int, default=1)
+    parser.add_argument('--stage', choices=('final', 'discovery', 'validation', 'stress'), default='final')
     parser.add_argument('--set',action='append',default=[],metavar='KEY=VALUE')
     parser.add_argument('--output-dir',default='outputs/pulse/backtest')
     parser.add_argument('--no-excel',action='store_true')
@@ -363,16 +437,49 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
+        if args.campaign and args.params_source:
+            parser.error('--campaign already selects the parameter source; omit --params-source')
+        if args.params_source == 'best':
+            if args.params_file:
+                parser.error('use --params-file FILE alone, or --params-source best')
+            args.params_file = args.best_params
+        elif args.params_source == 'file' and not args.params_file:
+            parser.error('--params-source file requires --params-file FILE')
+        elif args.params_source == 'config' and args.params_file:
+            parser.error('use --params-file FILE alone, or --params-source config alone')
+        replay = None
+        if args.campaign:
+            from pulse_replay import load_campaign_replay
+            replay = load_campaign_replay(args.campaign, args.rank, args.stage)
+            if not args.data_file:
+                args.data_file = replay['data_file']
+            if args.timeframe == 'auto':
+                args.timeframe = replay['timeframe']
+        args.start = args.start or (replay['start'] if replay else '2025-01-01')
+        args.end = args.end or (replay['end'] if replay else '2025-01-03')
         configure_runtime(args,argv)
-        tune = load_strategy_tune(args.params_file) if args.params_file else {}
+        tune = dict(replay['params']) if replay else load_strategy_tune(args.params_file) if args.params_file else {}
         for item in args.set:
             key,value = item.split('=',1)
             tune[key] = json.loads(value)
         tune['optimize'] = False
+        if not args.quiet:
+            print(f"Pulse parameters: {args.campaign or args.params_file or 'defaults (no parameter file selected)'} | {args.start} -> {args.end}")
         bound = lambda value: int(value) if value.isdigit() else value
         result = pulse_strategy(tune,bound(args.start),bound(args.end),output_dir=args.output_dir,
+                                use_indicator_warmup=replay['use_indicator_warmup'] if replay else True,
                                 write_excel=not args.no_excel,trace=args.trace,verbose=not args.quiet,
                                 write_chart=not args.no_chart, **chart_options(args), plot_max_candles=args.plot_max_candles)
+        if replay:
+            keys = ('long_trades', 'short_trades', 'closed_trades', 'total_profit_percent', 'maximum_drawdown')
+            comparison = dict(candidate_id=replay['candidate_id'], source=replay['source'], stage=replay['stage'],
+                              actual={key: result.get(key) for key in keys},
+                              expected={key: replay['expected'].get(key) for key in keys})
+            comparison['matches'] = all(comparison['expected'][key] is not None and np.isclose(
+                comparison['actual'][key], comparison['expected'][key], rtol=1e-8, atol=1e-6) for key in keys)
+            (Path(args.output_dir) / 'replay_comparison.json').write_text(json.dumps(comparison, indent=2), encoding='utf-8')
+            if not args.quiet:
+                print('Campaign replay: ' + ('MATCH' if comparison['matches'] else 'DIFFERENT (check overrides, data or code changes)'))
     except (ValueError,TypeError,OSError) as exc:
         parser.error(str(exc))
     return 0

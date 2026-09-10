@@ -2121,6 +2121,8 @@ def _save_optimizer_workbook(
             series.graphicalProperties.solidFill = color
             series.graphicalProperties.line.solidFill = color
         add_report_chart(workbook, chart)
+    from report_style import style_report
+    style_report(workbook)
     workbook.save(output_path)
     return output_path
 
@@ -4107,6 +4109,9 @@ def _flatten_hall_record(record, keys, rank, state=None):
             row[f"{stage}_{metric}"] = metrics.get(metric)
     effective_params = record.get('effective_params') or record.get('params') or {}
     row.update({key: effective_params.get(key) for key in keys})
+    for key in ('enable_long', 'enable_short'):
+        if key in effective_params:
+            row[key] = effective_params[key]
     return row
 
 
@@ -4516,6 +4521,8 @@ def _save_auto_workbook(
             series.graphicalProperties.solidFill = color
             series.graphicalProperties.line.solidFill = color
         add_report_chart(workbook, chart)
+    from report_style import style_report
+    style_report(workbook)
     workbook.save(staging_path)
     try:
         _replace_with_retry(staging_path, output_path)
@@ -4839,9 +4846,28 @@ def run_auto_optimization(args, grid=None):
         args, profile, grid, base_tune, base_description, resolved_end
     )
     optimizer_features = _auto_feature_configuration(args)
-    bootstrap = _auto_bootstrap(args, grid)
+    bootstrap = None if resume_existing else _auto_bootstrap(args, grid)
     seed_elites = list(getattr(args, "_seed_elites", ()) or ())
     seed_history = list(getattr(args, "_seed_history", ()) or ())
+    from campaign_transfer import prepare_transfer, read_json as read_transfer, save_transfer
+    transfer_path = output_dir / 'transfer_seed.json.gz'
+    transfer = read_transfer(transfer_path, {}) if resume_existing else {}
+    source = getattr(args, 'seed_campaign', None)
+    if source and resume_existing:
+        raise ValueError('--seed-campaign requires a NEW output folder; resume preserves its existing transfer snapshot')
+    if not source and not resume_existing:
+        parent = Path(getattr(args, 'base_params', output_dir / 'best_params.json')).resolve().parent
+        if parent != output_dir.resolve() and (parent / 'auto_state.json').is_file():
+            source = str(parent)
+    if source and not resume_existing:
+        if Path(source).resolve() == output_dir.resolve():
+            raise ValueError('Seed campaign must be a different folder from the new output')
+        transfer = prepare_transfer(source, config, optimizer_features, grid, _adapter_from_args(args),
+                                    _load_json(output_dir / 'research_manifest.json', {}).get('fingerprints', {}))
+        save_transfer(transfer_path, transfer)
+    if transfer:
+        seed_history.extend(transfer.get('history', []))
+        print('Campaign transfer: ' + json.dumps(transfer['summary'], ensure_ascii=False))
 
     if resume_existing:
         state = saved_state or _load_json(state_path)
@@ -4966,6 +4992,11 @@ def run_auto_optimization(args, grid=None):
             "advanced_from_cycle": 1,
             "bootstrap": bootstrap,
         }
+    if transfer:
+        state['campaign_transfer'] = transfer['summary']
+        if transfer['summary']['mode'] == 'compatible_history' and not resume_existing:
+            importance = transfer.get('source_importance') or importance
+            mutation_guidance = transfer.get('source_mutation_guidance') or mutation_guidance
     removed_files, compressed_csvs, removed_bytes = _safe_cleanup_completed_auto_cycles(
         output_dir, state["cycle"], show_progress=resume_existing
     )
@@ -5041,7 +5072,10 @@ def run_auto_optimization(args, grid=None):
     # Disk history is loaded once per process. Subsequent cycles extend these
     # caches with only their new plans/results instead of rescanning everything.
     seen_cache = None
-    history_cache = seed_history or None
+    history_cache = None
+    if seed_history:
+        combined = [*seed_history, *_load_discovery_history(output_dir, keys)]
+        history_cache = list({row['candidate_id']: row for row in combined}.values())
     try:
         while cycle_limit == 0 or state["cycles_completed"] < cycle_limit:
             cycle = int(state["cycle"])
@@ -5162,6 +5196,13 @@ def run_auto_optimization(args, grid=None):
                     args.seed + cycle - 1,
                     parameter_importance=importance,
                 )
+                if transfer:
+                    imported = [params for params in transfer.get('proposals', [])
+                                if _candidate_signature(params, keys) not in seen_cache][:max(1, args.auto_tests // 2)]
+                    chosen = {_candidate_signature(params, keys) for params in imported}
+                    generated = (imported + [params for params in generated
+                                 if _candidate_signature(params, keys) not in chosen])[:args.auto_tests]
+                    surrogate_metadata['transferred_for_retest'] = len(imported)
                 seen_cache.update(
                     _candidate_signature(params, keys) for params in generated
                 )
@@ -8234,11 +8275,11 @@ Tips:
         help="parameter profile name (default: full in auto mode, focused otherwise)",
     )
     search.add_argument(
-        "--base-source", choices=("config", "best", "file"), default="config",
+        "--base-source", "--params-source", choices=("config", "best", "file"), default="config",
         help="fixed/base values come from the selected strategy config or --base-params JSON",
     )
     search.add_argument(
-        "--base-params", default=os.path.join("outputs", "optimize", "best_params.json"),
+        "--base-params", "--params-file", default=os.path.join("outputs", "optimize", "best_params.json"),
         metavar="PATH", help="JSON read when --base-source is best or file",
     )
 
@@ -8594,6 +8635,8 @@ Tips:
         "--auto-surrogate-max-samples", type=int, default=10_000, metavar="N",
         help="representative historical samples retained for tree training",
     )
+    search.add_argument('--seed-campaign', metavar='FOLDER',
+                        help='seed a NEW Auto campaign with prior finalists and representative history; incompatible scores are reevaluated')
     auto.add_argument(
         '--auto-learning-target', choices=('rank', 'profit-evidence'), default='rank',
         help='profit-evidence learns net return, monthly downside and failed candidates; persists across resume',
@@ -8672,8 +8715,8 @@ def main(argv=None):
     from optimize_commands import expand_arguments, report_command
     parser = build_parser()
     arguments = sys.argv[1:] if argv is None else list(argv)
-    simple_start = bool(arguments and not arguments[0].startswith('-')
-                        and arguments[0] not in ('resume', 'status', 'report'))
+    from parameter_cli import optimizer_parameter_arguments
+    arguments = optimizer_parameter_arguments(arguments)
     try:
         if report_command(arguments):
             return
@@ -8683,7 +8726,7 @@ def main(argv=None):
     args = parser.parse_args(arguments)
     if any(item == '--cycles' or item.startswith('--cycles=') for item in arguments):
         args.auto = True
-    if simple_start and args.auto and not args.resume:
+    if args.auto and not args.resume:
         module = _adapter_from_spec(args.strategy).module
         parser.set_defaults(**getattr(module, 'OPTIMIZER_DEFAULTS', {}))
         args = parser.parse_args(arguments)

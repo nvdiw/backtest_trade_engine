@@ -137,15 +137,34 @@ class ProfitLearningTests(unittest.TestCase):
 
 
 class CampaignLauncherTests(unittest.TestCase):
-    def test_both_grids_are_loadable_and_exclude_risk_escalation(self):
+    def test_both_grids_include_sizing_and_keep_costs_fixed(self):
         for timeframe in ('1m', '15m'):
             grid = load_grid_source(f'run_pulse_200:GRID_{timeframe.upper()}')['full']
             pulse.validate_parameter_grid(grid)
-            self.assertIn('min_atr_cost_ratio', grid)
-            self.assertIn('max_entry_gap_atr', grid)
-            self.assertNotIn('leverage', grid)
+            self.assertEqual(grid['enable_long'], [True])
+            self.assertEqual(grid['enable_short'], [True])
+            for key in pulse.FULL_PARAM_GRID:
+                self.assertNotIn(key, grid)
+                for side in ('long', 'short'):
+                    self.assertGreater(len(grid[f'{side}_{key}']), 1)
             self.assertNotIn('fee_rate', grid)
         self.assertNotEqual(search_grid('1m'), search_grid('15m'))
+
+    def test_joint_candidates_have_independent_parameters(self):
+        grid = pulse.PARAMETER_PROFILES['quality']
+        for side in ('long', 'short'):
+            self.assertEqual(grid[f'{side}_leverage'], pulse.FULL_PARAM_GRID['leverage'])
+            self.assertTrue(pulse.is_valid_candidate({f'{side}_leverage': 100.0}))
+        generator = optimize.SmartCandidateGenerator(
+            grid, strategy_adapter=optimize._adapter_from_spec('pulse'))
+        candidates = generator.generate_auto(32)
+        self.assertEqual(len(candidates), 32)
+        for params in candidates:
+            self.assertTrue(params['enable_long'])
+            self.assertTrue(params['enable_short'])
+            self.assertTrue(pulse.is_valid_candidate(params))
+        self.assertTrue(any(p['long_leverage'] != p['short_leverage'] for p in candidates))
+        self.assertTrue(any(p['long_breakout_lookback_bars'] != p['short_breakout_lookback_bars'] for p in candidates))
 
     def test_campaign_defaults_and_resume(self):
         args = build_parser().parse_args(['--dry-run'])

@@ -1,90 +1,300 @@
 {
-  "breakout_lookback_bars": [
+  "long_breakout_lookback_bars": [
     30,
     60,
     120,
     240
   ],
-  "stop_atr_mult": [
+  "long_stop_atr_mult": [
     1.5,
     2.0,
     3.0,
     4.0
   ],
-  "max_hold_bars": [
+  "long_max_hold_bars": [
     30,
     60,
     120,
     240,
     480
   ],
-  "breakout_buffer_atr": [
+  "long_breakout_buffer_atr": [
     0.0,
     0.1,
     0.25,
     0.5
   ],
-  "trend_ma_bars": [
+  "long_trend_ma_bars": [
     0,
     60,
     120,
     240,
     480
   ],
-  "min_efficiency_ratio": [
+  "long_min_efficiency_ratio": [
     0.0,
     0.15,
     0.3,
     0.5
   ],
-  "min_volume_ratio": [
+  "long_min_volume_ratio": [
     0.0,
     1.0,
     1.5,
     2.0
   ],
-  "min_atr_cost_ratio": [
+  "long_min_atr_cost_ratio": [
     0.0,
     0.5,
     1.0,
     2.0,
     3.0
   ],
-  "max_signal_range_atr": [
+  "long_max_signal_range_atr": [
     0.0,
     2.0,
     3.0,
     4.0
   ],
-  "max_entry_gap_atr": [
+  "long_max_entry_gap_atr": [
     0.0,
     0.25,
     0.5,
     1.0
   ],
-  "trailing_stop_atr_mult": [
+  "long_trailing_stop_atr_mult": [
     0.0,
     1.5,
     2.0,
     3.0
   ],
-  "trailing_activation_r": [
+  "long_trailing_activation_r": [
     1.0,
     2.0,
     3.0
   ],
-  "cooldown_bars": [
+  "long_cooldown_bars": [
     0,
     5,
     15,
     30
   ],
+  "long_entry_score_min": [
+    0.0,
+    40.0,
+    55.0,
+    70.0
+  ],
+  "long_failed_breakout_bars": [
+    0,
+    3,
+    6,
+    12
+  ],
+  "long_breakeven_activation_r": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "long_risk_per_trade": [
+    0.001,
+    0.0025,
+    0.005
+  ],
+  "long_max_gross_exposure": [
+    1.0,
+    2.0,
+    3.0,
+    5.0
+  ],
+  "long_leverage": [
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    8.0,
+    10.0,
+    20.0,
+    30.0,
+    50.0,
+    75.0,
+    100.0
+  ],
+  "long_trade_amount_percent": [
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0
+  ],
+  "short_breakout_lookback_bars": [
+    30,
+    60,
+    120,
+    240
+  ],
+  "short_stop_atr_mult": [
+    1.5,
+    2.0,
+    3.0,
+    4.0
+  ],
+  "short_max_hold_bars": [
+    30,
+    60,
+    120,
+    240,
+    480
+  ],
+  "short_breakout_buffer_atr": [
+    0.0,
+    0.1,
+    0.25,
+    0.5
+  ],
+  "short_trend_ma_bars": [
+    0,
+    60,
+    120,
+    240,
+    480
+  ],
+  "short_min_efficiency_ratio": [
+    0.0,
+    0.15,
+    0.3,
+    0.5
+  ],
+  "short_min_volume_ratio": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "short_min_atr_cost_ratio": [
+    0.0,
+    0.5,
+    1.0,
+    2.0,
+    3.0
+  ],
+  "short_max_signal_range_atr": [
+    0.0,
+    2.0,
+    3.0,
+    4.0
+  ],
+  "short_max_entry_gap_atr": [
+    0.0,
+    0.25,
+    0.5,
+    1.0
+  ],
+  "short_trailing_stop_atr_mult": [
+    0.0,
+    1.5,
+    2.0,
+    3.0
+  ],
+  "short_trailing_activation_r": [
+    1.0,
+    2.0,
+    3.0
+  ],
+  "short_cooldown_bars": [
+    0,
+    5,
+    15,
+    30
+  ],
+  "short_entry_score_min": [
+    0.0,
+    40.0,
+    55.0,
+    70.0
+  ],
+  "short_failed_breakout_bars": [
+    0,
+    3,
+    6,
+    12
+  ],
+  "short_breakeven_activation_r": [
+    0.0,
+    1.0,
+    1.5,
+    2.0
+  ],
+  "short_risk_per_trade": [
+    0.001,
+    0.0025,
+    0.005
+  ],
+  "short_max_gross_exposure": [
+    1.0,
+    2.0,
+    3.0,
+    5.0
+  ],
+  "short_leverage": [
+    1.0,
+    2.0,
+    3.0,
+    5.0,
+    8.0,
+    10.0,
+    20.0,
+    30.0,
+    50.0,
+    75.0,
+    100.0
+  ],
+  "short_trade_amount_percent": [
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0
+  ],
   "enable_long": [
-    true,
-    false
+    true
   ],
   "enable_short": [
-    true,
-    false
+    true
+  ],
+  "long_max_atr_expansion": [
+    0.0,
+    1.5,
+    2.0,
+    3.0
+  ],
+  "long_stagnation_exit_bars": [
+    0,
+    10,
+    30,
+    60
+  ],
+  "long_stagnation_min_progress_r": [
+    0.25,
+    0.5,
+    1.0
+  ],
+  "short_max_atr_expansion": [
+    0.0,
+    1.5,
+    2.0,
+    3.0
+  ],
+  "short_stagnation_exit_bars": [
+    0,
+    10,
+    30,
+    60
+  ],
+  "short_stagnation_min_progress_r": [
+    0.25,
+    0.5,
+    1.0
   ]
 }

@@ -1,9 +1,21 @@
 # Optimize خودکار Pulse
 
+به‌روزرسانی ۲۰۲۶-۰۹-۱۱: دستورهای جاری در [راهنمای سادهٔ اجرا](COMMANDS_FA.md) هستند.
+پیش‌فرض Quality اکنون چهار چرخه با قیف `256 → 64 → 32 → WF 16×3 → 16` است؛
+runner و `python optimize.py pulse` از یک تنظیم مشترک استفاده می‌کنند.
+نام پوشهٔ خودکار runner با `quality_v3_` شروع می‌شود. اعداد 98 و مسیر Phase A
+در ادامه، شرح نسخهٔ قدیمی‌اند و پیش‌فرض فعلی نیستند.
+
+به‌روزرسانی ۲۰۲۶-۰۹-۱۰: پیش‌فرض runner اکنون Quality با ۴۶ متغیر مستقل
+Long/Short و دو کلید ثابت برای فعال‌بودن هر دو جهت است؛ اهرم و حجم نیز مستقل‌اند.
+راهنمای جاری: [Pulse جدید](PULSE_UPGRADES_FA.md).
+توضیحات Phase A و بودجهٔ ۳۹۲ ترکیب در ادامه فقط با `--profile signal` صدق می‌کنند؛
+تعدادهای قدیمی Full در این یادداشت تاریخی دیگر نمایندهٔ شبکهٔ فعلی نیستند.
+
 از ریشهٔ پروژه اجرا کنید:
 
 ```powershell
-python run_pulse_optimize.py --performance normal
+python run_pulse_optimize.py --profile signal --performance normal
 ```
 
 دیدن برنامه بدون اجرای بک‌تست: `python run_pulse_optimize.py --dry-run`.

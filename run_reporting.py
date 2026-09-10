@@ -26,13 +26,68 @@ def write_metadata(directory, result, parameters):
         temporary.replace(directory / name)
 
 
+def format_backtest_log(result, start, end):
+    """Compact legacy console/file summary, shared by all strategies."""
+    def value(key):
+        number = result.get(key)
+        return str(round(float(number), 2)) if number is not None else 'N/A'
+
+    elapsed = int((pd.Timestamp(end) - pd.Timestamp(start)).total_seconds() / 60)
+    days, remainder = divmod(elapsed, 1440)
+    hours, minutes = divmod(remainder, 60)
+    profit = f"{value('total_profit_percent')} %"
+    if result.get('sum_trade_profit_percent') is not None:
+        profit += f" or {value('sum_trade_profit_percent')} %"
+    lines = [
+        f'{pd.Timestamp(start).year} - {pd.Timestamp(end).year}',
+        '\u2705 BACKTEST FINISHED',
+        f"Closed Trades: {result['closed_trades']} ( Longs: {result['long_trades']} | Shorts: {result['short_trades']} )",
+        f"Count open Trades: {result['open_positions']}",
+        f"Total Wins: {result['wins']} | Total Wins Long: {result['long_wins']} | Total Wins Short: {result['short_wins']}",
+        f"Total Losses: {result['losses']}",
+        f"Final Balance: {value('final_balance')} $",
+        f"Final Balance (No Fee): {value('final_balance_without_fee')} $",
+        f"Final balance if close, open orders: {value('final_balance_dynamic')} $",
+        f"Total Fees Paid: {value('total_fees')} $",
+        f"Fee Compounding Impact: {value('fee_compounding_impact')} $",
+        f"Maximum Drawdown: {value('maximum_drawdown')} %",
+        f'Total Duration : {days} days, {hours} hours, {minutes} minutes',
+        f"Win Rate: {value('win_rate')} %",
+        f"Total Profit: {value('total_profit')} $",
+        f'Total Profit Percent: {profit}',
+        f"saved Money: {value('saved_money')} $",
+        f"Count Liquids: {result['liquidations']}",
+        f"count_profit_months: {result['profit_months']}",
+        f"count_loss_months: {result['loss_months']}",
+        f"Total calendar months: {result['calendar_months']}",
+        f"Months with profit >= 8%: {result['monthly_8pct_met_months']}",
+        f"Losing months (net return < 0%): {result['monthly_loss_months']}",
+        f"Months below 8%: {result['monthly_8pct_missed_months']}",
+        f"Monthly loss stop enabled: {str(result['monthly_loss_stop_enabled']).lower()}",
+        f"Total score: {result['score']}",
+    ]
+    if result.get('monthly_partial_months'):
+        lines.insert(-1, f"Partial months included: {result['monthly_partial_months']}")
+    if result.get('monthly_target_unknown_months'):
+        lines.insert(-1, f"Months with unavailable return: {result['monthly_target_unknown_months']}")
+    return '\n'.join(lines) + '\n'
+
+
 def publish_backtest(engine, result, parameters, start, end, first_balance, monthly, output_file=None):
     """Both account adapters call this; strategy code does not serialize reports."""
     result.update(engine.market_metadata)
     result['report_schema_version'] = 1
     result['backtest_start'] = str(start)
     result['backtest_end_exclusive'] = str(end)
+    result['fee_compounding_impact'] = round(
+        result['final_balance_without_fee'] - result['final_balance'] - result['total_fees'], 6)
     summary, months = monthly
+    # The requested 8% comparison is a reporting benchmark, independent of
+    # a strategy's configured monthly target or trading-stop controls.
+    returns = [row['net_return_percent'] for row in months if row['net_return_percent'] is not None]
+    result['monthly_8pct_met_months'] = sum(value >= 8.0 for value in returns)
+    result['monthly_8pct_missed_months'] = sum(value < 8.0 for value in returns)
+    result['monthly_loss_stop_enabled'] = bool(parameters.get('monthly_loss_close_filter', False))
     sections = {
         'Run': {'Strategy': result.get('strategy_name', 'Strategy'),
                 'Symbol': result.get('symbol', 'unspecified'), 'Timeframe': result.get('timeframe', 'unspecified'),
@@ -59,15 +114,13 @@ def publish_backtest(engine, result, parameters, start, end, first_balance, mont
         values = {key: value for key, value in result.items() if key.startswith(prefix + '_') or '_' + prefix + '_' in key}
         if values:
             sections[prefix.upper()] = values
+    if result.get('diagnostics'):
+        sections['Signal diagnostics'] = result['diagnostics']
     sections['Trades']['Realized profit / trade'] = (result.get('realized_profit', 0) / result['closed_trades']
                                                     if result['closed_trades'] else 0)
-    lines = [f"{section} | {key}: {value}" for section, values in sections.items()
-             for key, value in values.items()]
+    log = format_backtest_log(result, start, end)
     if engine.verbose:
-        print('BACKTEST FINISHED')
-        print(f"Final Balance: {result['final_balance']} | Total Fees Paid: {result['total_fees']}")
-        print(f"Maximum Drawdown: {result['maximum_drawdown']} | Total score: {result['score']}")
-        print('\n'.join(lines))
+        print(log, end='')
     if not engine.write_trades:
         return
     directory = Path(engine.output_dir)
@@ -76,6 +129,8 @@ def publish_backtest(engine, result, parameters, start, end, first_balance, mont
     elapsed_minutes = int((pd.Timestamp(end) - pd.Timestamp(start)).total_seconds() / 60)
     days, remainder = divmod(elapsed_minutes, 1440)
     hours, minutes = divmod(remainder, 60)
+    if engine.verbose:
+        print('Writing trade reports (CSV / Excel)...', flush=True)
     engine.csv_logger.save_csv(first_balance=first_balance, final_balance=result['final_balance'],
         total_profit=result['total_profit'], total_profit_percent=result['total_profit_percent'],
         total_fee=result['total_fees'], start_time=start, end_time=end,
@@ -84,5 +139,7 @@ def publish_backtest(engine, result, parameters, start, end, first_balance, mont
     write_monthly_summary(in_file=path, out_file=str(directory / 'monthly/monthly_data_orders.csv'), quiet=True)
     numeric = {key: value for key, value in result.items() if not isinstance(value, (dict, list, tuple))}
     pd.DataFrame([numeric]).to_csv(directory / 'run_summary.csv', index=False)
-    (directory / 'run.log').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    (directory / 'run.log').write_text(log, encoding='utf-8')
     write_metadata(directory, result, parameters)
+    if engine.verbose:
+        print('Trade reports saved.', flush=True)

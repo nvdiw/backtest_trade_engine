@@ -34,7 +34,7 @@ def restore_campaign(parser, args, arguments):
         return arguments
     # Runtime controls and bounded execution limits belong to this invocation.
     transient = {'resume', 'output_dir', 'dry_run', 'list_profiles', 'refresh_auto_report',
-                 'workers', 'performance', 'auto_cycles'}
+                 'workers', 'performance', 'auto_cycles', 'seed_campaign'}
     for key, value in saved.items():
         if hasattr(args, key) and key not in explicit | transient and not key.startswith('_'):
             setattr(args, key, value)

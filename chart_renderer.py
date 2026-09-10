@@ -91,8 +91,10 @@ def render_backtest_chart(
         0, max(1e-9, float(finite_oscillator.max()) * 1.1) if finite_oscillator.size else 1)
     if any(len(values) != len(source_close) for values in overlays.values()):
         raise ValueError('Chart overlays must match candle count')
-    source_times = pd.to_datetime(np.asarray(close_times, dtype=object), utc=True)
-    source_open_times = pd.to_datetime(np.asarray(open_times, dtype=object), utc=True)
+    # Keep the history in its original representation. Parsing years of 1m
+    # timestamps here delays the first frame even when only 500 bars are visible.
+    source_times = close_times
+    source_open_times = open_times
     total_candles = len(source_close)
     if total_candles == 0:
         return None
@@ -403,7 +405,7 @@ def render_backtest_chart(
             full_high = source_high[plot_start:plot_end]
             full_low = source_low[plot_start:plot_end]
             full_close = source_close[plot_start:plot_end]
-            full_close_times = source_times[plot_start:plot_end]
+            full_close_times = pd.to_datetime(source_times[plot_start:plot_end], utc=True)
             full_ema16 = source_ema16[plot_start:plot_end]
             full_ma50 = source_ma50[plot_start:plot_end]
             full_ma100 = source_ma100[plot_start:plot_end]
@@ -968,7 +970,7 @@ def render_backtest_chart(
                     if isinstance(ts, pd.Timestamp):
                         ts_dt = ts.to_pydatetime()
                     else:
-                        ts_dt = pd.Timestamp(ts, tz="UTC").to_pydatetime()
+                        ts_dt = pd.to_datetime(ts, utc=True).to_pydatetime()
                     nav_state["marker_hover_points"].append(
                         {
                             # mplfinance uses sequential x positions when

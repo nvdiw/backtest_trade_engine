@@ -44,9 +44,24 @@ class MonthlyReportingTests(unittest.TestCase):
             detail = pd.read_csv(path.with_name('data_orders_monthly_targets.csv'))
             self.assertEqual(detail['target_status'].tolist(), ['MISSED', 'MET'])
             book = load_workbook(path.with_suffix('.xlsx'))
-            self.assertEqual(book.sheetnames[:2], ['Monthly Summary', 'Monthly Goals'])
+            self.assertEqual(book.sheetnames[:3], ['Dashboard', 'Monthly Summary', 'Monthly Goals'])
             self.assertEqual(book['Monthly Goals'].max_row, 3)
             book.close()
+
+    def test_log_counts_calendar_losses_and_eight_percent_without_loss_stop(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = TradeEngine(optimize=False, verbose=False, output_dir=directory)
+            result = engine.finalize_account(AccountState(balance=1000), first_balance=1000,
+                ending_mark_price=100, start_time='2025-01-01', end_time='2025-11-01',
+                monthly_returns=[.08] * 8 + [.03, -.01], monthly_profit_target_percent=9,
+                report_metadata={'monthly_loss_close_filter': False})
+            log = (Path(directory) / 'run.log').read_text(encoding='utf-8')
+            self.assertIn('Total calendar months: 10', log)
+            self.assertIn('Months with profit >= 8%: 8', log)
+            self.assertIn('Losing months (net return < 0%): 1', log)
+            self.assertIn('Months below 8%: 2', log)
+            self.assertIn('Monthly loss stop enabled: false', log)
+            self.assertEqual(result['monthly_target_met_months'], 0)  # Separate 9% report target.
 
 
 if __name__ == '__main__':
