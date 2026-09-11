@@ -3,13 +3,6 @@
 کمپین تازهٔ ۳۰۰ چرخه‌ای با انتقال سابقهٔ `2026_09_10` به پوشهٔ `2026-09-11`:
 
 ```powershell
-python run_pulse_next_300.py --dry-run
-python run_pulse_next_300.py
-```
-
-این میان‌بر مخصوص همین انتقال است. دستور عمومی معادل آن:
-
-```powershell
 python optimize.py pulse --timeframe 1m --cycles 300 --seed-campaign outputs/pulse/optimize/2026_09_10 --output-dir outputs/pulse/optimize/2026-09-11 --workers 8
 ```
 

@@ -10,14 +10,9 @@ python optimize.py report pulse_quality_200_20260908_100013
 python optimize.py resume pulse_quality_200_20260908_100013 --cycles 50
 ```
 
-در resume تعداد cycle، تعداد **اضافی** است. نیازی به تکرار base-source، base-params یا output-dir نیست. اگر نام پوشه تکراری باشد مسیر کامل بدهید. فرمان report فقط از ارزیابی‌های ذخیره‌شده گزارش می‌سازد و تست را دوباره اجرا نمی‌کند. Snapshot پیش‌فرض هر ۵۰ cycle است.
+در resume تعداد cycle، سقف **کل چرخه‌های تکمیل‌شده** است. نیازی به تکرار base-source، base-params یا output-dir نیست. اگر نام پوشه تکراری باشد مسیر کامل بدهید. فرمان report فقط از ارزیابی‌های ذخیره‌شده گزارش می‌سازد و تست را دوباره اجرا نمی‌کند. فاصلهٔ Snapshot به تنظیمات کمپین بستگی دارد.
 
-اسکریپت آمادهٔ PowerShell هم از همین رابط استفاده می‌کند و Python را در همان ترمینال اجرا می‌کند:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_pulse_long_test.ps1 -Cycles 200 -Workers 8
-powershell -NoProfile -ExecutionPolicy Bypass -File .\run_pulse_long_test.ps1 -Resume pulse_quality_200_20260908_100013 -Cycles 50
-```
+دستورهای جاری در [راهنمای ترمینال](COMMANDS_FA.md) هستند؛ همه را از ریشهٔ پروژه اجرا کنید.
 
 ## مسیر مشترک گزارش‌ها
 

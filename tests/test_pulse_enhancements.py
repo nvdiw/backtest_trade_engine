@@ -2,7 +2,7 @@ import unittest
 import numpy as np
 import pandas as pd
 import pulse_strategy as pulse
-from test_pulse_strategy import PulseTests as _PulseRunner, candles
+from tests.test_pulse_strategy import PulseTests as _PulseRunner, candles
 
 
 class PulseEnhancementTests(unittest.TestCase):

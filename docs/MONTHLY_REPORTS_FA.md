@@ -24,13 +24,13 @@
 برای تست طولانی Pulse در ترمینال:
 
 ```powershell
-.\run_pulse_long_test.ps1
+python optimize.py pulse --cycles 200
 ```
 
-ادامهٔ اجرای متوقف‌شده با ۱۵۰ cycle دیگر:
+ادامهٔ اجرای متوقف‌شده تا سقف ۳۵۰ cycle کامل:
 
 ```powershell
-.\run_pulse_long_test.ps1 -Resume نام_پوشه -Cycles 150
+python optimize.py resume CAMPAIGN_FOLDER --cycles 350
 ```
 
-این اسکریپت مستقیماً `optimize.py` را اجرا می‌کند و به راه‌انداز Python جداگانه وابسته نیست. دادهٔ پیش‌فرض Pulse یک‌دقیقه‌ای و دادهٔ پیش‌فرض MA پانزده‌دقیقه‌ای است؛ optimizer فاصلهٔ واقعی کندل‌ها را از داده تشخیص می‌دهد.
+دستورها را از ریشهٔ پروژه اجرا کنید. دادهٔ پیش‌فرض Pulse یک‌دقیقه‌ای و دادهٔ پیش‌فرض MA پانزده‌دقیقه‌ای است؛ optimizer فاصلهٔ واقعی کندل‌ها را از داده تشخیص می‌دهد.

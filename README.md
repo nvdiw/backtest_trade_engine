@@ -1,6 +1,12 @@
 # Backtest Trade Engine
 
-[Unified output pipeline and simple optimizer commands (Persian)](UNIFIED_OUTPUTS_FA.md)
+[Documentation index / فهرست راهنماها](docs/README.md) · [Terminal commands / دستورهای ترمینال](docs/COMMANDS_FA.md)
+
+Run commands from the repository root. Guides live in `docs/`, tests in `tests/`, parameter grids in `param_grids/`, market data in `data_candle/`, and generated artifacts in `outputs/`.
+
+Run tests with `python -m unittest discover -s tests -t . -v`.
+
+[Unified output pipeline and simple optimizer commands (Persian)](docs/UNIFIED_OUTPUTS_FA.md)
 
 ```powershell
 python optimize.py pulse --cycles 200
@@ -10,11 +16,11 @@ python optimize.py report CAMPAIGN_FOLDER
 python optimize.py resume CAMPAIGN_FOLDER --cycles 50
 ```
 
-Strategies own their data and timeframe settings. Backtests share CSV, Excel, log, monthly and chart reporting for every strategy, timeframe and symbol. Auto campaigns publish status and rejection reports even when no candidate qualifies. Resume restores the saved campaign configuration; `--cycles` adds cycles on resume.
+Strategies own their data and timeframe settings. Backtests share CSV, Excel, log, monthly and chart reporting for every strategy, timeframe and symbol. Auto campaigns publish status and rejection reports even when no candidate qualifies. Resume restores the saved campaign configuration; `--cycles` sets the total completed-cycle limit on resume.
 
-[Pulse automatic date windows and bounded campaign](PULSE_OPTIMIZE_FA.md): `python run_pulse_optimize.py --performance normal` runs up to four cycles of 98 Phase A candidates, with dataset-revision isolation and automatic checkpoint continuation.
+[Pulse automatic date windows and bounded campaign](docs/PULSE_OPTIMIZE_FA.md): `python run_pulse_optimize.py --performance normal` runs up to four Quality cycles with a 256 → 64 → 32 → WF 16×3 → 16 funnel, dataset-revision isolation and automatic checkpoint continuation.
 
-[Independent long/short settings, adaptive Auto and chart layout](DIRECTIONAL_AUTO_GUIDE_FA.md)
+[Independent long/short settings, adaptive Auto and chart layout](docs/DIRECTIONAL_AUTO_GUIDE_FA.md)
 
 | Task | Command / setting | Behavior |
 |---|---|---|
@@ -25,11 +31,11 @@ Strategies own their data and timeframe settings. Backtests share CSV, Excel, lo
 
 Shared balance, costs and portfolio stop controls still couple economic results between directions. `--autopilot` defaults to eleven phases of ten cycles and one snapshot every 110 cycles. Existing `--auto` behavior remains available. Use a separate output directory for the new directional campaign.
 
-[Build a strategy with its own dataset and timeframe](STRATEGY_PLUGIN_GUIDE_FA.md) — includes the copy-ready `example_strategy.py` configured for `data_candle/btc_1m_data.csv`.
+[Build a strategy with its own dataset and timeframe](docs/STRATEGY_PLUGIN_GUIDE_FA.md) — includes the copy-ready `example_strategy.py` configured for `data_candle/btc_1m_data.csv`.
 
-[Research workflow: nested walk-forward, sealed holdout, Top 100 snapshots, and strategy plug-ins](RESEARCH_GUIDE_FA.md)
+[Research workflow: nested walk-forward, sealed holdout, Top 100 snapshots, and strategy plug-ins](docs/RESEARCH_GUIDE_FA.md)
 
-[راهنمای فارسی](README_FA.md)
+[راهنمای فارسی](docs/README_FA.md)
 
 A candle-by-candle BTC backtesting and parameter-optimization project. It supports long/short positions, leverage, fees, liquidation, scale-ins, monthly controls, MA/EMA/ADX/ATR/volume/RSI scoring, interactive chart review, multiprocessing optimization, checkpoints, and out-of-sample validation.
 
@@ -517,10 +523,10 @@ outputs/                generated artifacts
 
 ## Runtime resources and candle timeframe
 
-Pulse (`--strategy pulse`) implements the one-minute rolling-range breakout using the shared TradeEngine, CSV/XLSX logger, monthly reports and interactive chart renderer. See [Pulse rules, parameter schema, tests and commands](PULSE_GUIDE_FA.md). Its initial shared grid has 392 combinations; risk and cost assumptions are not search dimensions.
+Pulse (`--strategy pulse`) implements the one-minute rolling-range breakout using the shared TradeEngine, CSV/XLSX logger, monthly reports and interactive chart renderer. See [Pulse rules, parameter schema, tests and commands](docs/PULSE_GUIDE_FA.md). Its initial shared grid has 392 combinations; risk and cost assumptions are not search dimensions.
 
-Outputs now default to `outputs/<strategy>/backtest`, `optimize`, `evaluate`, `research` or `holdout`. Workspace ownership prevents cross-strategy reuse, and OS locks prevent concurrent writers to the same run directory. Legacy outputs stay in place and remain selectable with an explicit path. See [strategy workspaces](STRATEGY_WORKSPACES_FA.md).
+Outputs now default to `outputs/<strategy>/backtest`, `optimize`, `evaluate`, `research` or `holdout`. Workspace ownership prevents cross-strategy reuse, and OS locks prevent concurrent writers to the same run directory. Legacy outputs stay in place and remain selectable with an explicit path. See [strategy workspaces](docs/STRATEGY_WORKSPACES_FA.md).
 
 Git tracks source code, tests, documentation and parameter grids. Generated files in `outputs/`, local candle datasets in `data_candle/`, Python caches, environments and scratch files are ignored. Supply an OHLCV CSV through `--data-file`; ignoring an existing local file does not delete it.
 
-`--performance power_saving|normal|boost` controls worker count and process priority without changing test budgets or numerical precision. Explicit `-w` overrides the suggested worker count. `--data-file PATH --timeframe auto` selects and detects a consistent candle interval, including 1m and 15m, across the optimizer and workers. See [focus, resources and timeframe guide](RUNTIME_FOCUS_GUIDE_FA.md).
+`--performance power_saving|normal|boost` controls worker count and process priority without changing test budgets or numerical precision. Explicit `-w` overrides the suggested worker count. `--data-file PATH --timeframe auto` selects and detects a consistent candle interval, including 1m and 15m, across the optimizer and workers. See [focus, resources and timeframe guide](docs/RUNTIME_FOCUS_GUIDE_FA.md).

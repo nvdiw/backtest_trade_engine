@@ -20,6 +20,7 @@ htmlcov/
 # Local scratch files and editor/OS artifacts
 /terminal.txt
 /strategy_config copy.py
+/local_notes/
 *.log
 ~$*
 .DS_Store

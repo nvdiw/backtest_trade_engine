@@ -10,7 +10,7 @@ matplotlib.use('Agg')
 import pandas as pd
 import ma_strategy
 import pulse_strategy
-from test_strategy_plugins import _write_minute_candles
+from tests.test_strategy_plugins import _write_minute_candles
 
 class OutputDefaultsTests(unittest.TestCase):
     def run_cli(self, module, minutes, root, extra=(), check_at_show=False):

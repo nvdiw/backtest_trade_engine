@@ -13,7 +13,7 @@ import optimize
 from strategy_adapter import resolve_strategy
 from strategy_workspace import (assert_strategy_path, claim_output, output_path,
                                 output_session)
-from test_strategy_plugins import _write_minute_candles
+from tests.test_strategy_plugins import _write_minute_candles
 
 
 class StrategyWorkspaceTests(unittest.TestCase):

@@ -16,7 +16,7 @@ import optimize
 from market_data import clear_market_data_cache
 from optimize_commands import expand_arguments
 from campaign_reporting import publish_campaign
-from test_pulse_strategy import candles
+from tests.test_pulse_strategy import candles
 from trade_engine import TradeEngine
 
 

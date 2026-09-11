@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 import pulse_strategy as pulse
 from pulse_replay import load_campaign_replay
-from test_pulse_strategy import candles
+from tests.test_pulse_strategy import candles
 
 
 class PulseReplayTests(unittest.TestCase):

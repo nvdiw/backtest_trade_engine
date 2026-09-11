@@ -120,7 +120,7 @@ python pulse_strategy.py --start 2025-01-01 --end 2025-01-03 --show-chart --outp
 تست‌های Pulse و آزمون کل پروژه:
 
 ```powershell
-python -m unittest test_pulse_strategy test_pulse_integration -v
+python -m unittest tests.test_pulse_strategy tests.test_pulse_integration -v
 python -m unittest discover -q
 ```
 

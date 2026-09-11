@@ -51,7 +51,7 @@ sys.meta_path.insert(0, BlockPeer())
 import optimize
 optimize.main(['--strategy', {strategy!r}, '--list-profiles'])
 '''
-            result = subprocess.run([sys.executable, '-c', code], cwd=Path(__file__).parent,
+            result = subprocess.run([sys.executable, '-c', code], cwd=Path(__file__).resolve().parents[1],
                                     capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
 

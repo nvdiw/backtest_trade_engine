@@ -11,7 +11,7 @@ import pulse_strategy as pulse
 from optimizer_evidence import profit_evidence, apply_profit_learning, chronological_probe_indices
 from run_pulse_200 import build_parser, campaign_arguments, search_grid
 from strategy_adapter import load_grid_source
-from test_pulse_strategy import PulseTests as _PulseRunner, candles
+from tests.test_pulse_strategy import PulseTests as _PulseRunner, candles
 
 
 class PulseTimeframeTests(unittest.TestCase):

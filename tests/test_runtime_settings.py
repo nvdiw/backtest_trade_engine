@@ -15,7 +15,7 @@ from ma_strategy import ma_strategy
 from market_data import MarketDataSource, clear_market_data_cache
 from runtime_settings import (add_runtime_arguments, configure_runtime,
                               performance_name, runtime_session, worker_count)
-from test_strategy_plugins import _write_minute_candles
+from tests.test_strategy_plugins import _write_minute_candles
 
 
 class RuntimeTests(unittest.TestCase):

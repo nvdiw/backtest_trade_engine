@@ -10,7 +10,7 @@ import numpy as np
 import pandas as pd
 import optimize
 import pulse_strategy as pulse
-from test_pulse_strategy import candles
+from tests.test_pulse_strategy import candles
 
 class PulseIntegrationTests(unittest.TestCase):
     def test_grid_multiprocessing_reports_and_auto_resume(self):
@@ -56,7 +56,13 @@ class PulseIntegrationTests(unittest.TestCase):
             self.assertEqual(state['cycles_completed'],2)
             self.assertEqual(state['config']['strategy'],pulse.IDENTIFIER)
             self.assertEqual(len(state['config']['parameter_grid']),len(pulse.FULL_PARAM_GRID))
-            self.assertTrue((auto/'snapshots/cycles_000002/best_params.json').exists())
+            snapshot = auto/'snapshots/cycles_000002'
+            snapshot_manifest = json.loads((snapshot/'manifest.json').read_text())
+            self.assertEqual(snapshot_manifest['cycle'], 2)
+            # A short synthetic run need not produce a qualified winner under
+            # profit-evidence scoring, but its snapshot must still be published.
+            self.assertEqual((snapshot/'best_params.json').exists(),
+                             snapshot_manifest['saved_candidates'] > 0)
     def test_backtest_xlsx_contains_strategy_and_parameters(self):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); data=root/'candles.csv'; candles().to_csv(data,index=False)

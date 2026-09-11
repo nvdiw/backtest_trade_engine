@@ -8728,7 +8728,12 @@ def main(argv=None):
         args.auto = True
     if args.auto and not args.resume:
         module = _adapter_from_spec(args.strategy).module
-        parser.set_defaults(**getattr(module, 'OPTIMIZER_DEFAULTS', {}))
+        strategy_defaults = dict(getattr(module, 'OPTIMIZER_DEFAULTS', {}))
+        if args.param_grid:
+            # External grids define their own profiles; a strategy-owned name
+            # such as Pulse's "quality" may not exist in the supplied file.
+            strategy_defaults.pop('profile', None)
+        parser.set_defaults(**strategy_defaults)
         args = parser.parse_args(arguments)
         args.auto = True
     try:

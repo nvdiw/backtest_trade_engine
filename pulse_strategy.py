@@ -1,7 +1,7 @@
 ﻿"""Pulse / RollingRangeBreakout1m research hypothesis, not a profitability claim.
 
 Prior-bar channels, SMA(TR,20), closed-bar signals and next-open execution.
-Optional causal entry filters and close-updated ATR trailing. See PULSE_GUIDE_FA.md.
+Optional causal entry filters and close-updated ATR trailing. See docs/PULSE_GUIDE_FA.md.
 """
 from __future__ import annotations
 import argparse
