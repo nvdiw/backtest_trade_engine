@@ -1,3 +1,5 @@
+> Developer navigation: [Code map and selection/sizing notes](docs/CODE_MAP.md).
+
 # Backtest Trade Engine
 
 [Documentation index / فهرست راهنماها](docs/README.md) · [Terminal commands / دستورهای ترمینال](docs/COMMANDS_FA.md)

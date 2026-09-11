@@ -51,6 +51,7 @@ def collect_stage_evidence(directory, cycle=None):
         key = path.parent.name + '/' + stage
         info = dict(cycle=int(path.parent.name.split('_')[1]), stage=stage, evaluations=0,
                     eligible=0, rejected=0, errors=0, no_trades=0, insufficient_trades=0,
+                    insufficient_directional_trades=0,
                     excessive_drawdown=0, other_rejections=0, positive_net_return=0)
         opener = gzip.open if path.suffix == '.gz' else open
         best = None
@@ -78,6 +79,12 @@ def collect_stage_evidence(directory, cycle=None):
                         info['no_trades'] += 1
                     elif trades < gate:
                         info['insufficient_trades'] += 1
+                    elif (number(row.get('required_directional_trades')) or 0) > 0 and any(
+                        str(row.get('enable_' + side, 'True')).lower() != 'false'
+                        and (number(row.get(side + '_trades')) or 0) < number(row['required_directional_trades'])
+                        for side in ('long', 'short')
+                    ):
+                        info['insufficient_directional_trades'] += 1
                     elif max_dd is not None and dd is not None and abs(dd) > max_dd:
                         info['excessive_drawdown'] += 1
                     else:
@@ -106,13 +113,16 @@ def publish_campaign(directory, state=None, excel=True, rebuild=False, cycle=Non
     evidence = (collect_stage_evidence(directory, cycle) if rebuild or cycle is not None
                 else read_json(directory / 'stage_evidence.json', {}))
     hall = read_json(directory / 'hall_of_fame.json', [])
+    from optimizer_selection import _auto_candidate_decision
+    accepted = [record for record in hall if _auto_candidate_decision(record)['decision'] == 'ACCEPT']
     result = dict(status=state.get('status'), cycles_completed=state.get('cycles_completed', 0),
                   current_cycle=state.get('cycle'), current_stage=state.get('stage'),
-                  evaluations=state.get('total_evaluations', 0), qualified_finalists=len(hall),
+                  evaluations=state.get('total_evaluations', 0), qualified_finalists=len(accepted),
+                  observed_finalists=len(hall),
                   strategy=state.get('config', {}).get('strategy'), timeframe=state.get('config', {}).get('timeframe'),
-                  outcome='QUALIFIED_FINALISTS' if hall else 'NO_QUALIFIED_FINALIST',
-                  recommended_params='best_params.json' if hall else None,
-                  note='Checkpoint parameters are provisional; no approved winner.' if not hall else 'Auto selection; independent validation still required.')
+                  outcome='QUALIFIED_FINALISTS' if accepted else 'NO_QUALIFIED_FINALIST',
+                  recommended_params='best_params.json' if accepted and hall[0] in accepted else None,
+                  note='Checkpoint parameters are provisional; no approved winner.' if not accepted else 'Auto selection; independent validation still required.')
     stages = []
     leaders = []
     direction_leaders = []
@@ -126,7 +136,7 @@ def publish_campaign(directory, state=None, excel=True, rebuild=False, cycle=Non
                                       'selected_by': side + ' net profit', **leader,
                                       'scope': 'side contribution within tested portfolio; not a standalone backtest or final winner'})
     stage_columns = ['cycle', 'stage', 'evaluations', 'eligible', 'rejected', 'errors', 'no_trades',
-                     'insufficient_trades', 'excessive_drawdown', 'other_rejections', 'positive_net_return']
+                     'insufficient_trades', 'insufficient_directional_trades', 'excessive_drawdown', 'other_rejections', 'positive_net_return']
     stage_frame = pd.DataFrame(stages, columns=stage_columns)
     aggregate = stage_frame.groupby('stage', sort=False).sum(numeric_only=True).drop(columns='cycle', errors='ignore').reset_index()
     status_frame = pd.DataFrame(list(result.items()), columns=['Metric', 'Value'])

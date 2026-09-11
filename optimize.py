@@ -7,9 +7,58 @@ Examples:
     python optimize.py --mode grid -w 8
 """
 
+from optimizer_defaults import (
+    DEFAULT_DEVELOPMENT_START,
+    DEFAULT_AUTO_VALIDATION_START,
+    DEFAULT_AUTO_DISCOVERY_START,
+    DEFAULT_DEVELOPMENT_END,
+    DEFAULT_RESEARCH_END,
+    DEFAULT_HOLDOUT_START,
+    DEFAULT_ROLLING_DEVELOPMENT_MONTHS,
+    DEFAULT_ROLLING_OOS_MONTHS,
+    DEFAULT_ROLLING_EMBARGO_MONTHS,
+    DEFAULT_ROLLING_HOLDOUT_MONTHS,
+    DEFAULT_ROLLING_STRESS_MONTHS,
+    DEFAULT_ROLLING_VALIDATION_MONTHS,
+    DEFAULT_OUTPUT_DIR,
+    AUTO_STAGE_ORDER,
+    AUTO_STAGE_WEIGHTS,
+    DEFAULT_EXECUTION_SCENARIOS
+)
+from optimizer_cli import (
+    _OptimizerHelpFormatter,
+    build_parser
+)
+from optimizer_learning import (
+    _finite_number,
+    _record_comparable_score,
+    _surrogate_target,
+    _score_percentiles,
+    _annotate_discovery_learning_scores,
+    _apply_funnel_learning_scores,
+    _importance_target,
+    _learn_parameter_importance,
+    _smooth_parameter_importance,
+    _learn_mutation_guidance,
+    ExtraTreesSurrogate
+)
+from optimizer_selection import (
+    _record_percentiles,
+    _combine_auto_stage_records,
+    _auto_candidate_decision,
+    _auto_candidate_rank_key
+)
+from optimizer_progress import (
+    _show_loading_progress
+)
+
 from excel_charts import add_report_chart
 from optimize_overview import OVERVIEW_COLUMNS, comparison_rows, write_overview, print_leaders
 from optimizer_evidence import apply_profit_learning, chronological_probe_indices
+from optimizer_candidates import (
+    build_ma_strategy_config, grid_size, iter_grid_candidates, _nearest_value, is_valid_candidate, SmartCandidateGenerator
+)
+from optimizer_policy import required_directional_trades, apply_directional_gate
 from monthly_reporting import MONTHLY_COLUMNS
 from campaign_reporting import publish_campaign
 
@@ -75,11 +124,6 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
-def build_ma_strategy_config(tune=None):
-    from ma_strategy_config import build_ma_strategy_config as build
-    return build(tune)
-
-
 def _strategy_staged_phases(args):
     """Return a strategy-owned staged schedule, preserving the MA default."""
     adapter = _adapter_from_args(args)
@@ -109,6 +153,9 @@ def _strategy_staged_phases(args):
     return tuple(phases)
 
 RESULT_COLUMNS = [
+    *[f"{side}_{metric}" for side in ("long", "short") for metric in
+      ("filled_entries", "average_gross_exposure", "average_margin_fraction",
+       "sizing_risk_entries", "sizing_exposure_entries", "sizing_margin_entries", "sizing_cash_entries")],
     *MONTHLY_COLUMNS,
     "final_balance_static", "final_balance_dynamic", "final_balance",
     "final_balance_without_fee",
@@ -164,21 +211,9 @@ _ACTIVE_MARKET_DATA_SOURCE = None
 _ACTIVE_CANDLES_PER_YEAR = CANDLES_PER_YEAR_15M
 SURROGATE_MAX_TRAINING_SAMPLES = 10_000
 SURROGATE_CACHE_BOOTSTRAP_CYCLES = 24
-SURROGATE_CACHE_VERSION = 2
+SURROGATE_CACHE_VERSION = 3
 
 # Fixed-mode bootstrap values. Auto mode replaces them from the final candle.
-DEFAULT_DEVELOPMENT_START = "2023-01-01"
-DEFAULT_AUTO_VALIDATION_START = "2023-07-01"
-DEFAULT_AUTO_DISCOVERY_START = "2024-01-01"
-DEFAULT_DEVELOPMENT_END = "2025-04-01"
-DEFAULT_RESEARCH_END = "2026-01-01"
-DEFAULT_HOLDOUT_START = "2026-01-01"
-DEFAULT_ROLLING_DEVELOPMENT_MONTHS = 24
-DEFAULT_ROLLING_OOS_MONTHS = 8
-DEFAULT_ROLLING_EMBARGO_MONTHS = 1
-DEFAULT_ROLLING_HOLDOUT_MONTHS = 5
-DEFAULT_ROLLING_STRESS_MONTHS = 3
-DEFAULT_ROLLING_VALIDATION_MONTHS = 6
 
 _WORKER_START = DEFAULT_DEVELOPMENT_START
 _WORKER_END = DEFAULT_DEVELOPMENT_END
@@ -187,7 +222,6 @@ _WORKER_USE_INDICATOR_WARMUP = True
 _WORKER_INDICATOR_WARMUP_CANDLES = None
 _WORKER_STRATEGY_SPEC = "ma"
 _WORKER_RESEARCH = False
-DEFAULT_OUTPUT_DIR = os.path.join("outputs", "optimize")
 
 
 def _adapter_from_spec(specification=None):
@@ -247,398 +281,6 @@ def _profiles_from_args(args):
     except Exception:
         pass
     return profiles
-
-
-def grid_size(grid):
-    return math.prod(len(values) for values in grid.values())
-
-
-def iter_grid_candidates(grid):
-    """Yield the full Cartesian grid lazily without allocating it in memory."""
-    keys = tuple(grid)
-    for combo in itertools.product(*(grid[key] for key in keys)):
-        yield dict(zip(keys, combo))
-
-
-def _nearest_value(values, target):
-    if target in values:
-        return target
-    if isinstance(target, (int, float)) and not isinstance(target, bool):
-        numeric = [value for value in values if isinstance(value, (int, float))]
-        if numeric:
-            return min(numeric, key=lambda value: abs(value - target))
-    return values[0]
-
-
-def is_valid_candidate(candidate, strategy_adapter=None):
-    """Reject combinations that violate basic parameter relationships."""
-    if strategy_adapter is not None and not strategy_adapter.validate_candidate(candidate):
-        return False
-    ma_periods = [
-        candidate.get("ema_16_period"), candidate.get("ma_50_period"),
-        candidate.get("ma_100_period"), candidate.get("ma_200_period"),
-    ]
-    if all(value is not None for value in ma_periods) and ma_periods != sorted(ma_periods):
-        return False
-    leverage_tiers = [
-        candidate.get("safe_leverage_low"), candidate.get("safe_leverage_med"),
-        candidate.get("safe_leverage_high"), candidate.get("leverage"),
-    ]
-    if all(value is not None for value in leverage_tiers) and leverage_tiers != sorted(leverage_tiers):
-        return False
-    balance_tiers = [
-        candidate.get("safe_leverage_balance_pct_low"),
-        candidate.get("safe_leverage_balance_pct_med"),
-        candidate.get("safe_leverage_balance_pct_high"),
-    ]
-    if all(value is not None for value in balance_tiers) and balance_tiers != sorted(balance_tiers):
-        return False
-    return True
-
-
-class SmartCandidateGenerator:
-    """Reproducible adaptive search over discrete or locally refined values."""
-
-    def __init__(
-        self,
-        grid,
-        seed=42,
-        baseline_params=None,
-        continuous_refinement=False,
-        parameter_importance=None,
-        mutation_guidance=None,
-        refinement_round=1,
-        strategy_adapter=None,
-    ):
-        if not grid or any(not values for values in grid.values()):
-            raise ValueError("param_grid must contain at least one value per parameter")
-        self.grid = {key: tuple(values) for key, values in grid.items()}
-        self.keys = tuple(self.grid)
-        self.mutable_keys = tuple(key for key, values in self.grid.items() if len(values) > 1)
-        self.random = random.Random(seed)
-        self.continuous_refinement = bool(continuous_refinement)
-        self.refinement_round = max(1, int(refinement_round))
-        self.strategy_adapter = strategy_adapter
-        supplied_importance = parameter_importance or {}
-        self.parameter_importance = {
-            key: max(0.01, float(supplied_importance.get(key, 1.0)))
-            for key in self.mutable_keys
-        }
-        supplied_guidance = mutation_guidance or {}
-        self.mutation_guidance = {
-            key: dict(supplied_guidance.get(key, {})) for key in self.mutable_keys
-        }
-        self.seen = set()
-        self.local_queue = []
-        self.local_queued = set()
-        self.baseline_attempted = False
-        defaults = (
-            strategy_adapter.default_values(baseline_params)
-            if strategy_adapter is not None
-            else build_ma_strategy_config(baseline_params)
-        )
-        if isinstance(defaults, dict):
-            defaults = dict(defaults)
-            for key in self.grid:
-                if key.startswith(('long_', 'short_')) and defaults.get(key) is None:
-                    defaults[key] = defaults.get(key.split('_', 1)[1], self.grid[key][0])
-        else:
-            for key in self.grid:
-                if key.startswith(('long_', 'short_')) and getattr(defaults, key, None) is None:
-                    setattr(defaults, key, getattr(defaults, key.split('_', 1)[1], self.grid[key][0]))
-        self.baseline = {
-            key: _nearest_value(
-                values,
-                (
-                    defaults.get(key, values[0])
-                    if isinstance(defaults, dict)
-                    else getattr(defaults, key, values[0])
-                ),
-            )
-            for key, values in self.grid.items()
-        }
-
-    def _signature(self, candidate):
-        return tuple(candidate[key] for key in self.keys)
-
-    def _canonicalize(self, candidate):
-        """Collapse inactive conditional parameters to avoid duplicate backtests."""
-        candidate = dict(candidate)
-        if candidate.get("scale_in_enabled") is False:
-            for key in self.keys:
-                if key.startswith(("scale_entry_", "profit_scale_entry_")):
-                    candidate[key] = self.baseline[key]
-        else:
-            if candidate.get("scale_entry_on_profit_enabled") is False:
-                for key in ("scale_entry_profit_trigger_pct",):
-                    if key in candidate:
-                        candidate[key] = self.baseline[key]
-            if candidate.get("scale_entry_on_loss_enabled") is False:
-                for key in ("scale_entry_loss_trigger_pct",):
-                    if key in candidate:
-                        candidate[key] = self.baseline[key]
-            if candidate.get("profit_scale_entry_filter_enabled") is False:
-                for key in (
-                    "profit_scale_entry_min_score",
-                    "profit_scale_entry_atr_ratio_min",
-                ):
-                    if key in candidate:
-                        candidate[key] = self.baseline[key]
-        if candidate.get("rsi_trade_monthly_filter_on") is False:
-            for key in self.keys:
-                if (
-                    key.startswith(("rsi_", "lowest_rsi_", "highest_rsi_"))
-                    and key != "rsi_trade_monthly_filter_on"
-                ):
-                    candidate[key] = self.baseline[key]
-        elif candidate.get("rsi_cooldown_filter") is False:
-            if "rsi_cooldown_bars" in candidate:
-                candidate["rsi_cooldown_bars"] = self.baseline["rsi_cooldown_bars"]
-        inactive_filter_settings = (
-            ("adx_filter", ("entry_adx_threshold", "entry_score_adx")),
-            ("atr_filter", ("entry_atr_threshold",)),
-            ("volume_filter", ("volume_spike_multiplier", "entry_score_volume")),
-            (
-                "consecutive_losses_month_stop_filter",
-                ("consecutive_losses_stop_until_month",),
-            ),
-        )
-        for switch, dependent_keys in inactive_filter_settings:
-            if candidate.get(switch) is False:
-                for key in dependent_keys:
-                    if key in candidate:
-                        candidate[key] = self.baseline[key]
-        if self.strategy_adapter is not None:
-            candidate = self.strategy_adapter.canonicalize_candidate(
-                candidate, self.baseline
-            )
-        return candidate
-
-    def _random_candidate(self):
-        return {key: self.random.choice(values) for key, values in self.grid.items()}
-
-    @staticmethod
-    def _is_numeric_values(values):
-        return all(
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            for value in values
-        )
-
-    def _numeric_refinement_step(self, values):
-        ordered = sorted(set(values))
-        if all(isinstance(value, int) and not isinstance(value, bool) for value in ordered):
-            return 1
-        gaps = [
-            right - left for left, right in zip(ordered, ordered[1:])
-            if right > left
-        ]
-        if not gaps:
-            return 0
-        # Each completed auto cycle can halve the smallest coarse-grid gap. The
-        # cap avoids creating meaningless floating-point precision indefinitely.
-        divisor = 2 ** min(4, self.refinement_round)
-        return min(gaps) / divisor
-
-    @staticmethod
-    def _float_precision(values, step):
-        def decimal_places(value):
-            text = f"{float(value):.12f}".rstrip("0")
-            return len(text.partition(".")[2])
-
-        return min(12, max([decimal_places(value) for value in values] + [decimal_places(step)]))
-
-    def _refined_neighbors(self, key, current):
-        values = self.grid[key]
-        if not self.continuous_refinement or not self._is_numeric_values(values):
-            ordered = list(values)
-            if current in ordered:
-                index = ordered.index(current)
-            else:
-                index = min(range(len(ordered)), key=lambda i: abs(ordered[i] - current))
-            return [
-                ordered[neighbor_index]
-                for neighbor_index in (index - 1, index + 1)
-                if 0 <= neighbor_index < len(ordered)
-            ]
-
-        lower, upper = min(values), max(values)
-        step = self._numeric_refinement_step(values)
-        if step <= 0:
-            return []
-        precision = self._float_precision(values, step)
-        neighbors = []
-        guidance = self.mutation_guidance.get(key, {})
-        preferred_direction = int(guidance.get("direction", 0) or 0)
-        directions = [-1, 1]
-        if preferred_direction in (-1, 1):
-            directions.sort(key=lambda item: item != preferred_direction)
-        step_multiplier = max(1, min(3, int(guidance.get("step_multiplier", 1) or 1)))
-        for direction in directions:
-            value = current + direction * step * step_multiplier
-            value = max(lower, min(upper, value))
-            if all(isinstance(item, int) and not isinstance(item, bool) for item in values):
-                value = int(round(value))
-            else:
-                value = round(value, precision)
-            if value != current and value not in neighbors:
-                neighbors.append(value)
-        return neighbors
-
-    def _weighted_mutation_keys(self, count):
-        available = list(self.mutable_keys)
-        chosen = []
-        while available and len(chosen) < count:
-            weights = [self.parameter_importance.get(key, 1.0) for key in available]
-            key = self.random.choices(available, weights=weights, k=1)[0]
-            available.remove(key)
-            chosen.append(key)
-        return chosen
-
-    def _mutate_key(self, candidate, key, prefer_local=True):
-        values = self.grid[key]
-        neighbors = self._refined_neighbors(key, candidate[key])
-        if prefer_local and neighbors and self.random.random() < 0.85:
-            guidance = self.mutation_guidance.get(key, {})
-            confidence = max(0.0, min(1.0, float(guidance.get("confidence", 0.0))))
-            preferred_direction = int(guidance.get("direction", 0) or 0)
-            preferred = [
-                value for value in neighbors
-                if preferred_direction and (value - candidate[key]) * preferred_direction > 0
-            ]
-            if preferred and self.random.random() < 0.50 + 0.45 * confidence:
-                candidate[key] = self.random.choice(preferred)
-            else:
-                candidate[key] = self.random.choice(neighbors)
-        else:
-            candidate[key] = self.random.choice(values)
-
-    def _elite_choice(self, elites):
-        # Rank weighting prevents one early lucky candidate from monopolizing search.
-        weights = list(range(len(elites), 0, -1))
-        return self.random.choices(elites, weights=weights, k=1)[0]
-
-    def _guided_candidate(self, elites, progress=0.0, crossover_probability=0.20):
-        # Occasionally cross two good candidates, then mutate. Mutation becomes
-        # narrower as the budget is consumed (exploration -> exploitation).
-        parent = self._elite_choice(elites)
-        candidate = {key: parent["params"][key] for key in self.keys}
-        if len(elites) > 1 and self.random.random() < crossover_probability:
-            other = self._elite_choice(elites)["params"]
-            side_choices = {side: self.random.random() < 0.5 for side in ('long', 'short')}
-            for key in self.mutable_keys:
-                # Preserve a parent's complete directional setup rather than
-                # splicing incompatible MA periods and exit settings together.
-                side = key.split('_', 1)[0]
-                take_other = side_choices[side] if side in side_choices else self.random.random() < 0.5
-                if take_other:
-                    candidate[key] = other[key]
-
-        max_mutations = max(2, round(math.sqrt(max(1, len(self.mutable_keys)))))
-        mutation_count = max(1, round(max_mutations * (1.0 - 0.70 * progress)))
-        mutation_count = min(len(self.mutable_keys), mutation_count)
-        for key in self._weighted_mutation_keys(mutation_count):
-            self._mutate_key(candidate, key, prefer_local=True)
-        return candidate
-
-    def _crossover_candidate(self, elites, progress=0.0):
-        candidate = self._guided_candidate(
-            elites, progress=progress, crossover_probability=1.0
-        )
-        return candidate
-
-    def _queue_elite_neighbors(self, elites):
-        """Queue deterministic one-step neighbors around the current elites."""
-        for elite in elites:
-            parent = {key: elite["params"][key] for key in self.keys}
-            ordered_keys = sorted(
-                self.mutable_keys,
-                key=lambda key: self.parameter_importance.get(key, 1.0),
-                reverse=True,
-            )
-            for key in ordered_keys:
-                current = parent[key]
-                for neighbor in self._refined_neighbors(key, current):
-                    candidate = dict(parent)
-                    candidate[key] = neighbor
-                    candidate = self._canonicalize(candidate)
-                    signature = self._signature(candidate)
-                    if (
-                        signature not in self.seen
-                        and signature not in self.local_queued
-                        and is_valid_candidate(candidate, self.strategy_adapter)
-                    ):
-                        self.local_queue.append(candidate)
-                        self.local_queued.add(signature)
-
-    def generate(self, count, elites=None, progress=0.0, progress_label=None):
-        candidates = []
-        attempts = 0
-        max_attempts = max(1000, count * 100)
-        if elites:
-            self._queue_elite_neighbors(elites)
-        while len(candidates) < count and attempts < max_attempts:
-            attempts += 1
-            if not self.baseline_attempted:
-                candidate = dict(self.baseline)
-                self.baseline_attempted = True
-            elif self.local_queue and self.random.random() < (0.35 + 0.50 * progress):
-                candidate = self.local_queue.pop(0)
-                self.local_queued.discard(self._signature(candidate))
-            elif elites and self.random.random() >= max(0.12, 0.40 * (1.0 - progress)):
-                candidate = self._guided_candidate(elites, progress=progress)
-            else:
-                candidate = self._random_candidate()
-            candidate = self._canonicalize(candidate)
-            signature = self._signature(candidate)
-            if signature in self.seen or not is_valid_candidate(
-                candidate, self.strategy_adapter
-            ):
-                continue
-            self.seen.add(signature)
-            candidates.append(candidate)
-            if progress_label and (
-                len(candidates) == count
-                or len(candidates) % max(1, math.ceil(count / 20)) == 0
-            ):
-                _show_loading_progress(progress_label, len(candidates), count)
-        return candidates
-
-    def generate_auto(self, count, elites=None, progress_label=None):
-        """Generate the 25% exploration / 15% crossover / 60% local mix."""
-        if not elites:
-            return self.generate(count, progress_label=progress_label)
-        self._queue_elite_neighbors(elites)
-        candidates = []
-        attempts = 0
-        max_attempts = max(2000, count * 200)
-        while len(candidates) < count and attempts < max_attempts:
-            attempts += 1
-            roll = self.random.random()
-            if roll < 0.25:
-                candidate = self._random_candidate()
-            elif roll < 0.40:
-                candidate = self._crossover_candidate(elites, progress=0.85)
-            elif self.local_queue and self.random.random() < 0.50:
-                candidate = self.local_queue.pop(0)
-                self.local_queued.discard(self._signature(candidate))
-            else:
-                candidate = self._guided_candidate(
-                    elites, progress=0.85, crossover_probability=0.0
-                )
-            candidate = self._canonicalize(candidate)
-            signature = self._signature(candidate)
-            if signature in self.seen or not is_valid_candidate(
-                candidate, self.strategy_adapter
-            ):
-                continue
-            self.seen.add(signature)
-            candidates.append(candidate)
-            if progress_label and (
-                len(candidates) == count
-                or len(candidates) % max(1, math.ceil(count / 20)) == 0
-            ):
-                _show_loading_progress(progress_label, len(candidates), count)
-        return candidates
 
 
 def _parse_bound(value):
@@ -824,582 +466,8 @@ def _range_candle_count(range_start, range_end):
     return max(1, _bound_index(range_end) - _bound_index(range_start))
 
 
-AUTO_STAGE_ORDER = ("discovery", "validation", "stress", "walk_forward", "final")
-AUTO_STAGE_WEIGHTS = {
-    # Recent Discovery evidence is intentionally stronger than older regimes.
-    "discovery": 0.35,
-    "validation": 0.15,
-    "stress": 0.10,
-    "walk_forward": 0.30,
-    "final": 0.10,
-}
 AUTO_STATE_VERSION = 2
 LEGACY_AUTO_STATE_VERSIONS = {1, AUTO_STATE_VERSION}
-
-
-def _finite_number(value):
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    return number if math.isfinite(number) else None
-
-
-def _record_comparable_score(record):
-    normalized = _finite_number(record.get("time_normalized_score"))
-    return normalized if normalized is not None else _finite_number(
-        record.get("objective_score")
-    )
-
-
-def _surrogate_target(record):
-    """Return a range-comparable learning label, preferring funnel feedback."""
-    for key in ("learning_score", "robust_score", "time_normalized_score"):
-        value = _finite_number(record.get(key))
-        if value is not None:
-            return value
-    return _finite_number(record.get("objective_score"))
-
-
-def _score_percentiles(records, score_getter=_record_comparable_score):
-    """Return tie-aware [0, 1] percentiles without assuming score scale."""
-    ranked = sorted(
-        (
-            (float(score), record.get("candidate_id"))
-            for record in records
-            for score in [score_getter(record)]
-            if score is not None and record.get("candidate_id") is not None
-        ),
-        key=lambda item: item[0],
-    )
-    if not ranked:
-        return {}
-    if len(ranked) == 1:
-        return {ranked[0][1]: 1.0}
-    denominator = max(1, len(ranked) - 1)
-    output = {}
-    index = 0
-    while index < len(ranked):
-        end = index + 1
-        while end < len(ranked) and ranked[end][0] == ranked[index][0]:
-            end += 1
-        percentile = ((index + end - 1) / 2) / denominator
-        for _, candidate_id in ranked[index:end]:
-            output[candidate_id] = percentile
-        index = end
-    return output
-
-
-def _annotate_discovery_learning_scores(records):
-    """Use within-range ranks so cycles with different durations remain comparable."""
-    percentiles = _score_percentiles(records)
-    for record in records:
-        candidate_id = record.get("candidate_id")
-        if candidate_id in percentiles:
-            record["learning_score"] = percentiles[candidate_id]
-            record["learning_source"] = "normalized_discovery_rank"
-    return records
-
-
-def _apply_funnel_learning_scores(history, stage_records):
-    """Teach the surrogate which Discovery candidates survive robust later stages."""
-    if not stage_records or "discovery" not in stage_records:
-        return history
-    weights = AUTO_STAGE_WEIGHTS
-    stage_percentiles = {
-        stage: _score_percentiles(records)
-        for stage, records in stage_records.items()
-        if stage in weights and records
-    }
-    discovery_ids = set(stage_percentiles.get("discovery", {}))
-    targets = {}
-    for candidate_id in discovery_ids:
-        targets[candidate_id] = sum(
-            weights[stage] * percentiles.get(candidate_id, 0.0)
-            for stage, percentiles in stage_percentiles.items()
-        )
-    for record in history:
-        candidate_id = record.get("candidate_id")
-        if candidate_id in targets:
-            record["learning_score"] = targets[candidate_id]
-            record["learning_source"] = "robust_funnel_rank"
-    return history
-
-
-def _importance_target(record, target):
-    if target == "objective_score":
-        return _surrogate_target(record)
-    return _finite_number((record.get("result") or {}).get(target))
-
-
-def _learn_parameter_importance(records, parameter_keys, target="objective_score"):
-    """Estimate which parameters explain the largest share of result variance.
-
-    Exact values are grouped for small discrete spaces. Highly varied numeric
-    parameters are binned so locally refined off-grid values remain useful.
-    A small exploration floor prevents an early noisy estimate from permanently
-    freezing any parameter.
-    """
-    usable = []
-    for record in records:
-        value = _importance_target(record, target)
-        if value is not None:
-            usable.append((record["params"], value))
-    if len(usable) < 4:
-        equal = 1.0 / max(1, len(parameter_keys))
-        return {
-            key: {"weight": equal, "effect": 0.0, "groups": 0, "samples": len(usable)}
-            for key in parameter_keys
-        }
-
-    targets = [value for _, value in usable]
-    overall_mean = statistics.fmean(targets)
-    total_variance = statistics.fmean((value - overall_mean) ** 2 for value in targets)
-    raw = {}
-    for key in parameter_keys:
-        key_values = [params[key] for params, _ in usable]
-        unique = list(dict.fromkeys(key_values))
-        numeric = all(
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            for value in unique
-        )
-        groups = {}
-        if numeric and len(unique) > 12:
-            lower, upper = min(unique), max(unique)
-            width = (upper - lower) / 8 if upper > lower else 0
-            for (params, target_value) in usable:
-                group = 0 if width == 0 else min(7, int((params[key] - lower) / width))
-                groups.setdefault(group, []).append(target_value)
-        else:
-            for params, target_value in usable:
-                groups.setdefault((type(params[key]).__name__, params[key]), []).append(target_value)
-
-        between = sum(
-            len(values) * (statistics.fmean(values) - overall_mean) ** 2
-            for values in groups.values()
-        ) / len(usable)
-        effect = between / total_variance if total_variance > 0 else 0.0
-        confidence = min(1.0, len(usable) / max(20.0, len(groups) * 4.0))
-        raw[key] = {
-            "effect": max(0.0, min(1.0, effect)) * confidence,
-            "groups": len(groups),
-            "samples": len(usable),
-        }
-
-    # The floor reserves exploration for every variable while high-effect
-    # variables receive most local mutations and deterministic neighbor tests.
-    scores = {key: 0.05 + item["effect"] for key, item in raw.items()}
-    total = sum(scores.values()) or 1.0
-    return {
-        key: {**raw[key], "weight": scores[key] / total}
-        for key in parameter_keys
-    }
-
-
-def _smooth_parameter_importance(previous, learned, previous_weight=0.65):
-    if not previous:
-        return learned
-    blended = {}
-    for key, item in learned.items():
-        old = previous.get(key, {})
-        weight = previous_weight * float(old.get("weight", 0.0)) + (
-            1.0 - previous_weight
-        ) * float(item.get("weight", 0.0))
-        blended[key] = {**item, "weight": weight}
-    total = sum(item["weight"] for item in blended.values()) or 1.0
-    for item in blended.values():
-        item["weight"] /= total
-    return blended
-
-
-def _learn_mutation_guidance(records, parameter_keys, grid):
-    """Learn promising numeric directions and safe local step sizes in O(rows*keys)."""
-    usable = [
-        record for record in records
-        if _surrogate_target(record) is not None
-    ]
-    guidance = {}
-    if len(usable) < 8:
-        return guidance
-    targets = [_surrogate_target(record) for record in usable]
-    target_mean = statistics.fmean(targets)
-    target_variance = statistics.fmean(
-        (value - target_mean) ** 2 for value in targets
-    )
-    top_count = max(2, math.ceil(len(usable) * 0.20))
-    top_records = sorted(
-        usable, key=lambda record: _surrogate_target(record), reverse=True
-    )[:top_count]
-    for key in parameter_keys:
-        values = [record.get("params", {}).get(key) for record in usable]
-        if not values or not all(
-            isinstance(value, (int, float)) and not isinstance(value, bool)
-            for value in values
-        ):
-            continue
-        lower, upper = min(values), max(values)
-        if lower == upper or target_variance <= 1e-15:
-            continue
-        value_mean = statistics.fmean(values)
-        value_variance = statistics.fmean(
-            (value - value_mean) ** 2 for value in values
-        )
-        if value_variance <= 1e-15:
-            continue
-        covariance = statistics.fmean(
-            (value - value_mean) * (target - target_mean)
-            for value, target in zip(values, targets)
-        )
-        correlation = covariance / math.sqrt(value_variance * target_variance)
-        confidence = min(1.0, abs(correlation))
-        direction = 1 if correlation > 0.05 else -1 if correlation < -0.05 else 0
-        ordered_grid = sorted({
-            value for value in grid.get(key, ())
-            if isinstance(value, (int, float)) and not isinstance(value, bool)
-        })
-        hard_lower = ordered_grid[0] if ordered_grid else lower
-        hard_upper = ordered_grid[-1] if ordered_grid else upper
-        span = hard_upper - hard_lower
-        top_values = [record["params"][key] for record in top_records]
-        top_mean = statistics.fmean(top_values)
-        boundary_pressure = 0
-        if span > 0 and top_mean >= hard_upper - 0.10 * span:
-            boundary_pressure = 1
-        elif span > 0 and top_mean <= hard_lower + 0.10 * span:
-            boundary_pressure = -1
-        if boundary_pressure and (direction == 0 or confidence < 0.20):
-            direction = boundary_pressure
-        step_multiplier = 3 if confidence >= 0.65 else 2 if confidence >= 0.30 else 1
-        guidance[key] = {
-            "direction": direction,
-            "confidence": confidence,
-            "step_multiplier": step_multiplier,
-            "boundary_pressure": boundary_pressure,
-            "samples": len(usable),
-        }
-    return guidance
-
-
-class ExtraTreesSurrogate:
-    """Small dependency-free extremely-randomized tree ensemble.
-
-    It is intentionally limited to the numeric/boolean parameter spaces used by
-    this optimizer.  The ensemble predicts both a mean score and disagreement
-    between trees, which lets auto mode balance exploitation and exploration.
-    """
-
-    def __init__(
-        self, n_trees=32, max_depth=10, min_leaf=4, max_features=None, seed=42,
-    ):
-        self.n_trees = max(1, int(n_trees))
-        self.max_depth = max(1, int(max_depth))
-        self.min_leaf = max(1, int(min_leaf))
-        self.max_features = max_features
-        self.seed = int(seed)
-        self.trees = []
-
-    @staticmethod
-    def _leaf(targets, indices):
-        return ("leaf", statistics.fmean(targets[index] for index in indices))
-
-    def _build_tree(self, features, targets, indices, depth, randomizer):
-        if depth >= self.max_depth or len(indices) < self.min_leaf * 2:
-            return self._leaf(targets, indices)
-        node_targets = [targets[index] for index in indices]
-        if max(node_targets) - min(node_targets) <= 1e-12:
-            return self._leaf(targets, indices)
-
-        feature_count = len(features[0])
-        requested = self.max_features or max(
-            1, round(2.0 * math.sqrt(feature_count))
-        )
-        selected_features = randomizer.sample(
-            range(feature_count), min(feature_count, requested)
-        )
-        best = None
-        for feature_index in selected_features:
-            values = [features[index][feature_index] for index in indices]
-            lower, upper = min(values), max(values)
-            if lower == upper:
-                continue
-            # More randomized thresholds substantially improve split quality in
-            # wide, conditional parameter spaces while keeping the model cheap.
-            for _ in range(8):
-                threshold = randomizer.uniform(lower, upper)
-                left = []
-                right = []
-                for index in indices:
-                    target = (
-                        left
-                        if features[index][feature_index] <= threshold
-                        else right
-                    )
-                    target.append(index)
-                if len(left) < self.min_leaf or len(indices) - len(left) < self.min_leaf:
-                    continue
-                left_mean = statistics.fmean(targets[index] for index in left)
-                right_mean = statistics.fmean(targets[index] for index in right)
-                loss = sum((targets[index] - left_mean) ** 2 for index in left)
-                loss += sum((targets[index] - right_mean) ** 2 for index in right)
-                if best is None or loss < best[0]:
-                    best = (loss, feature_index, threshold, left, right)
-        if best is None:
-            return self._leaf(targets, indices)
-        _, feature_index, threshold, left, right = best
-        return (
-            "node", feature_index, threshold,
-            self._build_tree(features, targets, left, depth + 1, randomizer),
-            self._build_tree(features, targets, right, depth + 1, randomizer),
-        )
-
-    def fit(self, features, targets, progress_label=None):
-        if not features or len(features) != len(targets):
-            raise ValueError("surrogate training features and targets must be non-empty")
-        sample_count = len(features)
-        self.trees = []
-        for tree_index in range(self.n_trees):
-            randomizer = random.Random(self.seed + tree_index * 104729)
-            # Random subsampling gives useful model disagreement without letting
-            # duplicate bootstrap rows dominate small optimization histories.
-            subset_size = max(self.min_leaf * 2, round(sample_count * 0.80))
-            subset_size = min(sample_count, subset_size)
-            indices = randomizer.sample(range(sample_count), subset_size)
-            self.trees.append(
-                self._build_tree(features, targets, indices, 0, randomizer)
-            )
-            if progress_label and (
-                tree_index + 1 == self.n_trees
-                or (tree_index + 1) % max(1, math.ceil(self.n_trees / 20)) == 0
-            ):
-                _show_loading_progress(progress_label, tree_index + 1, self.n_trees)
-        return self
-
-    @staticmethod
-    def _predict_tree(tree, features):
-        while tree[0] == "node":
-            _, feature_index, threshold, left, right = tree
-            tree = left if features[feature_index] <= threshold else right
-        return tree[1]
-
-    def predict_mean_std(self, feature_rows, progress_label=None):
-        if not self.trees:
-            raise ValueError("surrogate must be fitted before prediction")
-        output = []
-        total = len(feature_rows)
-        for index, row in enumerate(feature_rows, start=1):
-            predictions = [self._predict_tree(tree, row) for tree in self.trees]
-            output.append((
-                statistics.fmean(predictions),
-                statistics.pstdev(predictions) if len(predictions) > 1 else 0.0,
-            ))
-            if progress_label and (
-                index == total or index % max(1, math.ceil(total / 20)) == 0
-            ):
-                _show_loading_progress(progress_label, index, total)
-        return output
-
-
-def _record_percentiles(records):
-    valid = [
-        record for record in records
-        if _record_comparable_score(record) is not None
-    ]
-    valid.sort(
-        key=lambda record: _record_comparable_score(record),
-        reverse=True,
-    )
-    denominator = max(1, len(valid) - 1)
-    return {
-        record["candidate_id"]: 1.0 - rank / denominator
-        for rank, record in enumerate(valid)
-    }
-
-
-def _combine_auto_stage_records(stage_records):
-    """Rank candidates across every completed, non-overlapping market regime."""
-    completed_stages = [stage for stage in AUTO_STAGE_ORDER if stage in stage_records]
-    if not completed_stages:
-        return []
-    final_stage = completed_stages[-1]
-    record_maps = {
-        stage: {record["candidate_id"]: record for record in records}
-        for stage, records in stage_records.items()
-    }
-    percentiles = {
-        stage: _record_percentiles(records) for stage, records in stage_records.items()
-    }
-    stage_weights = AUTO_STAGE_WEIGHTS
-    if "walk_forward" not in completed_stages:
-        # Preserve the ranking contract used by version-1 campaigns while an
-        # interrupted legacy cycle is being finished.
-        stage_weights = {
-            "discovery": 0.40, "validation": 0.30,
-            "stress": 0.20, "final": 0.10,
-        }
-    combined = []
-    for latest in stage_records[final_stage]:
-        candidate_id = latest["candidate_id"]
-        if any(candidate_id not in record_maps[stage] for stage in completed_stages):
-            continue
-        ranks = []
-        weighted_total = 0.0
-        weight_total = 0.0
-        stage_scores = {}
-        stage_metrics = {}
-        qualified = True
-        for stage in completed_stages:
-            record = record_maps[stage][candidate_id]
-            score = _finite_number(record.get("objective_score"))
-            normalized_score = _record_comparable_score(record)
-            percentile = percentiles[stage].get(candidate_id)
-            if score is None or normalized_score is None or percentile is None:
-                qualified = False
-                break
-            weight = stage_weights[stage]
-            ranks.append(percentile)
-            weighted_total += weight * percentile
-            weight_total += weight
-            stage_scores[stage] = score
-            stage_metrics[stage] = {
-                **record["result"],
-                "time_normalized_score": normalized_score,
-                "range_start": record.get("range_start"),
-                "range_end": record.get("range_end"),
-                "range_candles": record.get("range_candles"),
-                "duration_s": record.get("duration"),
-            }
-        if not qualified:
-            robust_score = -math.inf
-        else:
-            weighted_rank = weighted_total / weight_total
-            dispersion = statistics.pstdev(ranks) if len(ranks) > 1 else 0.0
-            transformed_quality = sum(
-                stage_weights[stage]
-                * math.copysign(
-                    math.log1p(abs(stage_metrics[stage]["time_normalized_score"])),
-                    stage_metrics[stage]["time_normalized_score"],
-                )
-                for stage in completed_stages
-            ) / weight_total
-            robust_score = (
-                50.0 * weighted_rank
-                + 20.0 * min(ranks)
-                - 10.0 * dispersion
-                + 10.0 * transformed_quality
-            )
-        combined_record = {
-            "candidate_id": candidate_id,
-            "params": latest["params"],
-            "robust_score": robust_score,
-            "recency_score": (
-                100.0 * percentiles.get("discovery", {}).get(candidate_id)
-                if percentiles.get("discovery", {}).get(candidate_id) is not None
-                else None
-            ),
-            "stage_consistency_score": (
-                100.0 * (1.0 - statistics.pstdev(ranks)) if ranks else None
-            ),
-            "worst_stage_percentile": min(ranks) if ranks else None,
-            "stage_scores": stage_scores,
-            "stage_metrics": stage_metrics,
-        }
-        combined_record.update(_auto_candidate_decision(combined_record))
-        combined.append(combined_record)
-    combined.sort(key=_auto_candidate_rank_key, reverse=True)
-    return combined
-
-
-def _auto_candidate_decision(record):
-    """Classify Auto evidence for research triage, never for live deployment."""
-    robust = _finite_number(record.get("robust_score"))
-    recency = _finite_number(record.get("recency_score"))
-    consistency = _finite_number(record.get("stage_consistency_score"))
-    worst = _finite_number(record.get("worst_stage_percentile"))
-    stages = record.get("stage_metrics", {}) or {}
-    final_metrics = stages.get("final", {}) or {}
-    from optimizer_evidence import directional_evidence
-    side_evidence = directional_evidence(final_metrics, record.get('effective_params') or record.get('params'))
-    final_return = _finite_number(final_metrics.get("total_profit_percent"))
-    final_drawdown = _finite_number(final_metrics.get("maximum_drawdown"))
-    liquidations = sum(
-        int((metrics or {}).get("liquidations", 0) or 0)
-        for metrics in stages.values()
-    )
-    reject_reasons = []
-    if robust is None:
-        reject_reasons.append("invalid robust score")
-    if liquidations > 0:
-        reject_reasons.append("liquidation detected")
-    if final_return is not None and final_return <= 0:
-        reject_reasons.append("non-positive final return")
-    if final_drawdown is not None and abs(final_drawdown) > 50:
-        reject_reasons.append("final drawdown above 50%")
-    if worst is not None and worst < 0.10:
-        reject_reasons.append("worst stage below 10th percentile")
-    if recency is not None and recency < 10:
-        reject_reasons.append("recent Discovery below 10th percentile")
-    complete = all(stage in stages for stage in AUTO_STAGE_ORDER)
-    if reject_reasons:
-        decision = "REJECT"
-        reasons = reject_reasons
-    elif (
-        complete
-        and worst is not None and worst >= 0.50
-        and recency is not None and recency >= 60
-        and consistency is not None and consistency >= 75
-        and final_return is not None and final_return > 0
-    ):
-        decision = "ACCEPT"
-        reasons = [
-            "stable across every Auto stage",
-            "strong recent Discovery rank",
-            "positive full-development return",
-            "eligible for independent Research validation",
-        ]
-    else:
-        decision = "WATCH"
-        reasons = []
-        if not complete:
-            reasons.append("Auto funnel is not complete")
-        if worst is None or worst < 0.50:
-            reasons.append("worst-stage rank is below ACCEPT threshold")
-        if recency is None or recency < 60:
-            reasons.append("recent Discovery rank is below ACCEPT threshold")
-        if consistency is None or consistency < 75:
-            reasons.append("cross-stage consistency is below ACCEPT threshold")
-        if final_return is None:
-            reasons.append("full-development return is not available")
-    side_reasons = []
-    for side, evidence in side_evidence.items():
-        if evidence['status'] == 'DISABLED':
-            continue
-        if evidence['status'] != 'SUFFICIENT':
-            side_reasons.append(f"{side.upper()} evidence {evidence['status'].lower()}: "
-                                f"{evidence['trades']} closed trades; requires {evidence['minimum_trades']} in Final")
-        elif not evidence['profitable']:
-            side_reasons.append(f"{side.upper()} has non-positive net profit in Final")
-    if side_reasons:
-        if decision == 'ACCEPT':
-            decision = 'WATCH'
-            reasons = [reason for reason in reasons if reason != 'eligible for independent Research validation']
-        reasons += side_reasons
-    return {
-        "decision": decision,
-        "directional_evidence": side_evidence,
-        "decision_scope": "Auto triage only; Research and sealed Holdout still required",
-        "decision_reasons": reasons,
-    }
-
-
-def _auto_candidate_rank_key(record):
-    """Prefer research-eligible evidence before raw score magnitude."""
-    decision_priority = {"ACCEPT": 2, "WATCH": 1, "REJECT": 0}
-    return (
-        decision_priority.get(record.get("decision"), 1),
-        _finite_number(record.get("robust_score")) or -math.inf,
-        _finite_number(record.get("recency_score")) or -math.inf,
-        _finite_number(record.get("stage_consistency_score")) or -math.inf,
-    )
 
 
 def _market_data_coverage(source=None):
@@ -1712,19 +780,6 @@ def _run_research_preflight(args, output_dir, resolved_config):
         report.to_dict(),
     )
     return manifest
-
-
-def _show_loading_progress(label, completed, total):
-    """Render one in-place startup progress line for potentially large histories."""
-    if total < 5:
-        return
-    percent = 100.0 * completed / max(1, total)
-    end = "\n" if completed >= total else ""
-    print(
-        f"\r{label}: {percent:6.2f}% ({completed:,}/{total:,})",
-        end=end,
-        flush=True,
-    )
 
 
 def _json_safe(value):
@@ -2676,6 +1731,7 @@ def _load_discovery_history(output_dir, keys):
         results_path = _resolve_csv_path(plan_path.with_name("discovery_results.csv"))
         candidates = _read_candidate_plan(plan_path)
         cycle_records = _read_auto_stage_records(results_path, candidates)
+        _gate_auto_records(cycle_records, saved_state, saved_state.get("config", {}).get("base_tune", {}))
         _annotate_discovery_learning_scores(cycle_records)
         if evidence_enabled:
             stages = {'discovery': cycle_records}
@@ -2690,6 +1746,8 @@ def _load_discovery_history(output_dir, keys):
             walk = _load_json(plan_path.with_name('walk_forward_summary.json'), {})
             if walk.get('records'):
                 stages['walk_forward'] = walk['records']
+            for stage_records in stages.values():
+                _gate_auto_records(stage_records, saved_state, saved_state.get('config', {}).get('base_tune', {}))
             _apply_funnel_learning_scores(cycle_records, stages)
             apply_profit_learning(cycle_records, stages, AUTO_STAGE_WEIGHTS)
         for record in cycle_records:
@@ -3423,7 +2481,7 @@ def _auto_stage_fieldnames(keys):
         "objective_score", "time_normalized_score", "score",
         *IMPORTANT_RESULT_COLUMNS, *metrics,
         "profit_per_trade", "range_candles", "duration_s", *keys, "error",
-        "monthly_returns_json", "required_trades",
+        "monthly_returns_json", "required_trades", "required_directional_trades",
     ]
 
 
@@ -3450,7 +2508,8 @@ def _upgrade_auto_stage_csv(path, keys):
 
 def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
                      params, result, duration, objective_score, error,
-                     time_normalized_score=None, range_candles=None, required_trades=None):
+                     time_normalized_score=None, range_candles=None, required_trades=None,
+                     required_directional_trades=None):
     row = {
         "candidate_id": candidate_id,
         "cycle": cycle,
@@ -3463,6 +2522,7 @@ def _auto_result_row(keys, candidate_id, cycle, stage, range_start, range_end,
         "range_candles": range_candles,
         "error": error,
         "required_trades": required_trades,
+        "required_directional_trades": required_directional_trades,
         "monthly_returns_json": (
             json.dumps(result.get("monthly_returns", []), separators=(",", ":"))
             if result and result.get("monthly_returns") is not None else ""
@@ -3611,6 +2671,23 @@ def duration_trade_requirement(reference_trades, stage_candles, reference_candle
     return max(1, math.ceil(reference_trades * stage_candles / max(1, reference_candles)))
 
 
+def _gate_auto_records(records, state, base_tune, range_start=None, range_end=None):
+    config = state.get('config', {})
+    strategy = config.get('strategy')
+    if strategy not in ('pulse', 'pulse_strategy:pulse_strategy'):
+        return records
+    final_range = config['ranges']['final']
+    final_candles = _range_candle_count(*final_range)
+    for record in records:
+        candles = record.get('range_candles')
+        if candles is None:
+            candles = _range_candle_count(
+                record.get('range_start', range_start), record.get('range_end', range_end))
+        minimum = required_directional_trades(strategy, candles, final_candles)
+        apply_directional_gate(record, minimum, base_tune)
+    return records
+
+
 def _run_auto_stage(
     args,
     cycle,
@@ -3629,6 +2706,7 @@ def _run_auto_stage(
     results_path = Path(cycle_dir) / f"{stage}_results.csv"
     _upgrade_auto_stage_csv(results_path, keys)
     existing = _read_auto_stage_records(results_path, candidates)
+    _gate_auto_records(existing, state, base_tune, range_start, range_end)
     records = {record["candidate_id"]: record for record in existing}
     pending = [
         candidate for candidate in candidates
@@ -3744,12 +2822,18 @@ def _run_auto_stage(
                         normalized_score = _time_normalized_score(
                             objective_score, range_candles
                         )
+                gated = dict(params=params, result=result, objective_score=objective_score,
+                             time_normalized_score=normalized_score, range_candles=range_candles, error=error)
+                _gate_auto_records([gated], state, base_tune)
+                objective_score = gated['objective_score']
+                normalized_score = gated['time_normalized_score']
                 writer.writerow(_auto_result_row(
                     keys, candidate_id, cycle, stage, range_start, range_end,
                     params, result, duration, objective_score, error,
                     time_normalized_score=normalized_score,
                     range_candles=range_candles,
                     required_trades=effective_min_trades,
+                    required_directional_trades=gated.get('required_directional_trades'),
                 ))
                 csv_file.flush()
                 records[candidate_id] = {
@@ -3763,6 +2847,7 @@ def _run_auto_stage(
                     "range_end": range_end,
                     "duration": duration,
                     "error": error,
+                    **{key: gated[key] for key in ("learning_score", "learning_source") if key in gated},
                 }
                 state["total_evaluations"] += 1
                 state["stage_completed"] = len(records)
@@ -3893,7 +2978,11 @@ def _aggregate_walk_forward_records(fold_records, candidates, stability_penalty)
             numeric = [value for value in values if value is not None]
             if not numeric:
                 result[metric] = None
-            elif metric in ("closed_trades", "wins", "losses", "liquidations"):
+            elif metric in ("closed_trades", "wins", "losses", "liquidations") or metric in {
+                f"{side}_{name}" for side in ("long", "short") for name in
+                ("trades", "wins", "losses", "breakeven_trades", "liquidations", "filled_entries",
+                 "sizing_risk_entries", "sizing_exposure_entries", "sizing_margin_entries", "sizing_cash_entries")
+            }:
                 result[metric] = sum(numeric)
             elif metric == "maximum_drawdown":
                 result[metric] = max(numeric, key=abs)
@@ -4564,8 +3653,7 @@ def _save_auto_workbook(
 def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled=True):
     output_dir = Path(output_dir)
     for record in hall:
-        if not record.get("decision") or 'directional_evidence' not in record:
-            record.update(_auto_candidate_decision(record))
+        record.update(_auto_candidate_decision(record))
     ranked_hall = sorted(hall, key=_auto_candidate_rank_key, reverse=True)
     _write_json(output_dir / "hall_of_fame.json", ranked_hall)
     _write_json(output_dir / "parameter_importance.json", importance)
@@ -4964,6 +4052,14 @@ def run_auto_optimization(args, grid=None):
         mutation_guidance = _load_json(
             output_dir / "mutation_guidance.json", {}
         ) or {}
+        if config.get('strategy') == 'pulse_strategy:pulse_strategy' and state.get('directional_selection_version') != 1:
+            importance, mutation_guidance = {}, {}
+            state['directional_selection_version'] = 1
+            state['directional_selection_migration'] = {
+                'cycle': state['cycle'], 'minimum_final_trades_per_enabled_side': 30,
+                'historical_metrics_preserved': True,
+                'reason': 'Requalify stored observations and rebuild learning with per-side coverage',
+            }
         state.update({
             "status": "running",
             "total_evaluations": _reconcile_auto_evaluations(output_dir, state),
@@ -5102,7 +4198,13 @@ def run_auto_optimization(args, grid=None):
             cycle = int(state["cycle"])
             cycle_dir = output_dir / "cycles" / f"cycle_{cycle:06d}"
             cycle_dir.mkdir(parents=True, exist_ok=True)
-            continuation_parent = hall[0] if hall else None
+            eligible_parents = hall
+            if config.get('strategy') == 'pulse_strategy:pulse_strategy':
+                eligible_parents = [record for record in hall if not apply_directional_gate(
+                    {'params': record.get('effective_params') or record['params'],
+                     'result': record.get('stage_metrics', {}).get('final', {})},
+                    30, base_tune).get('insufficient_directions')]
+            continuation_parent = eligible_parents[0] if eligible_parents else None
             continuation_base = (
                 continuation_parent.get("effective_params", continuation_parent["params"])
                 if continuation_parent
@@ -5143,7 +4245,7 @@ def run_auto_optimization(args, grid=None):
                         "params": {key: record["params"][key] for key in keys},
                         "result": record.get("stage_metrics", {}).get("final", {}),
                     }
-                    for record in hall
+                    for record in eligible_parents
                 ]
                 if not elite_records and seed_elites:
                     elite_records = [
@@ -7401,25 +6503,6 @@ def run_nested_walk_forward(args, grid=None):
     return report
 
 
-DEFAULT_EXECUTION_SCENARIOS = {
-    "base": {},
-    "adverse": {
-        "fee_rate": 0.0007,
-        "slippage_rate": 0.0002,
-        "funding_rate_per_8h": 0.0001,
-        "maintenance_margin_rate": 0.005,
-        "liquidation_fee_rate": 0.002,
-    },
-    "severe": {
-        "fee_rate": 0.0010,
-        "slippage_rate": 0.0005,
-        "funding_rate_per_8h": 0.0003,
-        "maintenance_margin_rate": 0.010,
-        "liquidation_fee_rate": 0.005,
-    },
-}
-
-
 def _load_execution_scenarios(args, adapter):
     source = getattr(args, "cost_scenarios", None)
     if source:
@@ -8183,550 +7266,6 @@ def run_optimization(args, grid=None):
         print(f"USE THIS PARAMETER FILE: {output_dir / 'best_params.json'}")
         print(f"Winner guide: {output_dir / 'best_params_manifest.json'}")
     return best
-
-
-class _OptimizerHelpFormatter(
-    argparse.ArgumentDefaultsHelpFormatter,
-    argparse.RawDescriptionHelpFormatter,
-):
-    """Keep command examples readable while still showing option defaults."""
-
-    def _get_help_string(self, action):
-        help_text = action.help
-        if (
-            "%(default)" not in help_text
-            and action.default not in (None, False, argparse.SUPPRESS)
-        ):
-            help_text += " (default: %(default)s)"
-        return help_text
-
-
-def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="optimize.py",
-        formatter_class=_OptimizerHelpFormatter,
-        description="""Search and validate robust strategy parameters.
-
-Choose one search path:
-  smart  Budgeted adaptive search (recommended for normal experiments).
-  grid   Every combination in a profile; usually only practical for tiny grids.
-  auto   Continuous model-guided development search with successive halving,
-         walk-forward validation, stress tests, and development-period finalists. Existing state is
-         resumed automatically. It runs until Ctrl+C unless --auto-cycles is set.
-
-Dates are inclusive at START and exclusive at END. A candle index may be used
-instead of a YYYY-MM-DD date.""",
-        epilog="""recommended examples:
-  Inspect profiles and estimate a run without starting it:
-    python optimize.py --list-profiles
-    python optimize.py --mode smart --profile focused --tests 5000 --dry-run
-
-  Start a fast adaptive search from ma_strategy_config.py:
-    python optimize.py --mode smart --profile focused --base-source config `
-      --tests 5000 -w 8 --output-dir outputs/optimize/focused_run
-
-  Train on one period and use the next period as inner validation:
-    python optimize.py --mode smart --profile signal --tests 10000 -w 8 --date-policy fixed `
-      --start 2023-01-01 --end 2024-01-01 `
-      --validation-start 2024-01-01 --validation-end 2025-04-01 `
-      --validation-top 30 --min-trades 50 --max-drawdown 35 `
-      --output-dir outputs/optimize/validated_signal
-
-  Refine an existing winner, then resume the same interrupted run:
-    python optimize.py --mode smart --profile exit --base-source best `
-      --base-params outputs/optimize/best_params.json --tests 5000 -w 8 `
-      --output-dir outputs/optimize/refine_exit
-    python optimize.py --mode smart --profile exit --base-source best `
-      --base-params outputs/optimize/best_params.json --tests 5000 -w 8 `
-      --output-dir outputs/optimize/refine_exit --resume
-
-  Run two auto cycles (omit --auto-cycles to run until Ctrl+C):
-    python optimize.py --auto --auto-cycles 2 -w 16 `
-      --output-dir outputs/optimize/auto_two_cycles
-
-  Resume the auto campaign with exactly the same settings (--resume is optional
-  when the checkpoint already exists):
-    python optimize.py --auto --auto-cycles 2 -w 16 `
-      --output-dir outputs/optimize/auto_two_cycles --resume
-
-Tips:
-  * Start with --dry-run. Full built-in grids can contain enormous combinations.
-  * Use a new --output-dir for a new experiment; use --resume only for the same run.
-  * Plain --auto detects and resumes a compatible checkpoint in --output-dir.
-  * A new campaign warm-starts from a compatible existing --base-params winner.
-  * --date-policy auto derives recent leak-resistant ranges from the latest candle.
-  * Use --date-policy fixed when explicit date flags must be preserved exactly.
-  * For trustworthy selection, use --research, freeze its recommendation, then peek once with --sealed-holdout.
-  * Raw score is preserved; cross-range comparisons use a candle-count annualized score.
-  * Auto learns from normalized Discovery ranks and later funnel outcomes, not raw scale.
-  * Candidate selection balances predicted quality, uncertainty, diversity, and randomness.
-  * Numeric mutations learn a preferred direction and local step inside the configured bounds.
-  * Auto mode defaults to profile=full; non-auto mode defaults to profile=focused.""",
-    )
-
-    search = parser.add_argument_group("search mode and parameter scope")
-    search.add_argument(
-        "--strategy", default="ma", metavar="NAME|MODULE:FUNCTION",
-        help=(
-            "strategy callable (built-in alias 'ma', or module:function; the callable "
-            "must accept tune/start/end and return result metrics)"
-        ),
-    )
-    search.add_argument(
-        "--param-grid", metavar="JSON|MODULE:ATTRIBUTE",
-        help=(
-            "external parameter grid or profile collection; otherwise the strategy's "
-            "param_grid/PARAMETER_PROFILES is discovered"
-        ),
-    )
-    search.add_argument(
-        "--auto", action="store_true",
-        help="use the resumable staged auto campaign (overrides --mode)",
-    )
-    search.add_argument(
-        "--mode", choices=("smart", "grid"), default="smart",
-        help="non-auto search algorithm",
-    )
-    search.add_argument(
-        "--tests", type=int, default=5000, metavar="N",
-        help="candidate budget in smart mode; ignored by grid and auto",
-    )
-    search.add_argument(
-        "--profile", default=None, metavar="NAME",
-        help="parameter profile name (default: full in auto mode, focused otherwise)",
-    )
-    search.add_argument(
-        "--base-source", "--params-source", choices=("config", "best", "file"), default="config",
-        help="fixed/base values come from the selected strategy config or --base-params JSON",
-    )
-    search.add_argument(
-        "--base-params", "--params-file", default=os.path.join("outputs", "optimize", "best_params.json"),
-        metavar="PATH", help="JSON read when --base-source is best or file",
-    )
-
-    execution = parser.add_argument_group("execution and reproducibility")
-    execution.add_argument(
-        "-w", "--workers", type=int, default=min(8, os.cpu_count() or 1), metavar="N",
-        help="parallel worker processes",
-    )
-    execution.add_argument(
-        "--batch-size", type=int, default=0, metavar="N",
-        help="candidates evaluated before adapting/checkpointing; 0 selects automatically",
-    )
-    execution.add_argument(
-        "--chunksize", type=int, default=0, metavar="N",
-        help="tasks sent to each worker at once; 0 selects automatically",
-    )
-    execution.add_argument(
-        "--elite-size", type=int, default=20, metavar="N",
-        help="top candidates that guide smart search",
-    )
-    execution.add_argument(
-        "--seed", type=int, default=42, metavar="N",
-        help="random seed for reproducible smart/auto candidate generation",
-    )
-    execution.add_argument(
-        "--data-file", metavar="PATH",
-        help=(
-            "fallback market CSV for audit/date discovery when a strategy does not "
-            "expose DATA_FILE; strategy-owned DATA_FILE is authoritative"
-        ),
-    )
-    execution.add_argument(
-        "--data-audit", choices=("strict", "warn", "off"), default="strict",
-        help="pre-run market-data gate; gaps/zero volume remain warnings in strict mode",
-    )
-    execution.add_argument(
-        "--refresh-auto-report", action="store_true",
-        help=(
-            "re-evaluate saved Auto finalists for monthly analytics and rebuild "
-            "the colored report/snapshot"
-        ),
-    )
-
-    ranges = parser.add_argument_group("standard search ranges and robustness")
-    ranges.add_argument(
-        "--date-policy", choices=("auto", "fixed"), default="auto",
-        help=(
-            "auto derives and freezes recent ranges from the latest candle; "
-            "fixed uses the explicit date options below"
-        ),
-    )
-    ranges.add_argument(
-        "--rolling-development-months", type=int,
-        default=DEFAULT_ROLLING_DEVELOPMENT_MONTHS, metavar="N",
-        help="recent history ending at the latest candle (default: 24 months)",
-    )
-    ranges.add_argument(
-        "--rolling-oos-months", type=int, default=DEFAULT_ROLLING_OOS_MONTHS,
-        metavar="N", help="reporting-only OOS reservation before the embargo",
-    )
-    ranges.add_argument(
-        "--rolling-embargo-months", type=int,
-        default=DEFAULT_ROLLING_EMBARGO_MONTHS, metavar="N",
-        help="unused calendar months between research OOS and sealed holdout",
-    )
-    ranges.add_argument(
-        "--rolling-holdout-months", type=int,
-        default=DEFAULT_ROLLING_HOLDOUT_MONTHS, metavar="N",
-        help="latest calendar months reserved as the sealed holdout",
-    )
-    ranges.add_argument(
-        "--rolling-stress-months", type=int,
-        default=DEFAULT_ROLLING_STRESS_MONTHS, metavar="N",
-        help="small historical stability slice immediately before the recent window",
-    )
-    ranges.add_argument(
-        "--rolling-validation-months", type=int,
-        default=DEFAULT_ROLLING_VALIDATION_MONTHS, metavar="N",
-        help="rolling Validation duration after Stress and before Discovery",
-    )
-    ranges.add_argument(
-        "--start", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
-        help="inclusive training start",
-    )
-    ranges.add_argument(
-        "--end", default=DEFAULT_DEVELOPMENT_END, metavar="DATE|INDEX",
-        help="exclusive search end; later dates are reserved for walk-forward/holdout",
-    )
-    ranges.add_argument(
-        "--validation-start", metavar="DATE|INDEX",
-        help="inclusive inner-validation start; requires --validation-end",
-    )
-    ranges.add_argument(
-        "--validation-end", metavar="DATE|INDEX",
-        help="exclusive inner-validation end; requires --validation-start",
-    )
-    ranges.add_argument(
-        "--validation-top", type=int, default=20, metavar="N",
-        help="training finalists re-tested on inner validation (used for selection)",
-    )
-    ranges.add_argument(
-        "--overfit-penalty", type=float, default=0.25, metavar="FLOAT",
-        help="penalty when training score exceeds validation score",
-    )
-    ranges.add_argument(
-        "--min-trades", type=int, default=0, metavar="N",
-        help="disqualify candidates with fewer closed trades (0 disables)",
-    )
-    ranges.add_argument(
-        "--max-drawdown", type=float, metavar="PERCENT",
-        help="disqualify candidates above this absolute drawdown percentage",
-    )
-
-    output = parser.add_argument_group("output, checkpoints, and planning")
-    output.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, metavar="PATH",
-                        help="directory for reports; CLI default: outputs/<strategy>/optimize (research/holdout for those modes)")
-    output.add_argument("--resume", nargs="?", const=True, default=False, metavar="FOLDER",
-                        help="resume with saved settings; optionally give a campaign path or unique folder name")
-    output.add_argument("--log-every", type=int, default=10, metavar="N",
-                        help="print progress every N completed tests (0 is silent)")
-    output.add_argument("--top-n", type=int, default=20, metavar="N",
-                        help="ranked candidates saved to top_results.json")
-    output.add_argument(
-        "--excel-top", type=int, default=5000,
-        metavar="N", help="top candidates included in XLSX (0 disables XLSX)",
-    )
-    output.add_argument("--list-profiles", action="store_true",
-                        help="show profile parameter counts/grid sizes and exit")
-    output.add_argument("--dry-run", action="store_true",
-                        help="print the resolved plan without running backtests")
-
-    research = parser.add_argument_group(
-        "nested walk-forward research (reporting-only OOS validation)"
-    )
-    research.add_argument(
-        "--research", action="store_true",
-        help="run nested chronological walk-forward instead of a normal/auto search",
-    )
-    research.add_argument(
-        "--wf-start", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
-        help="earliest nested walk-forward training candle",
-    )
-    research.add_argument(
-        "--wf-end", default=DEFAULT_RESEARCH_END, metavar="DATE|INDEX|latest",
-        help=(
-            "exclusive development end, not the dataset end; later candles "
-            "through --holdout-end stay sealed"
-        ),
-    )
-    research.add_argument("--wf-train-months", type=float, default=24.0, metavar="N")
-    research.add_argument("--wf-validation-months", type=float, default=3.0, metavar="N")
-    research.add_argument("--wf-test-months", type=float, default=2.0, metavar="N")
-    research.add_argument("--wf-step-months", type=float, default=2.0, metavar="N")
-    research.add_argument(
-        "--wf-rolling", action="store_true",
-        help="use a fixed rolling train window instead of anchored expanding history",
-    )
-    research.add_argument(
-        "--wf-purge-candles", type=int, default=0, metavar="N",
-        help="unused candles between train/validation/test boundaries",
-    )
-    research.add_argument(
-        "--research-tests", type=int, default=500, metavar="N",
-        help="fixed candidate pool evaluated independently inside every fold",
-    )
-    research.add_argument(
-        "--research-seeds", metavar="JSON",
-        help=(
-            "optional Auto snapshot/top-results JSON; compatible winners are "
-            "inserted before deterministic Halton candidates"
-        ),
-    )
-    research.add_argument(
-        "--allow-research-seed-overlap", action="store_true",
-        help=(
-            "allow unverifiable/overlapping seed history for diagnostics; the "
-            "research_seed_provenance gate remains false"
-        ),
-    )
-    research.add_argument(
-        "--research-validation-top", type=int, default=50, metavar="N",
-        help="training finalists evaluated on each inner validation window",
-    )
-    research.add_argument(
-        "--research-pbo-candidates", type=int, default=20, metavar="N",
-        help="fixed candidates retained across validation blocks for CSCV/PBO",
-    )
-    research.add_argument("--bootstrap-samples", type=int, default=1000, metavar="N")
-    research.add_argument("--bootstrap-confidence", type=float, default=0.95, metavar="RATIO")
-    research.add_argument("--min-oos-folds", type=int, default=4, metavar="N")
-    research.add_argument(
-        "--min-fold-trades", type=int, default=5, metavar="N",
-        help="minimum closed trades required in every train/validation/OOS evaluation",
-    )
-    research.add_argument(
-        "--min-total-oos-trades", type=int, default=30, metavar="N",
-        help="minimum closed trades across the stitched reporting-only OOS folds",
-    )
-    research.add_argument(
-        "--max-oos-liquidations", type=int, default=0, metavar="N",
-        help="maximum liquidations allowed across all reporting-only OOS folds",
-    )
-    research.add_argument(
-        "--research-max-drawdown", type=float, default=40.0, metavar="PERCENT",
-        help="per-window drawdown gate used during nested selection",
-    )
-    research.add_argument(
-        "--max-oos-drawdown", type=float, default=40.0, metavar="PERCENT",
-        help="maximum drawdown allowed on the stitched OOS return series",
-    )
-    research.add_argument("--min-positive-fold-ratio", type=float, default=0.60, metavar="RATIO")
-    research.add_argument("--min-dsr-probability", type=float, default=0.95, metavar="RATIO")
-    research.add_argument("--max-pbo", type=float, default=0.20, metavar="RATIO")
-    research.add_argument(
-        "--min-parameter-consensus", type=float, default=0.50, metavar="RATIO",
-        help="minimum mean modal frequency across mutable parameters and fold winners",
-    )
-    research.add_argument(
-        "--max-parameter-spread", type=float, default=0.35, metavar="RATIO",
-        help="maximum mean normalized grid spread across mutable parameters",
-    )
-    research.add_argument(
-        "--require-positive-ci", action="store_true",
-        help="require the bootstrap lower bound of periodic OOS return to exceed zero",
-    )
-    research.add_argument(
-        "--allow-nonpositive-ci", dest="require_positive_ci", action="store_false",
-        help="diagnostic override: do not reject a result whose bootstrap lower bound is non-positive",
-    )
-    research.set_defaults(require_positive_ci=True)
-    research.add_argument(
-        "--sealed-holdout", action="store_true",
-        help="evaluate frozen parameters once on the sealed range and record its consumption",
-    )
-    research.add_argument("--holdout-params", metavar="PATH")
-    research.add_argument(
-        "--holdout-start", default=DEFAULT_HOLDOUT_START, metavar="DATE|INDEX",
-        help="inclusive sealed range start; by default this is also --wf-end",
-    )
-    research.add_argument(
-        "--holdout-end", default="latest", metavar="DATE|INDEX|latest",
-        help="exclusive sealed range end; latest means one interval after the final candle",
-    )
-    research.add_argument(
-        "--holdout-min-trades", type=int, default=20, metavar="N",
-        help="minimum closed trades required in every sealed cost scenario",
-    )
-    research.add_argument(
-        "--holdout-max-drawdown", type=float, default=30.0, metavar="PERCENT",
-        help="maximum absolute drawdown allowed in every sealed cost scenario",
-    )
-    research.add_argument(
-        "--cost-scenarios", metavar="JSON",
-        help="scenario-name to strategy-tune overrides; MA gets base/adverse/severe defaults",
-    )
-    research.add_argument(
-        "--allow-holdout-repeat", action="store_true",
-        help="allow a repeat but mark it contaminated and never call it unseen",
-    )
-
-    auto = parser.add_argument_group("auto campaign (used only with --auto)")
-    auto.add_argument(
-        "--auto-tests", type=int, default=2000,
-        metavar="N",
-        help="new discovery candidates generated in every auto cycle",
-    )
-    auto.add_argument(
-        "--auto-validation-top", type=int, default=500,
-        metavar="N",
-        help="discovery finalists sent to the independent validation range",
-    )
-    auto.add_argument(
-        "--auto-stress-top", type=int, default=250,
-        metavar="N",
-        help="validation finalists sent to the older stress range",
-    )
-    auto.add_argument(
-        "--auto-final-top", type=int, default=100,
-        metavar="N",
-        help="stress finalists tested on the complete development range",
-    )
-    auto.add_argument(
-        "--auto-hall-size", type=int, default=100,
-        metavar="N",
-        help="maximum robust winners retained across all auto cycles",
-    )
-    auto.add_argument(
-        "--auto-cycles", "--cycles", type=int, default=0,
-        metavar="N",
-        help="stop after N completed cycles (0 runs until Ctrl+C)",
-    )
-    auto.add_argument(
-        "--auto-discovery-start", default=DEFAULT_AUTO_DISCOVERY_START,
-        metavar="DATE|INDEX",
-        help="start of the recent discovery range",
-    )
-    auto.add_argument(
-        "--auto-validation-start", default=DEFAULT_AUTO_VALIDATION_START,
-        metavar="DATE|INDEX",
-        help="start of validation; it ends at auto-discovery-start",
-    )
-    auto.add_argument(
-        "--auto-stress-start", default=DEFAULT_DEVELOPMENT_START,
-        metavar="DATE|INDEX",
-        help="inclusive start of the older stability-only stress slice",
-    )
-    auto.add_argument(
-        "--auto-stress-end", default=None, metavar="DATE|INDEX",
-        help=(
-            "exclusive end of the older stability slice; in fixed mode defaults "
-            "to --auto-validation-start"
-        ),
-    )
-    auto.add_argument(
-        "--auto-end", default=DEFAULT_DEVELOPMENT_END,
-        metavar="DATE|INDEX|latest",
-        help=(
-            "exclusive candidate-search end; auto policy sets this immediately "
-            "after the latest candle"
-        ),
-    )
-    auto.add_argument(
-        "--auto-importance-target",
-        choices=("objective_score", "total_profit", "total_profit_percent"),
-        default="objective_score",
-        help="metric used to learn which parameters deserve more mutations",
-    )
-    auto.add_argument(
-        "--auto-advanced-min-candidates", type=int, default=64, metavar="N",
-        help="minimum cycle size that activates halving/surrogate/walk-forward",
-    )
-    auto.add_argument(
-        "--auto-halving-rungs", type=int, default=2, metavar="N",
-        help="cheap expanding Discovery rungs before full Discovery (0 disables)",
-    )
-    auto.add_argument(
-        "--auto-halving-keep", type=float, default=0.25, metavar="RATIO",
-        help="fraction promoted after each cheap Discovery rung",
-    )
-    auto.add_argument(
-        "--auto-surrogate-min-samples", type=int, default=64, metavar="N",
-        help="historical full-Discovery samples required before Extra Trees is used",
-    )
-    auto.add_argument(
-        "--auto-surrogate-pool", type=int, default=8, metavar="MULTIPLIER",
-        help="unevaluated quality/uncertainty/diversity pool relative to --auto-tests",
-    )
-    auto.add_argument(
-        "--auto-surrogate-trees", type=int, default=64, metavar="N",
-        help="trees learning normalized ranks and robust funnel outcomes",
-    )
-    auto.add_argument(
-        "--auto-surrogate-max-samples", type=int, default=10_000, metavar="N",
-        help="representative historical samples retained for tree training",
-    )
-    search.add_argument('--seed-campaign', metavar='FOLDER',
-                        help='seed a NEW Auto campaign with prior finalists and representative history; incompatible scores are reevaluated')
-    auto.add_argument(
-        '--auto-learning-target', choices=('rank', 'profit-evidence'), default='rank',
-        help='profit-evidence learns net return, monthly downside and failed candidates; persists across resume',
-    )
-    auto.add_argument('--auto-trade-count-policy', choices=('fixed', 'duration'), default='fixed',
-                      help='duration scales the trade gate to each stage relative to Discovery')
-    auto.add_argument(
-        "--auto-walk-forward-folds", type=int, default=3, metavar="N",
-        help="disjoint pre-Discovery time folds (0 disables; minimum enabled value is 2)",
-    )
-    auto.add_argument(
-        "--auto-walk-forward-top", type=int, default=150, metavar="N",
-        help="Stress finalists evaluated on every walk-forward fold",
-    )
-    auto.add_argument(
-        "--auto-walk-forward-stability-penalty", type=float, default=0.15,
-        metavar="FLOAT",
-        help="penalty multiplier applied to score variation across folds",
-    )
-    auto.add_argument(
-        "--staged", action="store_true",
-        help="optimize Signal, Exit, Risk, RSI, and Scale in consecutive phases",
-    )
-    auto.add_argument(
-        "--stage-cycles", type=int, default=10, metavar="N",
-        help="completed auto cycles allocated to each staged parameter phase",
-    )
-    auto.add_argument(
-        "--snapshot-cycles", type=int, default=50, metavar="N",
-        help="completed auto cycles between ranked Top-N snapshots (default: 50)",
-    )
-    auto.add_argument(
-        "--snapshot-top", type=int, default=100, metavar="N",
-        help="ranked candidates and standalone parameter JSON files per snapshot",
-    )
-    auto.add_argument(
-        "--random-audit-tests", type=int, default=500, metavar="N",
-        help="total random-window backtests after every staged snapshot",
-    )
-    auto.add_argument(
-        "--random-audit-top", type=int, default=10, metavar="N",
-        help="staged finalists compared on identical random windows",
-    )
-    auto.add_argument(
-        "--random-audit-earliest", default=DEFAULT_DEVELOPMENT_START, metavar="DATE|INDEX",
-        help="earliest allowed random-window candle",
-    )
-    auto.add_argument(
-        "--random-audit-recent-start", default=DEFAULT_AUTO_DISCOVERY_START, metavar="DATE|INDEX",
-        help="start boundary used for the recent-window quota",
-    )
-    auto.add_argument(
-        "--random-audit-recent-ratio", type=float, default=0.70, metavar="RATIO",
-        help="fraction of random windows starting on recent data",
-    )
-    auto.add_argument(
-        "--random-audit-min-months", type=int, default=6, metavar="N",
-        help="minimum random audit window duration",
-    )
-    auto.add_argument(
-        "--random-audit-max-months", type=int, default=12, metavar="N",
-        help="maximum random audit window duration",
-    )
-    parser.add_argument('--directional', action='store_true',
-                        help='MA: optimize long/short separately; use side phases with --staged')
-    parser.add_argument('--autopilot', action='store_true',
-                        help='MA: start staged directional Auto with automatic snapshot and audit workbooks')
-    add_runtime_arguments(parser, data_file=False)
-    return parser
 
 
 @runtime_session

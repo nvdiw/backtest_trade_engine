@@ -618,10 +618,14 @@ class TradeEngine:
         equity = account.balance + account.save_money
         if min(fill, equity, account.balance, account.tactical_balance) <= 0:
             return None, None, 'insufficient_balance'
-        qty = min(equity * risk_per_trade / stop_distance,
-                  equity * max_gross_exposure / fill,
-                  equity * trade_amount_percent * leverage / fill,
-                  account.balance / (fill * (1 / leverage + 2 * self.fee_rate)))
+        from risk_sizing import position_size_limits
+        limits = position_size_limits(
+            equity=equity, balance=account.balance, fill=fill, stop_distance=stop_distance,
+            risk_per_trade=risk_per_trade, max_gross_exposure=max_gross_exposure,
+            trade_amount_percent=trade_amount_percent, leverage=leverage, fee_rate=self.fee_rate)
+        qty = min(limits.values())
+        self.last_risk_sizing = dict(limits=limits, binding_limit=min(limits, key=limits.get),
+                                     account_equity=equity)
         if quantity_step:
             from decimal import Decimal, ROUND_FLOOR
             step = Decimal(str(quantity_step))
