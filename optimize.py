@@ -1317,6 +1317,8 @@ def _auto_candidate_decision(record):
     worst = _finite_number(record.get("worst_stage_percentile"))
     stages = record.get("stage_metrics", {}) or {}
     final_metrics = stages.get("final", {}) or {}
+    from optimizer_evidence import directional_evidence
+    side_evidence = directional_evidence(final_metrics, record.get('effective_params') or record.get('params'))
     final_return = _finite_number(final_metrics.get("total_profit_percent"))
     final_drawdown = _finite_number(final_metrics.get("maximum_drawdown"))
     liquidations = sum(
@@ -1367,8 +1369,23 @@ def _auto_candidate_decision(record):
             reasons.append("cross-stage consistency is below ACCEPT threshold")
         if final_return is None:
             reasons.append("full-development return is not available")
+    side_reasons = []
+    for side, evidence in side_evidence.items():
+        if evidence['status'] == 'DISABLED':
+            continue
+        if evidence['status'] != 'SUFFICIENT':
+            side_reasons.append(f"{side.upper()} evidence {evidence['status'].lower()}: "
+                                f"{evidence['trades']} closed trades; requires {evidence['minimum_trades']} in Final")
+        elif not evidence['profitable']:
+            side_reasons.append(f"{side.upper()} has non-positive net profit in Final")
+    if side_reasons:
+        if decision == 'ACCEPT':
+            decision = 'WATCH'
+            reasons = [reason for reason in reasons if reason != 'eligible for independent Research validation']
+        reasons += side_reasons
     return {
         "decision": decision,
+        "directional_evidence": side_evidence,
         "decision_scope": "Auto triage only; Research and sealed Holdout still required",
         "decision_reasons": reasons,
     }
@@ -4108,6 +4125,8 @@ def _flatten_hall_record(record, keys, rank, state=None):
                 continue
             row[f"{stage}_{metric}"] = metrics.get(metric)
     effective_params = record.get('effective_params') or record.get('params') or {}
+    from optimizer_evidence import directional_evidence, directional_evidence_columns
+    row.update(directional_evidence_columns(directional_evidence(final_metrics, effective_params)))
     row.update({key: effective_params.get(key) for key in keys})
     for key in ('enable_long', 'enable_short'):
         if key in effective_params:
@@ -4136,6 +4155,8 @@ def _candidate_summary(record, rank, parameter_file, state=None):
     summary["monthly_performance"] = _monthly_performance_summary(
         final_metrics.get("monthly_returns")
     )
+    from optimizer_evidence import directional_evidence
+    summary['directional_evidence'] = directional_evidence(final_metrics, summary['effective_params'])
     if state is not None:
         summary["time_summary"] = _range_reporting_summary(state)
     return summary
@@ -4543,7 +4564,7 @@ def _save_auto_workbook(
 def _write_auto_reports(output_dir, hall, importance, state, keys, excel_enabled=True):
     output_dir = Path(output_dir)
     for record in hall:
-        if not record.get("decision"):
+        if not record.get("decision") or 'directional_evidence' not in record:
             record.update(_auto_candidate_decision(record))
     ranked_hall = sorted(hall, key=_auto_candidate_rank_key, reverse=True)
     _write_json(output_dir / "hall_of_fame.json", ranked_hall)

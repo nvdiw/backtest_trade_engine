@@ -70,12 +70,18 @@ def format_backtest_log(result, start, end):
         lines.insert(-1, f"Partial months included: {result['monthly_partial_months']}")
     if result.get('monthly_target_unknown_months'):
         lines.insert(-1, f"Months with unavailable return: {result['monthly_target_unknown_months']}")
+    for side, evidence in result.get('directional_evidence', {}).items():
+        lines.insert(-1, f"{side.upper()} sample evidence: {evidence['status']} | "
+                     f"closed trades {evidence['trades']} / minimum {evidence['minimum_trades']}")
     return '\n'.join(lines) + '\n'
 
 
 def publish_backtest(engine, result, parameters, start, end, first_balance, monthly, output_file=None):
     """Both account adapters call this; strategy code does not serialize reports."""
     result.update(engine.market_metadata)
+    from optimizer_evidence import directional_evidence, directional_evidence_columns
+    result['directional_evidence'] = directional_evidence(result, parameters)
+    result.update(directional_evidence_columns(result['directional_evidence']))
     result['report_schema_version'] = 1
     result['backtest_start'] = str(start)
     result['backtest_end_exclusive'] = str(end)
@@ -114,6 +120,8 @@ def publish_backtest(engine, result, parameters, start, end, first_balance, mont
         values = {key: value for key, value in result.items() if key.startswith(prefix + '_') or '_' + prefix + '_' in key}
         if values:
             sections[prefix.upper()] = values
+    for side in ('long', 'short'):
+        sections[side.title()].update(result['directional_evidence'][side])
     if result.get('diagnostics'):
         sections['Signal diagnostics'] = result['diagnostics']
     sections['Trades']['Realized profit / trade'] = (result.get('realized_profit', 0) / result['closed_trades']

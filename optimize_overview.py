@@ -8,7 +8,7 @@ OVERVIEW_COLUMNS = ('rank', 'decision', 'robust_score', 'final_total_profit_perc
                     'final_liquidations', 'enable_long', 'final_long_trades',
                     'final_long_profit', 'final_long_win_rate',
                     'enable_short', 'final_short_trades', 'final_short_profit',
-                    'final_short_win_rate', 'parameter_file')
+                    'final_short_win_rate', 'long_evidence_status', 'short_evidence_status', 'parameter_file')
 
 
 def comparison_rows(rows, keys):
@@ -35,7 +35,7 @@ def write_overview(output_dir, rows, keys, state):
         lines += [f"**Current leader: rank 1 — {rows[0].get('decision', 'WATCH')}**. "
                   'Parameters: [best_params.json](best_params.json).', '',
                   'Scores use campaign selection data; see decision reasons before choosing a candidate.', '',
-                  '| Rank | Decision | Robust score | Profit % | Drawdown % | Trades | Win % | Liquidations | Long enabled | Long trades | Long profit | Long win % | Short enabled | Short trades | Short profit | Short win % | Parameters |',
+                  '| Rank | Decision | Robust score | Profit % | Drawdown % | Trades | Win % | Liquidations | Long enabled | Long trades | Long profit | Long win % | Short enabled | Short trades | Short profit | Short win % | Long evidence | Short evidence | Parameters |',
                   '|' + '|'.join(['---'] * len(OVERVIEW_COLUMNS)) + '|']
         for row in rows[:5]:
             lines.append('| ' + ' | '.join(value(row.get(key)) for key in OVERVIEW_COLUMNS) + ' |')
@@ -74,5 +74,6 @@ def print_leaders(rows, output_dir):
             enabled = row.get('enable_' + side)
             status = 'disabled' if enabled is False else 'enabled' if enabled is True else 'unspecified'
             print(f"    {side.upper()} ({status}) | trades {metric('final_' + side + '_trades')} | "
-                  f"profit {metric('final_' + side + '_profit')} | win {metric('final_' + side + '_win_rate')}%")
+                  f"profit {metric('final_' + side + '_profit')} | win {metric('final_' + side + '_win_rate')}% | "
+                  f"evidence {row.get(side + '_evidence_status', 'MISSING')}")
     print(f'  Parameters + comparison: {Path(output_dir) / "OVERVIEW.md"}\n')

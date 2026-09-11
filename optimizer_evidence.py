@@ -3,6 +3,41 @@ import math
 import statistics
 
 
+DIRECTIONAL_MIN_TRADES = 30
+
+
+def directional_evidence(result, parameters=None):
+    """Per-side sample coverage, not a probability or independent validation.
+
+    Use one evaluation window only, never sum overlapping funnel trade counts.
+    Disabled directions do not need evidence.
+    """
+    parameters = parameters or {}
+    evidence = {}
+    for side in ('long', 'short'):
+        default_enabled = (result.get('directional_evidence', {}).get(side, {}).get('status') != 'DISABLED')
+        enabled = parameters.get('enable_' + side, parameters.get(side + '_enabled', default_enabled)) is not False
+        count = finite(result.get(side + '_trades'), None)
+        profit = finite(result.get(side + '_profit'), None)
+        if not enabled:
+            status = 'DISABLED'
+        elif count is None or count < 0 or profit is None:
+            status = 'MISSING'
+        elif count < DIRECTIONAL_MIN_TRADES:
+            status = 'INSUFFICIENT'
+        else:
+            status = 'SUFFICIENT'
+        evidence[side] = dict(status=status, trades=count, minimum_trades=DIRECTIONAL_MIN_TRADES,
+                              net_profit=profit, profitable=profit is not None and profit > 0,
+                              liquidations=result.get(side + '_liquidations'))
+    return evidence
+
+
+def directional_evidence_columns(evidence):
+    return {f'{side}_evidence_{key}': values[key] for side, values in evidence.items()
+            for key in ('status', 'trades', 'minimum_trades', 'net_profit', 'profitable')}
+
+
 def finite(value, default=0.0):
     try:
         number = float(value)

@@ -218,20 +218,27 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
     month,month_equity,monthly_returns = str(times[0])[:7],cfg.balance,[]
     monthly_return_months = [month]
     trade_id = 0
+    stop_context = {}
     def emit(kind,i,**details):
+        reason_text = details.pop('reason_text', None)
         if trace:
             events.append(dict(kind=kind,bar=int(market['start']+i),**details))
         if render_chart and kind in ('entry', 'exit'):
             action = 'open' if kind == 'entry' else 'close'
             prefix = f'{details["side"]}_{action}'
             chart_state[prefix + '_points'].append((i, details['price']))
-            chart_state[prefix + '_reasons'][i] = json.dumps(details, indent=2)
+            chart_state[prefix + '_reasons'][i] = reason_text or json.dumps(details, indent=2)
             stop_line[i] = details['stop']
-    def exit_position(i,reference,reason,timestamp):
+    def exit_position(i,reference,reason,timestamp,context=None):
         nonlocal position
         result = engine.close_at_reference(position,account,reference,timestamp,reason=reason)
+        text = None
+        if render_chart:
+            from pulse_reason_text import exit_reason
+            text = exit_reason(position,result,reason,stop=stop,initial_risk=initial_risk,
+                               reference=reference,context=context or stop_context)
         emit('exit',i,side=position.side,price=result['close_price'],reason=reason,
-             reference=float(reference),stop=float(stop),fees=result['total_fee'])
+             reference=float(reference),stop=float(stop),fees=result['total_fee'],reason_text=text)
         diagnostics[reason] += 1
         next_signal_index[position.side] = i + side_value(cfg,position.side,'cooldown_bars')
         position = None
@@ -249,8 +256,13 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
             check = engine.check_liquidation_long if position.side == 'long' else engine.check_liquidation_short
             liquidation = check(i, opens, times, position, account, reason_to_close='liquidation_exit')
             if liquidation.get('liquidated'):
+                text = None
+                if render_chart:
+                    from pulse_reason_text import exit_reason
+                    text = exit_reason(position,liquidation,'liquidation_exit',stop=stop,
+                                       initial_risk=initial_risk)
                 emit('exit', i, side=position.side, price=liquidation['close_price'],
-                     reason='liquidation_exit', stop=float(stop), fees=liquidation['total_fee'])
+                     reason='liquidation_exit', stop=float(stop), fees=liquidation['total_fee'],reason_text=text)
                 diagnostics['liquidation_exit'] += 1
                 next_signal_index[position.side] = i + side_value(cfg,position.side,'cooldown_bars')
                 position, pending, exited = None, None, True
@@ -268,7 +280,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
                 exit_position(i,opens[i],stop_reason,times[i])
                 exited = True
         if pending and pending['kind'] == 'exit' and position:
-            exit_position(i,opens[i],pending.get('reason', 'time_exit'),times[i])
+            exit_position(i,opens[i],pending.get('reason', 'time_exit'),times[i],pending.get('chart_context'))
             exited = True
         elif pending and pending['kind'] == 'entry' and position is None:
             side = pending['side']
@@ -294,10 +306,15 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
             else:
                 initial_risk, entry_boundary, stop_reason = pending['distance'], pending['boundary'], 'stop_exit'
                 best_close_gain = 0.0
+                stop_context = {}
                 armed[side] = False
+                text = None
+                if render_chart:
+                    from pulse_reason_text import entry_reason
+                    text = entry_reason(cfg,position,pending['chart_signal'],balance=account.balance,fill_open=opens[i])
                 emit('entry',i,side=side,price=position.entry_price,stop=stop,signal_atr=pending['atr'],
                      quantity=position.position_size,margin=position.margin,leverage=position.leverage,
-                     signal_bar=pending['signal_bar'])
+                     signal_bar=pending['signal_bar'],reason_text=text)
         pending = None
         if position:
             reference = engine.protective_stop_reference(position.side,stop,opens[i],high[i],low[i])
@@ -335,12 +352,19 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
                     (1 - direction * cfg.fee_rate) * (1 - direction * cfg.slippage_rate))
                 if direction * (proposed - stop) > 0 and direction * (close[i] - proposed) > 0:
                     stop, stop_reason = proposed, 'breakeven_stop_exit'
+                    if render_chart:
+                        stop_context = dict(time=str(closes_at[i]),close=float(close[i]),
+                                            activation_r=activation,gain_r=gain/initial_risk,
+                                            effective_from=str(times[i+1]))
                     emit('stop_update', i, side=position.side, stop=float(stop),
                          effective_bar=int(market['start']+i+1), source='breakeven')
             if multiplier and np.isfinite(atr[i]) and gain >= initial_risk * side_value(cfg,position.side,'trailing_activation_r'):
                 proposed = close[i] - direction * multiplier * atr[i]
                 if proposed > 0 and direction * (proposed - stop) > 0:
                     stop, stop_reason = proposed, 'trailing_stop_exit'
+                    if render_chart:
+                        stop_context = dict(time=str(closes_at[i]),close=float(close[i]),atr=float(atr[i]),
+                                            multiplier=multiplier,effective_from=str(times[i+1]))
                     emit('stop_update',i,side=position.side,stop=float(stop),effective_bar=int(market['start']+i+1))
             held_bars = i - position.entry_index + 1
             failure_window = side_value(cfg, position.side, 'failed_breakout_bars')
@@ -356,6 +380,13 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
             elif held_bars >= side_value(cfg,position.side,'max_hold_bars'):
                 pending = {'kind':'exit'}
                 emit('time_signal',i,side=position.side)
+            if render_chart and pending:
+                pending['chart_context'] = dict(time=str(closes_at[i]),close=float(close[i]),held_bars=held_bars,
+                    channel_boundary=entry_boundary,best_progress_r=best_close_gain/initial_risk,
+                    maximum_hold_bars=side_value(cfg,position.side,'max_hold_bars'),
+                    failure_window_bars=failure_window,
+                    stagnation_bars=side_value(cfg,position.side,'stagnation_exit_bars'),
+                    minimum_progress_r=side_value(cfg,position.side,'stagnation_min_progress_r'))
             continue
         if not ready[i] or not np.isfinite(atr[i]) or atr[i] <= 0: continue
         long_raw,short_raw = raw_breakouts(close[i],upper[i],lower[i])
@@ -375,6 +406,17 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
                 boundary=float(upper[i] if side == 'long' else lower[i]),
                 signal_close=float(close[i]),
                 distance=side_value(cfg,side,'stop_atr_mult')*float(atr[i]),signal_bar=int(market['start']+i))
+            if render_chart:
+                cost = close[i]*2*(cfg.fee_rate+cfg.slippage_rate)
+                pending['chart_signal'] = {**pending, 'signal_time':str(times[i]), 'confirmed_at':str(closes_at[i]),
+                    'efficiency':float(quality['efficiency'][i]),
+                    'relative_volume':float(quality['relative_volume'][i]),
+                    'trend':float(quality[side+'_trend'][i]),
+                    'trend_previous':float(quality[side+'_trend_previous'][i]),
+                    'atr_expansion':float(quality['atr_expansion'][i]),
+                    'range_atr':float((high[i]-low[i])/atr[i]),
+                    'atr_cost_ratio':float(atr[i]/cost) if cost else None,
+                    'entry_score':entry_quality_score(side,i,close,high,low,upper,lower,atr,quality)}
             diagnostics[side + '_entry_signals'] += 1
             score_details = ({'entry_score': entry_quality_score(side, i, close, high, low, upper, lower, atr, quality)}
                              if side_value(cfg, side, 'entry_score_min') and trace else {})
@@ -402,7 +444,7 @@ def pulse_strategy(tune=None,start='2025-01-01',end='latest',*,use_indicator_war
                             open_times=times, close_times=closes_at),
                 chart_state=chart_state, account=account, result=result,
                 price_overlays={'Upper channel': np.where(ready, upper, np.nan),
-                                'Lower channel': np.where(ready, lower, np.nan), 'Initial stop': stop_line},
+                                'Lower channel': np.where(ready, lower, np.nan), 'Active stop': stop_line},
                 oscillator_values=np.where(ready, atr, np.nan), oscillator_label='ATR20 SMA',
                 title=DISPLAY_NAME, show=show_chart, save_path=chart_file, max_candles=plot_max_candles)
     return result

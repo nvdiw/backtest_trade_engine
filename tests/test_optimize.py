@@ -119,7 +119,8 @@ class OptimizerSearchTests(unittest.TestCase):
             "robust_score": 90, "recency_score": 85,
             "stage_consistency_score": 90, "worst_stage_percentile": 0.7,
             "stage_metrics": {
-                stage: {"total_profit_percent": 10, "maximum_drawdown": 10, "liquidations": 0}
+                stage: {"total_profit_percent": 10, "maximum_drawdown": 10, "liquidations": 0,
+                        "long_trades": 40, "short_trades": 40, "long_profit": 50, "short_profit": 50}
                 for stage in ("discovery", "validation", "stress", "walk_forward", "final")
             },
         }
